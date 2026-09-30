@@ -228,6 +228,9 @@ fn main() {
                     controller.send(Command::ToggleMeeting);
                     close_popover(&window, cx);
                 }
+                PopoverEvent::SetSetting(setting) => {
+                    controller.send(Command::SetSetting(*setting));
+                }
             }
         })
         .detach();

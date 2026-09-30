@@ -43,6 +43,13 @@ pub struct Theme {
     pub hover: Rgba,
     /// Copper: recording and meeting, nothing else.
     pub accent: Rgba,
+    /// A pop-up menu over the rows (opaque, so rows do not show through).
+    pub menu_bg: Rgba,
+    /// A switch's track, on and off, and its knob.
+    pub switch_on: Rgba,
+    pub switch_off: Rgba,
+    pub knob_on: Rgba,
+    pub knob_off: Rgba,
 }
 
 /// Light appearance.
@@ -60,6 +67,11 @@ pub const LIGHT: Theme = Theme {
     separator: hex_a(0x000000, 0.09),
     hover: hex_a(0x000000, 0.06),
     accent: hex(0xa16135),
+    menu_bg: hex(0xf6f6f7),
+    switch_on: hex_a(0x000000, 0.78),
+    switch_off: hex_a(0x000000, 0.14),
+    knob_on: hex(0xffffff),
+    knob_off: hex(0xffffff),
 };
 
 /// Dark appearance: the same roles against a dark material.
@@ -77,6 +89,11 @@ pub const DARK: Theme = Theme {
     separator: hex_a(0xffffff, 0.12),
     hover: hex_a(0xffffff, 0.10),
     accent: hex(0xbb8669),
+    menu_bg: hex(0x323234),
+    switch_on: hex_a(0xffffff, 0.82),
+    switch_off: hex_a(0xffffff, 0.18),
+    knob_on: hex(0x28282a),
+    knob_off: hex_a(0xffffff, 0.85),
 };
 
 /// How opaque the popover material is over the blurred window: what is
@@ -137,6 +154,12 @@ pub const TAB_GAP: Pixels = px(14.);
 pub const SEPARATOR_INSET: Pixels = px(10.);
 pub const SEPARATOR_MARGIN: Pixels = px(5.0);
 pub const HAIRLINE: Pixels = px(1.0);
+
+/// A Settings-tab switch.
+pub const SWITCH_WIDTH: Pixels = px(28.);
+pub const SWITCH_HEIGHT: Pixels = px(16.);
+/// After a pop-up button's value.
+pub const POPUP_CHEVRON: &str = "\u{25BE}";
 
 /// The model download's progress bar.
 pub const PROGRESS_HEIGHT: Pixels = px(2.0);

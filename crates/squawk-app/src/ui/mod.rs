@@ -6,4 +6,5 @@
 pub mod format;
 pub mod panel;
 pub mod popover;
+pub mod settings;
 pub mod theme;

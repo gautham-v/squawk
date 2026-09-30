@@ -38,6 +38,8 @@ pub enum Pane {
     InputMonitoring,
     Microphone,
     ScreenRecording,
+    /// Calendars, for the notetaker's heads-up.
+    Calendars,
     /// Keyboard, for "Press 🌐 key to: Do nothing".
     Keyboard,
 }
@@ -57,6 +59,9 @@ impl Pane {
             }
             Pane::ScreenRecording => {
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+            }
+            Pane::Calendars => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars"
             }
             Pane::Keyboard => "x-apple.systempreferences:com.apple.Keyboard-Settings.extension",
         }
@@ -190,6 +195,7 @@ mod tests {
             Pane::InputMonitoring,
             Pane::Microphone,
             Pane::ScreenRecording,
+            Pane::Calendars,
             Pane::Keyboard,
         ] {
             assert!(pane.url().starts_with("x-apple.systempreferences:"));

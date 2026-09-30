@@ -8,15 +8,16 @@
 //!   "Needs Accessibility" with an Open Settings button), then the last error
 //!   or config note as a muted line; then, until fixed or hidden, a hint to
 //!   set Keyboard › Press 🌐 key to › Do nothing;
-//! - tabs: History | Meetings | Dictionary (text tabs, the selected one in
-//!   primary ink);
+//! - tabs: History | Meetings | Dictionary | Settings (text tabs, the
+//!   selected one in primary ink);
 //! - body (scrolls): History = the 50 most recent dictations, "app ·
 //!   project" and time, then the text clamped to 2 lines; click copies.
 //!   Meetings = title, date · length; click opens the file. Dictionary =
 //!   "Edit dictionary.txt" pinned above the list (opens the file), then one
-//!   line per entry, a replacement as "spoken → written";
-//! - footer: Record meeting ⌥M, Settings (config.toml), Launch at login,
-//!   Quit.
+//!   line per entry, a replacement as "spoken → written". Settings = the
+//!   notetaker's `[meeting]` settings, then "Edit config.toml"
+//!   (`ui::settings`);
+//! - footer: Record meeting ⌥M, Launch at login, Quit.
 //!
 //! The data comes from the files through [`PopoverData::load`], re-read when
 //! the popover opens and, while it is open, whenever the snapshot's
@@ -33,6 +34,7 @@ use gpui::{
     ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use squawk_core::dictionary::{Dictionary, Entry, DICTIONARY_HEADER};
+use squawk_core::notetaker::Setting;
 use squawk_core::store::{DictationEntry, MeetingSummary};
 use squawk_core::{Config, Paths, Store};
 
@@ -40,6 +42,7 @@ use crate::controller::Snapshot;
 use crate::launch_at_login;
 use crate::permissions::{self, Pane};
 use crate::ui::format::{self, Tone};
+use crate::ui::settings::{self, Menu};
 use crate::ui::theme::{self, Theme};
 
 /// How many dictations the History tab lists.
@@ -56,16 +59,18 @@ pub enum Tab {
     History,
     Meetings,
     Dictionary,
+    Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 3] = [Tab::History, Tab::Meetings, Tab::Dictionary];
+    pub const ALL: [Tab; 4] = [Tab::History, Tab::Meetings, Tab::Dictionary, Tab::Settings];
 
     pub fn label(self) -> &'static str {
         match self {
             Tab::History => "History",
             Tab::Meetings => "Meetings",
             Tab::Dictionary => "Dictionary",
+            Tab::Settings => "Settings",
         }
     }
 }
@@ -75,6 +80,8 @@ impl Tab {
 pub enum PopoverEvent {
     Close,
     ToggleMeeting,
+    /// A Settings-tab change, to be written to config.toml.
+    SetSetting(Setting),
 }
 
 actions!(squawk, [Dismiss]);
@@ -135,6 +142,8 @@ pub struct Popover {
     stale: bool,
     /// The History row showing "Copied", and when it was clicked.
     copied: Option<(usize, Instant)>,
+    /// The Settings tab's open pop-up menu.
+    open_menu: Option<Menu>,
     /// Whether the fn key is set to something that fights squawk.
     fn_hint: bool,
     login_error: Option<SharedString>,
@@ -156,6 +165,7 @@ impl Popover {
             live_files: true,
             stale: true,
             copied: None,
+            open_menu: None,
             fn_hint: false,
             login_error: None,
             list_scroll: ScrollHandle::new(),
@@ -188,6 +198,7 @@ impl Popover {
     /// fn-key setting (in the background; `defaults` takes a few ms).
     pub fn reset(&mut self, cx: &mut Context<Self>) {
         self.copied = None;
+        self.open_menu = None;
         self.login_error = None;
         self.scroll_to_top();
         self.reload(cx);
@@ -242,8 +253,34 @@ impl Popover {
     fn select(&mut self, tab: Tab, cx: &mut Context<Self>) {
         if tab != self.tab {
             self.scroll_to_top();
+            self.open_menu = None;
         }
         self.tab = tab;
+        cx.notify();
+    }
+
+    /// Open or close a Settings pop-up.
+    pub fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        self.open_menu = if self.open_menu == Some(menu) {
+            None
+        } else {
+            Some(menu)
+        };
+        cx.notify();
+    }
+
+    pub(crate) fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.open_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// A Settings-tab change: shown at once, written by the owner (the
+    /// controller writes config.toml and reloads).
+    pub(crate) fn change_setting(&mut self, setting: Setting, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        setting.apply(&mut self.snapshot.meeting_config);
+        cx.emit(PopoverEvent::SetSetting(setting));
         cx.notify();
     }
 
@@ -278,7 +315,7 @@ impl Popover {
         .detach();
     }
 
-    fn open_settings(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
         let path = self.snapshot.paths.config_file.clone();
         if let Err(e) = Config::write_default_if_missing(&path) {
             log::warn!("could not write {}: {e}", path.display());
@@ -325,7 +362,11 @@ impl Popover {
     }
 
     fn on_dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(PopoverEvent::Close);
+        if self.open_menu.is_some() {
+            self.close_menu(cx);
+        } else {
+            cx.emit(PopoverEvent::Close);
+        }
     }
 
     // ── Layout ──────────────────────────────────────────────────────────────
@@ -473,6 +514,16 @@ impl Popover {
             Tab::History => (None, self.history_rows(cx)),
             Tab::Meetings => (None, self.meeting_rows(cx)),
             Tab::Dictionary => (Some(self.dictionary_edit_row(cx)), self.dictionary_rows()),
+            Tab::Settings => (
+                None,
+                settings::body(
+                    self.theme,
+                    &self.snapshot.meeting_config,
+                    self.snapshot.calendar_access,
+                    self.open_menu,
+                    cx,
+                ),
+            ),
         };
         div()
             .flex()
@@ -695,10 +746,6 @@ impl Popover {
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(PopoverEvent::ToggleMeeting))),
             )
             .child(
-                menu_row(theme, "row-settings", "Settings", true)
-                    .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
-            )
-            .child(
                 menu_row(theme, "row-login", "Launch at login", login_available)
                     .child(div().child(if launch_at_login::is_enabled() {
                         "\u{2713}"
@@ -876,9 +923,9 @@ mod tests {
     use chrono::NaiveDate;
 
     #[test]
-    fn tabs_are_history_meetings_dictionary() {
+    fn tabs_are_history_meetings_dictionary_settings() {
         let labels: Vec<_> = Tab::ALL.iter().map(|t| t.label()).collect();
-        assert_eq!(labels, ["History", "Meetings", "Dictionary"]);
+        assert_eq!(labels, ["History", "Meetings", "Dictionary", "Settings"]);
         assert_eq!(Tab::default(), Tab::History);
     }
 

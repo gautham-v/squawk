@@ -3,12 +3,14 @@
 //!
 //! ```text
 //! cargo run -p squawk-app --example popover_preview -- \
-//!     ready|meetings|dictionary|recording|meeting|downloading|permissions|empty \
+//!     ready|meetings|dictionary|settings|settings-menu|settings-nocal|recording|meeting|
+//!     downloading|permissions|empty|panels \
 //!     [light|dark|system] [end]
 //! ```
 //!
 //! The optional second argument forces the appearance (by default the
 //! window follows the system); `end` scrolls the list to its bottom.
+//! `panels` shows the notetaker's four prompt panels instead of the popover.
 
 use std::time::{Duration, Instant};
 
@@ -18,15 +20,73 @@ use gpui::{
     ParentElement, Render, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use squawk_app::controller::{DictationPhase, MeetingSnap, Snapshot};
+use squawk_app::ui::panel::{self, PanelReply, PromptPanel};
 use squawk_app::ui::popover::{self, Popover, PopoverData, PopoverEvent, Tab};
+use squawk_app::ui::settings::Menu;
 use squawk_app::ui::theme;
 use squawk_core::dictionary::Entry;
+use squawk_core::notetaker::calls::CallId;
+use squawk_core::notetaker::{Prompt, StopReason};
 use squawk_core::status::Permissions;
 use squawk_core::store::{DictationEntry, MeetingSummary};
 use squawk_core::{ModelStatus, Paths};
 
 struct Preview {
     popover: gpui::Entity<Popover>,
+}
+
+/// The four prompt panels, stacked.
+struct Panels {
+    panels: Vec<gpui::Entity<PromptPanel>>,
+}
+
+impl Render for Panels {
+    fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(16.))
+            .bg(gpui::rgb(0xd7d3cc))
+            .p(px(24.))
+            .children(self.panels.iter().map(|p| {
+                div()
+                    .w(panel::PANEL_WIDTH)
+                    .h(px(panel::PANEL_HEIGHT_PX))
+                    .child(p.clone())
+            }))
+    }
+}
+
+fn prompts() -> Vec<Prompt> {
+    let start = Local::now()
+        .date_naive()
+        .and_hms_opt(15, 0, 0)
+        .and_then(|t| Local.from_local_datetime(&t).earliest())
+        .unwrap();
+    vec![
+        Prompt::HeadsUp {
+            key: "design-review".into(),
+            title: "Design review".into(),
+            start,
+            end: start + chrono::Duration::minutes(30),
+        },
+        Prompt::Call {
+            call: CallId(1),
+            app: "Zoom".into(),
+        },
+        Prompt::StoppingSoon {
+            title: "Weekly sync".into(),
+            limit: Duration::from_secs(2 * 3600),
+        },
+        Prompt::Saved {
+            title: "Weekly sync".into(),
+            path: "/tmp/2026-09-29 1400 Weekly sync.md".into(),
+            length_secs: 2530,
+            reason: StopReason::CallEnded("Zoom".into()),
+        },
+    ]
 }
 
 impl Render for Preview {
@@ -211,7 +271,11 @@ fn snapshot(mode: &str) -> Snapshot {
             s.permissions.accessibility = Some(false);
             s.config_note = Some("config.toml: expected a number for tap_max_ms".into());
         }
+        "settings-nocal" => s.calendar_access = Some(false),
         _ => {}
+    }
+    if s.calendar_access.is_none() {
+        s.calendar_access = Some(true);
     }
     s
 }
@@ -227,6 +291,10 @@ fn main() {
             Some(name) => force_appearance(name),
         }
         popover::bind_keys(cx);
+        if mode == "panels" {
+            open_panels(cx);
+            return;
+        }
         let bounds = Bounds {
             origin: point(px(120.), px(120.)),
             size: size(
@@ -247,6 +315,7 @@ fn main() {
                 let tab = match mode.as_str() {
                     "meetings" | "meeting" => Tab::Meetings,
                     "dictionary" => Tab::Dictionary,
+                    "settings" | "settings-menu" | "settings-nocal" => Tab::Settings,
                     _ => Tab::History,
                 };
                 let data = if mode == "empty" {
@@ -269,12 +338,50 @@ fn main() {
                 if scroll_to_end {
                     popover.update(cx, |popover, cx| popover.scroll_to_end(cx));
                 }
+                if mode == "settings-menu" {
+                    popover.update(cx, |popover, cx| popover.toggle_menu(Menu::HeadsUp, cx));
+                }
                 cx.new(|_| Preview { popover })
             },
         )
         .expect("open preview window");
         cx.activate(true);
     });
+}
+
+fn open_panels(cx: &mut App) {
+    let prompts = prompts();
+    let height = prompts.len() as f32 * (panel::PANEL_HEIGHT_PX + 16.0) + 32.0;
+    let bounds = Bounds {
+        origin: point(px(120.), px(120.)),
+        size: size(px(panel::PANEL_WIDTH_PX + 48.), px(height)),
+    };
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("squawk panels".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        |_, cx| {
+            let panels = prompts
+                .into_iter()
+                .map(|prompt| {
+                    let p = cx.new(|_| PromptPanel::new(Some(prompt)));
+                    cx.subscribe(&p, |_, PanelReply(reply), _| {
+                        println!("preview: panel {reply:?}");
+                    })
+                    .detach();
+                    p
+                })
+                .collect();
+            cx.new(|_| Panels { panels })
+        },
+    )
+    .expect("open panels window");
+    cx.activate(true);
 }
 
 /// Set the whole app's appearance, so a light or dark screenshot does not
