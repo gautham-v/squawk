@@ -206,7 +206,7 @@ impl Config {
 /// The file written on first run: every key at its default, commented so the
 /// user can see what is there without the file overriding future defaults.
 pub const DEFAULT_CONFIG_TOML: &str = r#"# squawk settings. Every key is optional; these are the defaults.
-# The app reads this at launch and when `squawk` sends it a reload.
+# The app reads this at launch, when you open its menu after an edit, and on `squawk reload`.
 
 # Where dictations, meetings and dictionary.txt live.
 # data_dir = "~/squawk"
