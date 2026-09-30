@@ -1,0 +1,15 @@
+/target
+.DS_Store
+
+# models are downloaded at runtime, never committed
+/models
+*.onnx
+*.tar.gz
+
+# local
+/.claude
+.claude/
+CLAUDE.md
+AGENTS.md
+*.token
+.env

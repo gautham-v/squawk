@@ -1,0 +1,108 @@
+[package]
+name = "squawk-app"
+description = "squawk's menu bar app: fn-key dictation, paste, meetings, popover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "squawk_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "squawk-app"
+path = "src/main.rs"
+
+[dependencies]
+squawk-core.workspace = true
+squawk-engine.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+log.workspace = true
+serde_json.workspace = true
+
+gpui = "0.2.2"
+futures = "0.3"
+block2 = "0.6"
+crossbeam-channel = "0.5"
+
+objc2 = "0.6"
+objc2-service-management = { version = "0.3.2", default-features = false, features = ["SMAppService", "std", "objc2", "objc2-foundation"] }
+objc2-application-services = { version = "0.3.2", default-features = false, features = ["std", "HIServices", "AXUIElement"] }
+objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2", "objc2-core-media"] }
+
+[dependencies.objc2-core-foundation]
+version = "0.3"
+features = ["CFBase", "CFRunLoop", "CFMachPort", "CFString", "CFDictionary", "CFNumber", "CFDate"]
+
+[dependencies.objc2-core-graphics]
+version = "0.3"
+features = ["CGColor", "CGColorSpace", "CGContext", "CGPath", "CGEvent", "CGEventTypes", "CGEventSource", "CGRemoteOperation", "CGWindow", "CGDirectDisplay"]
+
+[dependencies.objc2-foundation]
+version = "0.3"
+features = [
+    "NSString",
+    "NSGeometry",
+    "NSDate",
+    "NSArray",
+    "NSData",
+    "NSEnumerator",
+    "NSObjCRuntime",
+    "NSValue",
+    "NSError",
+    "NSURL",
+    "NSNotification",
+    "NSRunLoop",
+    "NSThread",
+    "NSBundle",
+    "NSAttributedString",
+    "NSDictionary",
+]
+
+[dependencies.objc2-app-kit]
+version = "0.3"
+features = [
+    "NSApplication",
+    "NSResponder",
+    "NSWindow",
+    "NSView",
+    "NSControl",
+    "NSButton",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSImage",
+    "NSScreen",
+    "NSEvent",
+    "NSPanel",
+    "NSRunningApplication",
+    "NSWorkspace",
+    "NSPasteboard",
+    "NSPasteboardItem",
+    "NSGraphicsContext",
+    "NSCell",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSColor",
+    "NSAttributedString",
+    "NSStringDrawing",
+    "NSAppearance",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+]
+
+[dependencies.objc2-event-kit]
+version = "0.3"
+features = [
+    "EKEventStore",
+    "EKEvent",
+    "EKCalendar",
+    "EKCalendarItem",
+    "EKObject",
+    "EKTypes",
+    "objc2-core-graphics",
+    "block2",
+]
