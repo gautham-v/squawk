@@ -9,8 +9,9 @@
 //! 2. `EnterHandsFree` → publish `Recording { hands_free: true }`.
 //! 3. `StopAndPaste` → publish `Transcribing`; `session.finish()` (if the
 //!    front app changed meanwhile, the context is re-detected while the tail
-//!    transcribes); `pipeline::finish` with the dictionary; if non-empty,
-//!    paste, append to the day file, log the latency line; publish `Idle`.
+//!    transcribes); `pipeline::finish_with` — S1-mini when it is on and
+//!    loaded, then the rules and the dictionary; if non-empty, paste, append
+//!    to the day file, log the latency line; publish `Idle`.
 //! 4. `Cancel(_)` → `session.cancel()`; publish `Idle`. Nothing is written.
 //!
 //! The notetaker (heads-up, call detection, maximum length) is
@@ -32,6 +33,7 @@ use squawk_core::context::{self, Context, FrontApp, VocabCache};
 use squawk_core::dictionary::DictionaryCache;
 use squawk_core::hotkey::{Action, Timings};
 use squawk_core::ipc::{Request, Response};
+use squawk_core::normalize::Normalizer;
 use squawk_core::notetaker::calls::CallId;
 use squawk_core::notetaker::heads_up::UpcomingEvent;
 use squawk_core::notetaker::{Notetaker, Outcome, Prompt, Reply, Setting, Settings, StopReason};
@@ -98,6 +100,10 @@ pub struct Snapshot {
     pub prompt: Option<Prompt>,
     /// Calendar access, once it matters (heads-up on): `None` = not asked.
     pub calendar_access: Option<bool>,
+    /// `[dictation] cleanup_model` as config.toml has it now.
+    pub cleanup_model: bool,
+    /// S1-mini's download/load state (`Missing` while off).
+    pub cleanup_status: ModelStatus,
 }
 
 impl Snapshot {
@@ -116,6 +122,8 @@ impl Snapshot {
             meeting_config: MeetingConfig::default(),
             prompt: None,
             calendar_access: None,
+            cleanup_model: false,
+            cleanup_status: ModelStatus::Missing,
         }
     }
 }
@@ -145,6 +153,8 @@ pub enum Command {
     Prompt(Reply),
     /// A Settings-tab change: written to config.toml, then reloaded.
     SetSetting(Setting),
+    /// The Settings tab's "Clean up with S1-mini" switch.
+    SetCleanupModel(bool),
     /// The calendar prompt was answered.
     CalendarAccess(bool),
     /// The calendar around now (read on a helper thread).
@@ -275,6 +285,8 @@ impl Worker {
         let mut snap = Snapshot::initial(paths.clone(), engine.model_status(), config_note);
         snap.permissions = permissions::check();
         snap.meeting_config = config.meeting.clone();
+        snap.cleanup_model = config.dictation.cleanup_model;
+        snap.cleanup_status = engine.cleanup_status();
         let notetaker = Notetaker::new(Settings::from(&config.meeting));
         Worker {
             store: Store::new(&paths),
@@ -373,6 +385,7 @@ impl Worker {
             }
             Command::Prompt(reply) => self.on_prompt(reply),
             Command::SetSetting(setting) => self.set_setting(setting),
+            Command::SetCleanupModel(on) => self.set_cleanup_model(on),
             Command::CalendarEvents(events) => {
                 self.events = events;
                 self.events_pending = false;
@@ -535,13 +548,19 @@ impl Worker {
             remove_fillers: self.config.dictation.remove_fillers,
             fix_doubles: true,
         };
-        let text = pipeline::finish(
+        let normalizer = self.engine.normalizer();
+        let finished = pipeline::finish_with(
             &transcript.text,
+            normalizer.as_ref().map(|n| n as &dyn Normalizer),
             self.dictionary.get(),
             context.as_ref(),
             &opts,
         );
-        let pipeline_ms = pipeline_start.elapsed().as_millis();
+        let text = finished.text;
+        let pipeline_ms = pipeline_start
+            .elapsed()
+            .saturating_sub(finished.model_time)
+            .as_millis();
 
         let app = front
             .as_ref()
@@ -553,6 +572,8 @@ impl Worker {
             segments: transcript.segments,
             tail_ms: transcript.tail_latency.as_millis(),
             pipeline_ms,
+            cleanup: finished.cleanup.label(),
+            cleanup_ms: finished.model_time.as_millis(),
             paste_ms: 0,
             release_to_paste_ms: 0,
             chars: text.chars().count(),
@@ -833,6 +854,14 @@ impl Worker {
         }
     }
 
+    fn set_cleanup_model(&mut self, on: bool) {
+        let path = self.base_paths.config_file.clone();
+        match config_edit::set_in_file(&path, "dictation", "cleanup_model", on) {
+            Ok(()) => self.reload(),
+            Err(e) => self.fail(format!("could not save the setting: {e}")),
+        }
+    }
+
     // ── IPC, config, permissions, engine ───────────────────────────────────
 
     fn on_ipc(&mut self, request: Request, reply: Sender<Response>) {
@@ -887,6 +916,7 @@ impl Worker {
         self.hotkeys.set_timings(Timings::from(&config.hotkey));
         self.notetaker.set_settings(Settings::from(&config.meeting));
         self.snap.meeting_config = config.meeting.clone();
+        self.snap.cleanup_model = config.dictation.cleanup_model;
         self.config = config;
         self.start_notetaker_inputs();
         self.sync_prompt();
@@ -916,6 +946,9 @@ impl Worker {
             ModelStatus::Missing | ModelStatus::Failed { .. }
         ) {
             self.engine.ensure_model();
+        }
+        if matches!(self.engine.cleanup_status(), ModelStatus::Failed { .. }) {
+            self.engine.ensure_cleanup_model();
         }
     }
 
@@ -958,6 +991,10 @@ impl Worker {
                     meeting.mic_lost = true;
                 }
                 self.fail(format!("microphone lost: {message}"));
+            }
+            EngineEvent::CleanupModel(status) => {
+                self.snap.cleanup_status = status;
+                self.publish();
             }
         }
     }
@@ -1053,7 +1090,11 @@ pub struct Metrics {
     pub audio_secs: f32,
     pub segments: usize,
     pub tail_ms: u128,
+    /// The rules, context and dictionary (S1-mini's wait is `cleanup_ms`).
     pub pipeline_ms: u128,
+    /// `rules`, `s1`, or `fallback:<why>` (`pipeline::Cleanup::label`).
+    pub cleanup: String,
+    pub cleanup_ms: u128,
     pub paste_ms: u128,
     pub release_to_paste_ms: u128,
     pub chars: usize,
@@ -1068,11 +1109,13 @@ impl Metrics {
     /// context=claude`. Lengths and timings only, never text.
     pub fn line(&self) -> String {
         let mut line = format!(
-            "audio={:.1}s segments={} tail_ms={} pipeline_ms={} paste_ms={} release_to_paste_ms={} chars={} app={}",
+            "audio={:.1}s segments={} tail_ms={} pipeline_ms={} cleanup={} cleanup_ms={} paste_ms={} release_to_paste_ms={} chars={} app={}",
             self.audio_secs,
             self.segments,
             self.tail_ms,
             self.pipeline_ms,
+            self.cleanup,
+            self.cleanup_ms,
             self.paste_ms,
             self.release_to_paste_ms,
             self.chars,
@@ -1145,6 +1188,8 @@ pub(crate) mod tests {
             segments: 5,
             tail_ms: 182,
             pipeline_ms: 3,
+            cleanup: "s1".into(),
+            cleanup_ms: 140,
             paste_ms: 12,
             release_to_paste_ms: 197,
             chars: 312,
@@ -1154,8 +1199,8 @@ pub(crate) mod tests {
         };
         assert_eq!(
             m.line(),
-            "audio=20.4s segments=5 tail_ms=182 pipeline_ms=3 paste_ms=12 \
-             release_to_paste_ms=197 chars=312 app=Ghostty project=squawk context=claude"
+            "audio=20.4s segments=5 tail_ms=182 pipeline_ms=3 cleanup=s1 cleanup_ms=140 \
+             paste_ms=12 release_to_paste_ms=197 chars=312 app=Ghostty project=squawk context=claude"
         );
     }
 
@@ -1166,6 +1211,8 @@ pub(crate) mod tests {
             segments: 1,
             tail_ms: 90,
             pipeline_ms: 0,
+            cleanup: "rules".into(),
+            cleanup_ms: 0,
             paste_ms: 4,
             release_to_paste_ms: 100,
             chars: 12,

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
-use squawk_core::config::{MeetingConfig, ModelConfig};
+use squawk_core::config::{MeetingConfig, ModelConfig, CLEANUP_MODEL_URL};
 use squawk_core::{Config, ModelStatus, Paths};
 
 use crate::audio::MicShare;
@@ -13,6 +13,7 @@ use crate::dictation::{self, DictationSession, Input, InputLevel};
 use crate::error::EngineError;
 use crate::meeting::{MeetingHandle, MeetingOptions};
 use crate::model;
+use crate::normalizer::{self, Normalizer};
 use crate::recognizer::{LoadState, Priority, Recognizer};
 use crate::segmenter::{Segmenter, SegmenterConfig};
 use crate::SAMPLE_RATE;
@@ -29,6 +30,9 @@ pub struct EngineConfig {
     pub meeting: MeetingConfig,
     /// A dictation is cut off (finished normally) after this long.
     pub max_dictation: Duration,
+    /// Keep "S1-mini" by "Superwhisper" downloaded and loaded for dictation
+    /// cleanup.
+    pub cleanup_model: bool,
 }
 
 impl EngineConfig {
@@ -41,6 +45,7 @@ impl EngineConfig {
             keep_audio: config.keep_audio,
             meeting: config.meeting.clone(),
             max_dictation: Duration::from_secs(config.dictation.max_secs),
+            cleanup_model: config.dictation.cleanup_model,
         }
     }
 
@@ -78,6 +83,9 @@ pub enum EngineEvent {
     /// A meeting's mic disappeared and could not be reopened: the meeting
     /// goes on, but "You" is no longer recorded.
     MeetingMicLost(String),
+    /// The cleanup model's status changed (same cadence as `Model`).
+    /// `Missing` also stands for "turned off".
+    CleanupModel(ModelStatus),
 }
 
 type Sink = Arc<dyn Fn(EngineEvent) + Send + Sync>;
@@ -119,6 +127,10 @@ struct Inner {
     /// The recognizer and the model dir it loads.
     recognizer: Mutex<Option<(PathBuf, Recognizer)>>,
     ensuring: AtomicBool,
+    /// S1-mini, once loaded (and only while `cleanup_model` is on).
+    normalizer: Mutex<Option<Normalizer>>,
+    cleanup_status: Mutex<ModelStatus>,
+    ensuring_cleanup: AtomicBool,
     dictating: Arc<AtomicBool>,
     meeting: Arc<AtomicBool>,
     /// The running meeting's echo-cancelled mic, for dictations.
@@ -144,6 +156,16 @@ impl Inner {
         drop(cur);
         self.emit(EngineEvent::Model(status));
     }
+
+    fn set_cleanup_status(&self, status: ModelStatus) {
+        let mut cur = self.cleanup_status.lock().expect("cleanup status lock");
+        if *cur == status {
+            return;
+        }
+        *cur = status.clone();
+        drop(cur);
+        self.emit(EngineEvent::CleanupModel(status));
+    }
 }
 
 impl Engine {
@@ -162,6 +184,9 @@ impl Engine {
                 status: Mutex::new(status),
                 recognizer: Mutex::new(None),
                 ensuring: AtomicBool::new(false),
+                normalizer: Mutex::new(None),
+                cleanup_status: Mutex::new(ModelStatus::Missing),
+                ensuring_cleanup: AtomicBool::new(false),
                 dictating: Arc::new(AtomicBool::new(false)),
                 meeting: Arc::new(AtomicBool::new(false)),
                 meeting_mic: MicShare::default(),
@@ -237,6 +262,119 @@ impl Engine {
                 message: e.to_string(),
             }),
         }
+        // Parakeet first: dictation works without the cleanup model.
+        self.ensure_cleanup_model();
+    }
+
+    /// The cleanup model's status (`Missing` while turned off). Never
+    /// blocks.
+    pub fn cleanup_status(&self) -> ModelStatus {
+        self.inner
+            .cleanup_status
+            .lock()
+            .expect("cleanup status lock")
+            .clone()
+    }
+
+    /// When `cleanup_model` is on, make S1-mini ready in the background:
+    /// download it if missing, then load it. Idempotent like
+    /// [`Engine::ensure_model`]; progress arrives as
+    /// `EngineEvent::CleanupModel`.
+    pub fn ensure_cleanup_model(&self) {
+        if !self.config().cleanup_model {
+            return;
+        }
+        if self.inner.ensuring_cleanup.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let engine = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("squawk-cleanup-model".into())
+            .spawn(move || {
+                engine.ensure_cleanup_blocking();
+                engine
+                    .inner
+                    .ensuring_cleanup
+                    .store(false, Ordering::Release);
+            });
+        if spawned.is_err() {
+            self.inner.ensuring_cleanup.store(false, Ordering::Release);
+        }
+    }
+
+    fn ensure_cleanup_blocking(&self) {
+        let models_dir = self.config().paths.models_dir;
+        if !normalizer::is_installed(&models_dir) {
+            let inner = self.inner.clone();
+            let got = normalizer::download(CLEANUP_MODEL_URL, &models_dir, &mut |s| {
+                inner.set_cleanup_status(s)
+            });
+            if let Err(e) = got {
+                log::error!("cleanup model: {e}");
+                self.inner.set_cleanup_status(ModelStatus::Failed {
+                    message: e.to_string(),
+                });
+                return;
+            }
+            log::info!("cleanup model: installed in {}", models_dir.display());
+        }
+        match self.load_cleanup_model_blocking() {
+            Ok(_) => {}
+            Err(e) => self.inner.set_cleanup_status(ModelStatus::Failed {
+                message: e.to_string(),
+            }),
+        }
+    }
+
+    /// Load S1-mini (if it is on and not loaded yet) and wait for it. Never
+    /// downloads: `ModelMissing` when it is not on disk. The CLI's
+    /// `transcribe` uses this directly.
+    pub fn load_cleanup_model_blocking(&self) -> Result<Normalizer, EngineError> {
+        let models_dir = self.config().paths.models_dir;
+        let existing = self
+            .inner
+            .normalizer
+            .lock()
+            .expect("normalizer lock")
+            .clone();
+        let n = match existing {
+            Some(n) if !matches!(n.state(), normalizer::LoadState::Failed(_)) => n,
+            _ => {
+                if !normalizer::is_installed(&models_dir) {
+                    return Err(EngineError::ModelMissing);
+                }
+                self.inner.set_cleanup_status(ModelStatus::Loading);
+                let weak = Arc::downgrade(&self.inner);
+                let n = Normalizer::spawn(normalizer::model_path(&models_dir), move |state| {
+                    let Some(inner) = weak.upgrade() else { return };
+                    inner.set_cleanup_status(match state {
+                        normalizer::LoadState::Ready => ModelStatus::Ready,
+                        normalizer::LoadState::Failed(message) => ModelStatus::Failed {
+                            message: message.clone(),
+                        },
+                        normalizer::LoadState::Loading => ModelStatus::Loading,
+                    });
+                });
+                *self.inner.normalizer.lock().expect("normalizer lock") = Some(n.clone());
+                n
+            }
+        };
+        n.wait_ready()?;
+        Ok(n)
+    }
+
+    /// S1-mini, when it is on and loaded; `None` otherwise (the dictation
+    /// is cleaned by the rules alone). Never blocks.
+    pub fn normalizer(&self) -> Option<Normalizer> {
+        if !self.config().cleanup_model {
+            return None;
+        }
+        self.inner
+            .normalizer
+            .lock()
+            .expect("normalizer lock")
+            .clone()
+            .filter(|n| n.state() == normalizer::LoadState::Ready)
     }
 
     /// The recognizer for the configured model, spawning it (and so loading
@@ -373,17 +511,34 @@ impl Engine {
 
     /// Apply a reloaded config. Takes effect for the next dictation/meeting;
     /// a changed model dir or URL triggers `ensure_model` again.
+    ///
+    /// Turning `cleanup_model` on loads (and if needed downloads) S1-mini;
+    /// turning it off frees it once the dictation using it, if any, is done.
     pub fn update_config(&self, config: EngineConfig) {
-        let model_changed = {
+        let (model_changed, cleanup) = {
             let mut cur = self.inner.config.lock().expect("config lock");
             let changed =
                 cur.model != config.model || cur.paths.models_dir != config.paths.models_dir;
+            let cleanup = (cur.cleanup_model != config.cleanup_model
+                || cur.paths.models_dir != config.paths.models_dir)
+                .then_some(config.cleanup_model);
             *cur = config;
-            changed
+            (changed, cleanup)
         };
         if model_changed {
             *self.inner.recognizer.lock().expect("recognizer lock") = None;
             self.ensure_model();
+        }
+        match cleanup {
+            Some(true) => {
+                *self.inner.normalizer.lock().expect("normalizer lock") = None;
+                self.ensure_cleanup_model();
+            }
+            Some(false) => {
+                *self.inner.normalizer.lock().expect("normalizer lock") = None;
+                self.inner.set_cleanup_status(ModelStatus::Missing);
+            }
+            None => {}
         }
     }
 
@@ -453,6 +608,7 @@ mod tests {
         c.dictation.input_device = "  ".into();
         c.dictation.max_secs = 42;
         let ec = EngineConfig::from_config(&paths, &c);
+        assert!(ec.cleanup_model);
         assert_eq!(ec.input_device, None);
         assert_eq!(ec.max_dictation, Duration::from_secs(42));
         assert_eq!(ec.model_dir(), paths.models_dir.join(&c.model.dir));
@@ -462,6 +618,23 @@ mod tests {
         let ec = EngineConfig::from_config(&paths, &c);
         assert_eq!(ec.input_device.as_deref(), Some("USB Mic"));
         assert_eq!(ec.audio_dir(), Some(paths.audio_dir.clone()));
+    }
+
+    #[test]
+    fn the_cleanup_model_is_missing_until_downloaded_and_none_when_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let e = engine_in(tmp.path());
+        assert_eq!(e.cleanup_status(), ModelStatus::Missing);
+        assert!(e.normalizer().is_none());
+        assert!(matches!(
+            e.load_cleanup_model_blocking(),
+            Err(EngineError::ModelMissing)
+        ));
+        let mut off = e.config();
+        off.cleanup_model = false;
+        e.update_config(off);
+        assert!(e.normalizer().is_none());
+        assert_eq!(e.cleanup_status(), ModelStatus::Missing);
     }
 
     #[test]

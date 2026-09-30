@@ -5,6 +5,9 @@
 //! Threads (none of them the caller's):
 //! - one **recognizer** thread owns the single Parakeet model and serves a
 //!   priority queue: dictation jobs before meeting chunks;
+//! - one **normalizer** thread owns "S1-mini" by "Superwhisper" (llama.cpp,
+//!   on the GPU) when dictation cleanup is on, and cleans one finished
+//!   dictation at a time;
 //! - each [`DictationSession`] owns a **capture** thread holding the cpal
 //!   input stream (cpal streams are `!Send`) and a **segmenter** that cuts
 //!   committed speech at pauses and submits it while the user is talking;
@@ -22,6 +25,7 @@ mod engine;
 mod error;
 pub mod meeting;
 pub mod model;
+pub mod normalizer;
 pub mod recognizer;
 pub mod segmenter;
 pub mod system_audio;
@@ -31,6 +35,7 @@ pub use dictation::{DictationSession, InputLevel, Transcript};
 pub use engine::{Engine, EngineConfig, EngineEvent};
 pub use error::EngineError;
 pub use meeting::{MeetingHandle, MeetingOptions, MeetingResult};
+pub use normalizer::Normalizer;
 
 /// What the model eats: 16 kHz mono f32 in [-1, 1].
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -50,5 +55,6 @@ mod tests {
         send::<audio::MicCapture>();
         send::<system_audio::SystemAudioCapture>();
         send_sync::<recognizer::Recognizer>();
+        send_sync::<Normalizer>();
     }
 }

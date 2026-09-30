@@ -1,6 +1,7 @@
-//! The popover's Settings tab: the notetaker's four `[meeting]` settings as
-//! rows (a label, a muted line, a pop-up or a switch), then "Edit
-//! config.toml" for everything else. config.toml stays the source of truth:
+//! The popover's Settings tab: "Clean up with S1-mini" (`[dictation]
+//! cleanup_model`), then the notetaker's `[meeting]` settings, as rows (a
+//! label, a muted line, a pop-up or a switch), then "Edit config.toml" for
+//! everything else. config.toml stays the source of truth:
 //! a change is written to the file (comments and other keys kept) and the
 //! app reloads it; the tab shows what the file says.
 //!
@@ -16,6 +17,7 @@ use squawk_core::config::MeetingConfig;
 use squawk_core::notetaker::{
     heads_up_label, max_length_label, Setting, HEADS_UP_CHOICES, MAX_LENGTH_CHOICES,
 };
+use squawk_core::ModelStatus;
 
 use crate::permissions::{self, Pane};
 use crate::ui::popover::Popover;
@@ -73,6 +75,38 @@ pub struct Row {
 }
 
 pub const SECTION: &str = "Meetings";
+pub const DICTATION_SECTION: &str = "Dictation";
+pub const CLEANUP_LABEL: &str = "Clean up with S1-mini";
+
+/// The dictation cleanup switch's state, as the snapshot has it.
+#[derive(Debug, Clone, Copy)]
+pub struct Cleanup<'a> {
+    pub on: bool,
+    pub status: &'a ModelStatus,
+}
+
+/// The muted line under "Clean up with S1-mini": who made it and what it
+/// does, or while it is on and not ready yet, where the download is.
+pub fn cleanup_note(cleanup: Cleanup) -> String {
+    const ABOUT: &str = "by Superwhisper · fillers, false starts, numbers";
+    if !cleanup.on {
+        return ABOUT.into();
+    }
+    match cleanup.status {
+        ModelStatus::Ready => ABOUT.into(),
+        ModelStatus::Missing => "462 MB download".into(),
+        ModelStatus::Downloading { downloaded, total } => match cleanup.status.progress() {
+            Some(p) => format!("Downloading {:.0}%", p * 100.0),
+            None => {
+                let _ = total;
+                format!("Downloading {} MB", downloaded / 1_000_000)
+            }
+        },
+        ModelStatus::Extracting => "Checking the download".into(),
+        ModelStatus::Loading => "Loading".into(),
+        ModelStatus::Failed { message } => format!("Failed: {message}"),
+    }
+}
 pub const EDIT_CONFIG: &str = "Edit config.toml";
 pub const EDIT_CONFIG_NOTE: &str = "Dictation, model";
 
@@ -124,19 +158,15 @@ pub fn body(
     theme: Theme,
     m: &MeetingConfig,
     calendar: Option<bool>,
+    cleanup: Cleanup,
     open: Option<Menu>,
     cx: &mut Context<Popover>,
 ) -> Vec<AnyElement> {
-    let mut out = vec![div()
-        .flex_shrink_0()
-        .px(theme::ROW_PAD_X)
-        .pt(px(4.))
-        .pb(px(2.))
-        .text_size(theme::TEXT_TINY)
-        .line_height(theme::LINE_TINY)
-        .text_color(theme.tertiary)
-        .child(SECTION)
-        .into_any_element()];
+    let mut out = vec![
+        section(theme, DICTATION_SECTION),
+        cleanup_row(theme, cleanup, cx),
+        section(theme, SECTION),
+    ];
     for row in rows(m, calendar) {
         out.push(setting_row(theme, row, m, open, cx));
     }
@@ -176,6 +206,62 @@ pub fn body(
             .into_any_element(),
     );
     out
+}
+
+/// A section heading: small, tertiary.
+fn section(theme: Theme, title: &'static str) -> AnyElement {
+    div()
+        .flex_shrink_0()
+        .px(theme::ROW_PAD_X)
+        .pt(px(4.))
+        .pb(px(2.))
+        .text_size(theme::TEXT_TINY)
+        .line_height(theme::LINE_TINY)
+        .text_color(theme.tertiary)
+        .child(title)
+        .into_any_element()
+}
+
+/// "Clean up with S1-mini": a switch row like the meeting ones, writing
+/// `[dictation] cleanup_model` instead of a `[meeting]` key.
+fn cleanup_row(theme: Theme, cleanup: Cleanup, cx: &mut Context<Popover>) -> AnyElement {
+    let on = cleanup.on;
+    div()
+        .id("setting-cleanup-model")
+        .flex()
+        .flex_row()
+        .flex_shrink_0()
+        .justify_between()
+        .items_center()
+        .gap(px(10.))
+        .px(theme::ROW_PAD_X)
+        .py(theme::LIST_ROW_PAD_Y)
+        .rounded(theme::ROW_RADIUS)
+        .cursor_pointer()
+        .hover(move |s| s.bg(theme.hover))
+        .on_click(cx.listener(move |this, _, _, cx| this.set_cleanup_model(!on, cx)))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .min_w(px(0.))
+                .child(
+                    div()
+                        .text_size(theme::TEXT_BODY)
+                        .line_height(theme::LINE_BODY)
+                        .child(CLEANUP_LABEL),
+                )
+                .child(
+                    div()
+                        .text_size(theme::TEXT_TINY)
+                        .line_height(theme::LINE_TINY)
+                        .text_color(theme.secondary)
+                        .line_clamp(1)
+                        .child(cleanup_note(cleanup)),
+                ),
+        )
+        .child(switch(theme, on))
+        .into_any_element()
 }
 
 fn setting_row(
@@ -358,6 +444,40 @@ fn switch(theme: Theme, on: bool) -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cleanup_note_says_what_it_is_or_where_the_download_is() {
+        let note = |on, status| {
+            cleanup_note(Cleanup {
+                on,
+                status: &status,
+            })
+        };
+        let about = "by Superwhisper · fillers, false starts, numbers";
+        assert_eq!(note(false, ModelStatus::Missing), about);
+        assert_eq!(note(true, ModelStatus::Ready), about);
+        assert_eq!(note(true, ModelStatus::Missing), "462 MB download");
+        assert_eq!(
+            note(
+                true,
+                ModelStatus::Downloading {
+                    downloaded: 242_000_000,
+                    total: Some(484_000_000)
+                }
+            ),
+            "Downloading 50%"
+        );
+        assert_eq!(note(true, ModelStatus::Loading), "Loading");
+        assert_eq!(
+            note(
+                true,
+                ModelStatus::Failed {
+                    message: "offline".into()
+                }
+            ),
+            "Failed: offline"
+        );
+    }
 
     #[test]
     fn the_rows_show_the_file_s_values() {
