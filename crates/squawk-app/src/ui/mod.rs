@@ -3,5 +3,6 @@
 //! black/white ink at the usual alphas, one accent — copper — used only for
 //! the recording/meeting state line). No literals in the views.
 
+pub mod format;
 pub mod popover;
 pub mod theme;

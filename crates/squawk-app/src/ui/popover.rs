@@ -1,27 +1,52 @@
 //! Root popover view.
 //!
-//! Layout, top to bottom:
-//! - header: one state line — "Ready · fn to talk", "Recording 0:07",
-//!   "Meeting · Weekly sync · 12:04", or a first-run state with its fix:
-//!   "Downloading model 42%" (thin progress bar), "Needs Accessibility
-//!   [Open Settings]", "Needs Microphone [Open Settings]"; then the config
-//!   note / last error as a muted line if any;
+//! Shaped like claudebar's: a system-menu material, 5 px of inset around
+//! plain rows, hairline separators, ink only — copper appears just on the
+//! state line while recording or in a meeting. Top to bottom:
+//! - header: one state line from [`format::header`] ("Ready · fn to talk",
+//!   "Recording 0:07", "Downloading model 42%" with a hairline progress bar,
+//!   "Needs Accessibility" with an Open Settings button), then the last error
+//!   or config note as a muted line; then, until fixed or hidden, a hint to
+//!   set Keyboard › Press 🌐 key to › Do nothing;
 //! - tabs: History | Meetings | Dictionary (text tabs, the selected one in
-//!   primary ink, the others secondary; no pills);
-//! - body: History = the 50 most recent dictations, each row "app · project"
-//!   and time on one line, the text clamped to 2 lines below; click copies
-//!   it (brief "Copied" in the row). Meetings = title, date · length, click
-//!   opens the file. Dictionary = entries, one per row, "Edit" opens
-//!   dictionary.txt;
-//! - footer: "Record meeting ⌥M" (or "Stop meeting ⌥M") and "Settings"
-//!   (opens config.toml, writing the default file first if missing).
+//!   primary ink);
+//! - body (scrolls): History = the 50 most recent dictations, "app ·
+//!   project" and time, then the text clamped to 2 lines; click copies.
+//!   Meetings = title, date · length; click opens the file. Dictionary = the
+//!   entries, "Edit dictionary.txt" opens the file;
+//! - footer: Record meeting ⌥M, Settings (config.toml), Launch at login,
+//!   Quit.
 //!
-//! Reads files through `squawk_core::Store` / `Dictionary` when opened and
-//! when `Snapshot.dictations_this_run` changes; holds no other data.
+//! The data comes from the files through [`PopoverData::load`], re-read when
+//! the popover opens and, while it is open, whenever the snapshot's
+//! `revision` moves; the preview example feeds fixture data instead.
 
-use gpui::{div, Context, IntoElement, Render, Window};
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use chrono::Local;
+use gpui::prelude::FluentBuilder;
+use gpui::{
+    actions, div, px, relative, App, Context, Div, EventEmitter, FocusHandle, Focusable,
+    FontWeight, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, Rgba,
+    SharedString, StatefulInteractiveElement, Styled, Window,
+};
+use squawk_core::dictionary::{Dictionary, Entry, DICTIONARY_HEADER};
+use squawk_core::store::{DictationEntry, MeetingSummary};
+use squawk_core::{Config, Paths, Store};
 
 use crate::controller::Snapshot;
+use crate::launch_at_login;
+use crate::permissions::{self, Pane};
+use crate::ui::format::{self, Tone};
+use crate::ui::theme::{self, Theme};
+
+/// How many dictations the History tab lists.
+pub const HISTORY_ROWS: usize = 50;
+/// How long "Copied" replaces a row's time.
+const COPIED_FOR: Duration = Duration::from_millis(1200);
+/// The marker file that hides the fn-key hint for good.
+const HINT_DISMISSED_FILE: &str = "fn-hint-dismissed";
 
 /// Which tab is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -32,20 +57,759 @@ pub enum Tab {
     Dictionary,
 }
 
+impl Tab {
+    pub const ALL: [Tab; 3] = [Tab::History, Tab::Meetings, Tab::Dictionary];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::History => "History",
+            Tab::Meetings => "Meetings",
+            Tab::Dictionary => "Dictionary",
+        }
+    }
+}
+
 /// What the popover asks its owner (main.rs) to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PopoverEvent {
     Close,
     ToggleMeeting,
-    OpenSettings,
+}
+
+actions!(squawk, [Dismiss]);
+
+/// Key context for the popover.
+pub const KEY_CONTEXT: &str = "Squawk";
+
+/// Install the popover's key bindings. Call once at app start.
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("escape", Dismiss, Some(KEY_CONTEXT))]);
+}
+
+/// What the three tabs list.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PopoverData {
+    pub history: Vec<DictationEntry>,
+    pub meetings: Vec<MeetingSummary>,
+    pub dictionary: Vec<Entry>,
+    /// A file that could not be read, shown in place of its list.
+    pub error: Option<String>,
+}
+
+impl PopoverData {
+    /// Read everything from the files. Small: 50 entries, the meeting
+    /// headers, one dictionary.
+    pub fn load(paths: &Paths) -> PopoverData {
+        let store = Store::new(paths);
+        let mut error = None;
+        let history = store.recent(HISTORY_ROWS).unwrap_or_else(|e| {
+            error = Some(format!("could not read dictations: {e}"));
+            Vec::new()
+        });
+        let meetings = store.meetings().unwrap_or_else(|e| {
+            error = Some(format!("could not read meetings: {e}"));
+            Vec::new()
+        });
+        let dictionary = Dictionary::load(&paths.dictionary_file)
+            .map(|d| d.entries().to_vec())
+            .unwrap_or_default();
+        PopoverData {
+            history,
+            meetings,
+            dictionary,
+            error,
+        }
+    }
 }
 
 pub struct Popover {
-    pub tab: Tab,
-    pub snapshot: Option<Snapshot>,
+    focus: FocusHandle,
+    tab: Tab,
+    snapshot: Snapshot,
+    data: PopoverData,
+    /// Read the files again (`None` in the preview: fixture data).
+    live_files: bool,
+    /// The files changed since they were read; re-read on the next render
+    /// (which only happens while the popover is open).
+    stale: bool,
+    /// The History row showing "Copied", and when it was clicked.
+    copied: Option<(usize, Instant)>,
+    /// Whether the fn key is set to something that fights squawk.
+    fn_hint: bool,
+    login_error: Option<SharedString>,
+    theme: Theme,
+    appearance: Option<gpui::Subscription>,
+}
+
+impl Popover {
+    /// A popover over the real files.
+    pub fn new(snapshot: Snapshot, cx: &mut Context<Self>) -> Popover {
+        Popover {
+            focus: cx.focus_handle(),
+            tab: Tab::default(),
+            snapshot,
+            data: PopoverData::default(),
+            live_files: true,
+            stale: true,
+            copied: None,
+            fn_hint: false,
+            login_error: None,
+            theme: Theme::default(),
+            appearance: None,
+        }
+    }
+
+    /// A popover over fixture data (the preview example).
+    pub fn with_data(
+        snapshot: Snapshot,
+        data: PopoverData,
+        tab: Tab,
+        fn_hint: bool,
+        cx: &mut Context<Self>,
+    ) -> Popover {
+        let mut popover = Popover::new(snapshot, cx);
+        popover.data = data;
+        popover.live_files = false;
+        popover.tab = tab;
+        popover.fn_hint = fn_hint;
+        popover
+    }
+
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    /// Called every time the popover opens: re-read the files and check the
+    /// fn-key setting (in the background; `defaults` takes a few ms).
+    pub fn reset(&mut self, cx: &mut Context<Self>) {
+        self.copied = None;
+        self.login_error = None;
+        self.reload(cx);
+        if !self.live_files {
+            return;
+        }
+        let dismissed = self.hint_dismissed_path().exists();
+        if dismissed {
+            self.fn_hint = false;
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let does_nothing = cx
+                .background_executor()
+                .spawn(async { permissions::fn_key_does_nothing() })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.fn_hint = !does_nothing;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// A new snapshot from the controller.
+    pub fn set_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        if snapshot.revision != self.snapshot.revision || snapshot.paths != self.snapshot.paths {
+            self.stale = true;
+        }
+        self.snapshot = snapshot;
+        cx.notify();
+    }
+
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        self.stale = true;
+        cx.notify();
+    }
+
+    /// Re-read the files if they changed. Called from `render`, which only
+    /// runs while the popover is open, so a closed popover reads nothing.
+    fn load_if_stale(&mut self) {
+        if self.stale && self.live_files {
+            self.data = PopoverData::load(&self.snapshot.paths);
+        }
+        self.stale = false;
+    }
+
+    fn hint_dismissed_path(&self) -> std::path::PathBuf {
+        self.snapshot.paths.support_dir.join(HINT_DISMISSED_FILE)
+    }
+
+    fn select(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        self.tab = tab;
+        cx.notify();
+    }
+
+    fn copy_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.data.history.get(index) else {
+            return;
+        };
+        crate::paste::copy(&entry.text);
+        let clicked = Instant::now();
+        self.copied = Some((index, clicked));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPIED_FOR).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.copied.is_some_and(|(_, at)| at == clicked) {
+                    this.copied = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn open_settings(&mut self, cx: &mut Context<Self>) {
+        let path = self.snapshot.paths.config_file.clone();
+        if let Err(e) = Config::write_default_if_missing(&path) {
+            log::warn!("could not write {}: {e}", path.display());
+        }
+        open_in_editor(&path);
+        cx.emit(PopoverEvent::Close);
+    }
+
+    fn edit_dictionary(&mut self, cx: &mut Context<Self>) {
+        let path = self.snapshot.paths.dictionary_file.clone();
+        if !path.exists() {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&path, DICTIONARY_HEADER);
+        }
+        open_in_editor(&path);
+        cx.emit(PopoverEvent::Close);
+    }
+
+    fn open_meeting(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(meeting) = self.data.meetings.get(index) {
+            let _ = std::process::Command::new("/usr/bin/open")
+                .arg(&meeting.path)
+                .spawn();
+            cx.emit(PopoverEvent::Close);
+        }
+    }
+
+    fn hide_hint(&mut self, cx: &mut Context<Self>) {
+        let path = self.hint_dismissed_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, "");
+        self.fn_hint = false;
+        cx.notify();
+    }
+
+    fn toggle_launch_at_login(&mut self, cx: &mut Context<Self>) {
+        let wanted = !launch_at_login::is_enabled();
+        self.login_error = launch_at_login::set_enabled(wanted).err().map(Into::into);
+        cx.notify();
+    }
+
+    fn on_dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(PopoverEvent::Close);
+    }
+
+    // ── Layout ──────────────────────────────────────────────────────────────
+
+    fn tone_color(&self, tone: Tone) -> Rgba {
+        match tone {
+            Tone::Primary => self.theme.text,
+            Tone::Accent => self.theme.accent,
+            Tone::Secondary => self.theme.secondary,
+        }
+    }
+
+    fn header(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let header = format::header(&self.snapshot, Instant::now());
+        let state_line = div()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .items_center()
+            .child(
+                div()
+                    .text_size(theme::TEXT_BODY)
+                    .line_height(theme::LINE_BODY)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(self.tone_color(header.tone))
+                    .child(header.text),
+            )
+            .children(header.fix.map(|pane| self.fix_button(pane, cx)));
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .px(theme::ROW_PAD_X)
+            .pt(px(4.))
+            .pb(px(2.))
+            .child(state_line)
+            .children(header.progress.map(|p| {
+                div()
+                    .w_full()
+                    .h(theme::PROGRESS_HEIGHT)
+                    .rounded(theme::PROGRESS_HEIGHT)
+                    .bg(theme.separator)
+                    .overflow_hidden()
+                    .child(div().w(relative(p.clamp(0.0, 1.0))).h_full().bg(theme.text))
+            }))
+            .children(header.note.map(|note| {
+                div()
+                    .text_size(theme::TEXT_TINY)
+                    .line_height(theme::LINE_TINY)
+                    .text_color(theme.secondary)
+                    .line_clamp(2)
+                    .child(note)
+            }))
+    }
+
+    fn fix_button(&self, pane: Pane, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        div()
+            .id(SharedString::from(format!("fix-{pane:?}")))
+            .px(px(8.))
+            .rounded(theme::ROW_RADIUS)
+            .border_1()
+            .border_color(theme.separator)
+            .text_size(theme::TEXT_TINY)
+            .line_height(theme::LINE_SMALL)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.hover))
+            .on_click(cx.listener(move |_, _, _, _| permissions::open_pane(pane)))
+            .child(format::FIX_LABEL)
+    }
+
+    fn hint(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.fn_hint {
+            return None;
+        }
+        let theme = self.theme;
+        Some(
+            div().flex().flex_col().child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .px(theme::ROW_PAD_X)
+                    .pb(px(4.))
+                    .text_size(theme::TEXT_TINY)
+                    .line_height(theme::LINE_TINY)
+                    .text_color(theme.tertiary)
+                    .child(
+                        div()
+                            .id("hint")
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.secondary))
+                            .on_click(
+                                cx.listener(|_, _, _, _| permissions::open_pane(Pane::Keyboard)),
+                            )
+                            .child("Set Keyboard › Press 🌐 key to › Do nothing"),
+                    )
+                    .child(
+                        div()
+                            .id("hint-hide")
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.secondary))
+                            .on_click(cx.listener(|this, _, _, cx| this.hide_hint(cx)))
+                            .child("Hide"),
+                    ),
+            ),
+        )
+    }
+
+    fn tabs(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_row()
+            .gap(theme::TAB_GAP)
+            .px(theme::ROW_PAD_X)
+            .pb(px(4.))
+            .text_size(theme::TEXT_SMALL)
+            .line_height(theme::LINE_SMALL)
+            .children(Tab::ALL.map(|tab| {
+                let selected = tab == self.tab;
+                div()
+                    .id(tab.label())
+                    .cursor_pointer()
+                    .text_color(if selected {
+                        theme.text
+                    } else {
+                        theme.secondary
+                    })
+                    .when(selected, |el| el.font_weight(FontWeight::MEDIUM))
+                    .when(!selected, |el| el.hover(|s| s.text_color(theme.text)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.select(tab, cx)))
+                    .child(tab.label())
+            }))
+    }
+
+    fn body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let rows: Vec<gpui::AnyElement> = match self.tab {
+            Tab::History => self.history_rows(cx),
+            Tab::Meetings => self.meeting_rows(cx),
+            Tab::Dictionary => self.dictionary_rows(cx),
+        };
+        div()
+            .id("list")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .children(rows)
+    }
+
+    fn empty(&self, line: &'static str) -> gpui::AnyElement {
+        div()
+            .px(theme::ROW_PAD_X)
+            .py(theme::LIST_ROW_PAD_Y)
+            .text_size(theme::TEXT_SMALL)
+            .line_height(theme::LINE_SMALL)
+            .text_color(self.theme.tertiary)
+            .child(line)
+            .into_any_element()
+    }
+
+    fn history_rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        if self.data.history.is_empty() {
+            return vec![self.empty(
+                self.data
+                    .error
+                    .as_deref()
+                    .map_or(EMPTY_HISTORY, |_| NO_FILES),
+            )];
+        }
+        let theme = self.theme;
+        let today = Local::now().date_naive();
+        self.data
+            .history
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let copied = self.copied.is_some_and(|(i, _)| i == index);
+                let time = if copied {
+                    "Copied".to_string()
+                } else {
+                    format::row_time(entry.at, today)
+                };
+                list_row(theme, SharedString::from(format!("history-{index}")))
+                    .on_click(cx.listener(move |this, _, _, cx| this.copy_row(index, cx)))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .gap(px(8.))
+                            .text_size(theme::TEXT_TINY)
+                            .line_height(theme::LINE_TINY)
+                            .child(
+                                div()
+                                    .text_color(theme.secondary)
+                                    .truncate()
+                                    .child(entry.source()),
+                            )
+                            .child(div().flex_shrink_0().text_color(theme.tertiary).child(time)),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::TEXT_SMALL)
+                            .line_height(theme::LINE_SMALL)
+                            .text_ellipsis()
+                            .line_clamp(2)
+                            .child(entry.text.clone()),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    fn meeting_rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        if self.data.meetings.is_empty() {
+            return vec![self.empty(EMPTY_MEETINGS)];
+        }
+        let theme = self.theme;
+        self.data
+            .meetings
+            .iter()
+            .enumerate()
+            .map(|(index, meeting)| {
+                list_row(theme, SharedString::from(format!("meeting-{index}")))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_meeting(index, cx)))
+                    .child(
+                        div()
+                            .text_size(theme::TEXT_BODY)
+                            .line_height(theme::LINE_BODY)
+                            .truncate()
+                            .child(meeting.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(theme::TEXT_TINY)
+                            .line_height(theme::LINE_TINY)
+                            .text_color(if meeting.in_progress {
+                                theme.accent
+                            } else {
+                                theme.secondary
+                            })
+                            .child(format::meeting_meta(meeting)),
+                    )
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    fn dictionary_rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let theme = self.theme;
+        let mut rows = vec![list_row(theme, "dictionary-edit".into())
+            .on_click(cx.listener(|this, _, _, cx| this.edit_dictionary(cx)))
+            .text_size(theme::TEXT_SMALL)
+            .line_height(theme::LINE_SMALL)
+            .text_color(theme.secondary)
+            .child("Edit dictionary.txt")
+            .into_any_element()];
+        if self.data.dictionary.is_empty() {
+            rows.push(self.empty(EMPTY_DICTIONARY));
+            return rows;
+        }
+        rows.extend(self.data.dictionary.iter().map(|entry| {
+            div()
+                .px(theme::ROW_PAD_X)
+                .py(px(2.))
+                .text_size(theme::TEXT_SMALL)
+                .line_height(theme::LINE_SMALL)
+                .truncate()
+                .child(entry.to_line())
+                .into_any_element()
+        }));
+        rows
+    }
+
+    fn footer(&self, cx: &mut Context<Self>) -> Div {
+        let theme = self.theme;
+        let recording = self.snapshot.meeting.is_some();
+        let login_available =
+            launch_at_login::availability() == launch_at_login::Availability::Ready;
+        div()
+            .flex()
+            .flex_col()
+            .child(
+                menu_row(
+                    theme,
+                    "row-meeting",
+                    format::meeting_action(recording),
+                    true,
+                )
+                .child(
+                    div()
+                        .text_color(theme.tertiary)
+                        .child(format::MEETING_SHORTCUT),
+                )
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(PopoverEvent::ToggleMeeting))),
+            )
+            .child(
+                menu_row(theme, "row-settings", "Settings", true)
+                    .on_click(cx.listener(|this, _, _, cx| this.open_settings(cx))),
+            )
+            .child(
+                menu_row(theme, "row-login", "Launch at login", login_available)
+                    .child(div().child(if launch_at_login::is_enabled() {
+                        "\u{2713}"
+                    } else {
+                        ""
+                    }))
+                    .when(login_available, |el| {
+                        el.on_click(cx.listener(|this, _, _, cx| this.toggle_launch_at_login(cx)))
+                    }),
+            )
+            .when(!login_available, |el| {
+                el.child(note(theme, launch_at_login::NO_BUNDLE_NOTE.into()))
+            })
+            .when_some(self.login_error.clone(), |el, message| {
+                el.child(note(theme, message))
+            })
+            .child(separator(theme))
+            .child(
+                menu_row(theme, "row-quit", "Quit Squawk", true)
+                    .on_click(cx.listener(|_, _, _, cx| cx.quit())),
+            )
+    }
+}
+
+/// A clickable two-line row in the scrolling list.
+fn list_row(theme: Theme, id: SharedString) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .gap(px(1.))
+        .px(theme::ROW_PAD_X)
+        .py(theme::LIST_ROW_PAD_Y)
+        .rounded(theme::ROW_RADIUS)
+        .cursor_pointer()
+        .hover(move |s| s.bg(theme.hover))
+}
+
+/// A footer row: a label on the left, room for a shortcut or checkmark on
+/// the right, a hover wash like a menu item.
+fn menu_row(
+    theme: Theme,
+    id: &'static str,
+    label: &'static str,
+    enabled: bool,
+) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .justify_between()
+        .items_center()
+        .px(theme::ROW_PAD_X)
+        .py(theme::ROW_PAD_Y)
+        .rounded(theme::ROW_RADIUS)
+        .text_size(theme::TEXT_BODY)
+        .line_height(theme::LINE_BODY)
+        .text_color(if enabled { theme.text } else { theme.tertiary })
+        .when(enabled, |el| {
+            el.cursor_pointer().hover(move |s| s.bg(theme.hover))
+        })
+        .child(label)
+}
+
+fn note(theme: Theme, message: SharedString) -> impl IntoElement {
+    div()
+        .px(theme::ROW_PAD_X)
+        .pb(px(4.))
+        .text_size(theme::TEXT_TINY)
+        .line_height(theme::LINE_TINY)
+        .text_color(theme.tertiary)
+        .child(message)
+}
+
+fn separator(theme: Theme) -> Div {
+    div()
+        .flex_shrink_0()
+        .h(theme::HAIRLINE)
+        .mx(theme::SEPARATOR_INSET)
+        .my(theme::SEPARATOR_MARGIN)
+        .bg(theme.separator)
+}
+
+/// Open a text file in the user's default text editor.
+fn open_in_editor(path: &Path) {
+    let _ = std::process::Command::new("/usr/bin/open")
+        .arg("-t")
+        .arg(path)
+        .spawn();
+}
+
+const EMPTY_HISTORY: &str = "Nothing yet. Hold fn and talk.";
+const EMPTY_MEETINGS: &str = "No meetings yet. ⌥M starts one.";
+const EMPTY_DICTIONARY: &str = "No words yet. Add names and jargon squawk should spell your way.";
+const NO_FILES: &str = "Could not read your dictations.";
+
+impl EventEmitter<PopoverEvent> for Popover {}
+
+impl Focusable for Popover {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
 }
 
 impl Render for Popover {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Follow the system appearance: the window only repaints when
+        // notified, so a light/dark flip while open has to wake it.
+        if self.appearance.is_none() {
+            let this = cx.entity();
+            self.appearance = Some(window.observe_window_appearance(move |_window, cx| {
+                this.update(cx, |_, cx| cx.notify());
+            }));
+        }
+        self.theme = Theme::for_appearance(window.appearance());
+        let theme = self.theme;
+        self.load_if_stale();
+
+        let header = self.header(cx);
+        let hint = self.hint(cx);
+        let tabs = self.tabs(cx);
+        let body = self.body(cx);
+        let footer = self.footer(cx);
+
         div()
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus)
+            .on_action(cx.listener(Self::on_dismiss))
+            .flex()
+            .flex_col()
+            .w(theme::POPOVER_WIDTH)
+            .h_full()
+            .p(theme::POPOVER_PAD)
+            .bg(theme.bg)
+            .rounded(theme::POPOVER_RADIUS)
+            .border_1()
+            .border_color(theme.border)
+            .overflow_hidden()
+            .font_family(theme::UI_FAMILY)
+            .text_size(theme::TEXT_BODY)
+            .text_color(theme.text)
+            .child(header)
+            .children(hint)
+            .child(separator(theme))
+            .child(tabs)
+            .child(body)
+            .child(separator(theme))
+            .child(footer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn tabs_are_history_meetings_dictionary() {
+        let labels: Vec<_> = Tab::ALL.iter().map(|t| t.label()).collect();
+        assert_eq!(labels, ["History", "Meetings", "Dictionary"]);
+        assert_eq!(Tab::default(), Tab::History);
+    }
+
+    #[test]
+    fn loading_reads_the_files_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under(dir.path());
+        paths.ensure_dirs().unwrap();
+        let store = Store::new(&paths);
+        for (i, text) in ["First.", "Second."].iter().enumerate() {
+            store
+                .append_dictation(&DictationEntry {
+                    at: NaiveDate::from_ymd_opt(2026, 9, 29)
+                        .unwrap()
+                        .and_hms_opt(14, i as u32, 0)
+                        .unwrap(),
+                    app: "Ghostty".into(),
+                    project: Some("demo".into()),
+                    text: text.to_string(),
+                })
+                .unwrap();
+        }
+        squawk_core::dictionary::add(&paths.dictionary_file, "Kubernetes").unwrap();
+
+        let data = PopoverData::load(&paths);
+        assert_eq!(data.error, None);
+        let texts: Vec<_> = data.history.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, ["Second.", "First."]);
+        assert_eq!(data.dictionary, [Entry::Term("Kubernetes".into())]);
+        assert!(data.meetings.is_empty());
+    }
+
+    #[test]
+    fn loading_an_empty_data_dir_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = PopoverData::load(&Paths::under(dir.path()));
+        assert!(data.history.is_empty());
+        assert!(data.dictionary.is_empty());
     }
 }

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Without this, the hardened runtime silently hands the app a silent mic. -->
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+  <!-- Meeting titles from the calendar event happening now. -->
+  <key>com.apple.security.personal-information.calendars</key>
+  <true/>
+</dict>
+</plist>

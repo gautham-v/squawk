@@ -32,6 +32,9 @@ objc2-service-management = { version = "0.3.2", default-features = false, featur
 objc2-application-services = { version = "0.3.2", default-features = false, features = ["std", "HIServices", "AXUIElement"] }
 objc2-av-foundation = { version = "0.3.2", default-features = false, features = ["std", "AVCaptureDevice", "AVMediaFormat", "block2", "objc2-core-media"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [dependencies.objc2-core-foundation]
 version = "0.3"
 features = ["CFBase", "CFRunLoop", "CFMachPort", "CFString", "CFDictionary", "CFNumber", "CFDate"]
