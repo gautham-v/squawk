@@ -21,17 +21,23 @@ make install
 That builds `Squawk.app` into `/Applications`, installs the `squawk` CLI into `~/.local/bin`, and
 opens the app. It lives in the menu bar: five small bars.
 
+`~/.local/bin` is not on a stock macOS `PATH`. Add it (`export PATH="$HOME/.local/bin:$PATH"` in
+`~/.zshrc`), or install the CLI somewhere that is: `make install BIN_DIR=/usr/local/bin`.
+
 Or by hand, if you would rather put the CLI in `~/.cargo/bin`:
 
 ```sh
 make bundle                                   # builds and signs Squawk.app
 cp -R target/Squawk.app /Applications/
-cargo install --path crates/squawk-cli        # the `squawk` CLI
+cargo install --locked --path crates/squawk-cli   # the `squawk` CLI
 ```
 
-Needs a Rust toolchain (`rustup`) and the Xcode command line tools. The build signs the app with
-your Developer ID when you have one, so macOS keeps its permissions across rebuilds; without one it
-signs ad-hoc and macOS asks again after every build.
+Needs a Rust toolchain (`rustup`) and the Xcode command line tools. The build signs the app with a
+codesigning identity from your keychain (a Developer ID if you have one, else the first identity
+`security find-identity -v -p codesigning` lists, such as an Apple Development certificate), so
+macOS keeps its permissions across rebuilds. Pick one with `CODESIGN_IDENTITY="<name>" make
+install`. With no identity at all it signs ad-hoc, and macOS asks for permissions again after
+every build.
 
 ## First run
 
@@ -107,7 +113,8 @@ typed in last wins. Sessions inside tmux are not detected yet; you get plain dic
 
 Try it offline against any repo: `squawk transcribe clip.m4a --raw --cwd ~/code/project`.
 
-Turn it off with `claude_code_mode = false` in the config.
+Turn it off by setting `claude_code_mode = false` under `[dictation]` in
+`~/.config/squawk/config.toml`.
 
 ## Files
 
@@ -184,7 +191,7 @@ cargo run -p squawk-app --example menu_bar_preview   # every menu bar state at o
 
 The workspace: `squawk-core` (config, files, cleanup, the fn state machine, IPC, Claude Code
 mode), `squawk-engine` (audio, Parakeet, streaming dictation, meetings), `squawk-app` (the menu
-bar app), `squawk-cli` (`squawk`). [SPEC.md](SPEC.md) is the design.
+bar app), `squawk-cli` (`squawk`). [docs/design.md](docs/design.md) describes how they fit.
 
 ## Credits
 

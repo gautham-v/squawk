@@ -1,5 +1,5 @@
 //! Plain-text output for the subcommands, kept pure so every shape in
-//! SPEC.md ("squawk-cli") is a unit test rather than a manual check. No
+//! docs/design.md ("squawk-cli") is a unit test rather than a manual check. No
 //! colour anywhere: the output is read by people and by Claude alike, and
 //! piped as often as not.
 
