@@ -7,11 +7,13 @@
 
 pub mod cleanup;
 pub mod config;
+pub mod config_edit;
 pub mod context;
 pub mod dictionary;
 pub mod error;
 pub mod hotkey;
 pub mod ipc;
+pub mod notetaker;
 pub mod paths;
 pub mod pipeline;
 pub mod status;

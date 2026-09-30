@@ -75,6 +75,16 @@ pub struct MeetingConfig {
     /// and a "You" line that repeats what "Them" said at the same moment is
     /// dropped. Off records the mic as it is (fine with headphones).
     pub echo_cancellation: bool,
+    /// Offer to record this many seconds before a calendar event with other
+    /// people or a call link starts. 0 = at the start, negative = off.
+    pub heads_up_secs: i64,
+    /// Offer to take notes when a call app starts using the mic.
+    pub detect_calls: bool,
+    /// Stop and save a meeting after this many minutes, with a warning two
+    /// minutes before.
+    pub max_minutes: u64,
+    /// Stop and save when the call app the meeting follows lets go of the mic.
+    pub stop_when_call_ends: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,6 +127,10 @@ impl Default for MeetingConfig {
             system_audio: true,
             calendar_titles: true,
             echo_cancellation: true,
+            heads_up_secs: 15,
+            detect_calls: true,
+            max_minutes: 120,
+            stop_when_call_ends: true,
         }
     }
 }
@@ -199,6 +213,12 @@ impl Config {
         d.max_secs = d.max_secs.clamp(10, 3600);
         let m = &mut self.meeting;
         m.chunk_secs = m.chunk_secs.clamp(5, 300);
+        m.heads_up_secs = if m.heads_up_secs < 0 {
+            -1
+        } else {
+            m.heads_up_secs.min(3600)
+        };
+        m.max_minutes = m.max_minutes.clamp(5, 24 * 60);
         if self.model.dir.trim().is_empty() {
             self.model.dir = DEFAULT_MODEL_DIR.to_string();
         }
@@ -241,6 +261,17 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# squawk settings. Every key is optiona
 # Take the other side out of your mic when the call plays on speakers. Other audio is
 # ducked a little while a meeting records; with headphones you can turn this off.
 # echo_cancellation = true
+# The rest is what the popover's Settings tab changes.
+# Offer to record this many seconds before a calendar event with other people or a
+# call link starts: 0 = at the start, -1 = off.
+# heads_up_secs = 15
+# Offer to take notes when Zoom, Teams, FaceTime, Slack, Webex, Discord or a Meet tab
+# starts using the mic.
+# detect_calls = true
+# Stop and save after this many minutes (warns 2 min before).
+# max_minutes = 120
+# Stop and save when the call app lets go of the mic for 10 s.
+# stop_when_call_ends = true
 
 [model]
 # dir = "parakeet-tdt-0.6b-v3-int8"
@@ -281,6 +312,26 @@ mod tests {
         let c = Config::parse("[meeting]\necho_cancellation = false\n").unwrap();
         assert!(!c.meeting.echo_cancellation);
         assert!(c.meeting.system_audio);
+    }
+
+    #[test]
+    fn notetaker_defaults_and_clamps() {
+        let m = Config::default().meeting;
+        assert_eq!(
+            (
+                m.heads_up_secs,
+                m.detect_calls,
+                m.max_minutes,
+                m.stop_when_call_ends
+            ),
+            (15, true, 120, true)
+        );
+        let c = Config::parse("[meeting]\nheads_up_secs = -40\nmax_minutes = 0\n").unwrap();
+        assert_eq!(c.meeting.heads_up_secs, -1);
+        assert_eq!(c.meeting.max_minutes, 5);
+        let c = Config::parse("[meeting]\nheads_up_secs = 99999\nmax_minutes = 99999\n").unwrap();
+        assert_eq!(c.meeting.heads_up_secs, 3600);
+        assert_eq!(c.meeting.max_minutes, 1440);
     }
 
     #[test]

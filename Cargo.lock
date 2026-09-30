@@ -6115,6 +6115,7 @@ dependencies = [
  "crossbeam-channel",
  "futures",
  "gpui",
+ "libc",
  "log",
  "objc2",
  "objc2-app-kit",
@@ -6161,6 +6162,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
 ]
 
 [[package]]
