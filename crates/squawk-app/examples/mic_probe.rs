@@ -7,7 +7,8 @@
 //! `mic_probe watch [seconds]` runs the real pipeline instead: the
 //! listener-driven `MicWatcher` feeding a `Notetaker` ticked once a second,
 //! printing each change, answering Start to a call prompt and reporting when
-//! the meeting would stop.
+//! the meeting would stop (only at the maximum length: a call ending never
+//! stops one).
 
 use std::time::{Duration, Instant};
 

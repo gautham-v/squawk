@@ -83,8 +83,8 @@ fn prompts() -> Vec<Prompt> {
         Prompt::Saved {
             title: "Weekly sync".into(),
             path: "/tmp/2026-09-29 1400 Weekly sync.md".into(),
-            length_secs: 2530,
-            reason: StopReason::CallEnded("Zoom".into()),
+            length_secs: 7200,
+            reason: StopReason::MaxLength,
         },
     ]
 }

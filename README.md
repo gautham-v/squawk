@@ -186,7 +186,7 @@ off: `echo_cancellation = false` under `[meeting]`. Dictation never uses it.
 
 ## Notetaker
 
-Squawk can notice meetings for you. The popover's **Settings** tab has four settings; each one
+Squawk can notice meetings for you. The popover's **Settings** tab has three settings; each one
 is a key under `[meeting]` in `~/.config/squawk/config.toml`, and the tab writes the file (your
 comments and other keys stay as they are). Edit the file by hand if you prefer; the tab shows
 what the file says.
@@ -196,7 +196,6 @@ what the file says.
 | Heads-up before meetings | `heads_up_secs` | `15` | off (`-1`), at start (`0`), 15 s, 1 min, 5 min |
 | Detect calls | `detect_calls` | `true` | |
 | Maximum recording length | `max_minutes` | `120` | 30 min, 1 h, 2 h, 3 h, 4 h |
-| Stop when the call ends | `stop_when_call_ends` | `true` | |
 
 Questions come as a small panel under the menu bar icon, never as notifications, and never take
 focus from the call:
@@ -214,12 +213,12 @@ focus from the call:
   14.2 or later (Core Audio's per-process list); browser tabs are read by window title, which
   uses the Accessibility access squawk already has.
 - **Maximum recording length.** Two minutes before, "Stopping in 2 min" with **Keep going +30
-  min**; then the meeting stops and saves as if you pressed ⌥M.
-- **Stop when the call ends.** A meeting follows the call it was started from, or the call app
-  that has the mic while it records (so ⌥M during a Zoom call counts). Once that app has let go
-  of the mic for 10 seconds, the meeting stops and saves, and "Saved notes · Weekly sync" offers
-  **Open**. A few seconds without the mic (switching to AirPods) is still the same call. Some
-  apps keep the mic after you leave; the maximum length is the backstop.
+  min**; then the meeting stops and saves as if you pressed ⌥M, and "Saved notes · Weekly sync"
+  offers **Open**.
+
+Otherwise a meeting keeps recording until you stop it (⌥M, the popover or `squawk meet stop`),
+even when the call ends: some call apps let go of the mic when you mute, so that is no sign the
+call is over.
 
 The menu bar item stays as it is: no titles or countdowns there.
 

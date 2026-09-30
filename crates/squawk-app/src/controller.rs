@@ -13,8 +13,8 @@
 //!    paste, append to the day file, log the latency line; publish `Idle`.
 //! 4. `Cancel(_)` → `session.cancel()`; publish `Idle`. Nothing is written.
 //!
-//! The notetaker (heads-up, call detection, maximum length, stop when the
-//! call ends) is `squawk_core::notetaker::Notetaker`, ticked here once a
+//! The notetaker (heads-up, call detection, maximum length) is
+//! `squawk_core::notetaker::Notetaker`, ticked here once a
 //! second with the call apps `mic_watch` reports and the calendar's events;
 //! its prompt rides on the [`Snapshot`] to the panel under the menu bar icon.
 //!
@@ -666,9 +666,6 @@ impl Worker {
         self.meeting = Some(handle);
         self.notetaker
             .meeting_started(Instant::now(), &info.title, call);
-        if let Some(followed) = self.notetaker.meeting_call() {
-            log::info!(target: "meeting", "following the {} call", followed.app);
-        }
         self.sync_prompt();
         self.publish();
         log::info!(target: "meeting", "started");

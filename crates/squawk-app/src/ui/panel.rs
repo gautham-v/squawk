@@ -8,7 +8,7 @@
 //! | heads-up | the event | 15:00–15:30 | Record · Not now |
 //! | call | Call detected in Zoom | Start notes? | Start · Not now |
 //! | limit | Stopping in 2 min | Weekly sync · 2 h limit | Keep going +30 min |
-//! | saved | Saved notes · Weekly sync | 42:10 · the call ended | Open |
+//! | saved | Saved notes · Weekly sync | 2:00:00 · reached the time limit | Open |
 //!
 //! main.rs opens it as a non-activating PopUp window (it never takes focus
 //! from the call) whenever the snapshot has a prompt and the popover is
@@ -72,7 +72,6 @@ pub fn panel_text(prompt: &Prompt) -> PanelText {
                 "{} · {}",
                 format_elapsed(*length_secs),
                 match reason {
-                    StopReason::CallEnded(_) => "the call ended",
                     StopReason::MaxLength => "reached the time limit",
                 }
             ),
@@ -254,11 +253,11 @@ mod tests {
         let text = panel_text(&Prompt::Saved {
             title: "Weekly sync".into(),
             path: "/m.md".into(),
-            length_secs: 2530,
-            reason: StopReason::CallEnded("Zoom".into()),
+            length_secs: 7200,
+            reason: StopReason::MaxLength,
         });
         assert_eq!(text.title, "Saved notes · Weekly sync");
-        assert_eq!(text.line, "42:10 · the call ended");
+        assert_eq!(text.line, "2:00:00 · reached the time limit");
         assert_eq!((text.accept, text.dismiss), ("Open", None));
     }
 }

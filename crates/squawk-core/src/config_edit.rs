@@ -177,15 +177,9 @@ mod tests {
 
     #[test]
     fn a_missing_table_is_created() {
-        let out = set_value(
-            "keep_audio = true\n",
-            "meeting",
-            "stop_when_call_ends",
-            false,
-        )
-        .unwrap();
+        let out = set_value("keep_audio = true\n", "meeting", "detect_calls", false).unwrap();
         let config = Config::parse(&out).unwrap();
-        assert!(!config.meeting.stop_when_call_ends);
+        assert!(!config.meeting.detect_calls);
         assert!(config.keep_audio);
         let out = set_value("", "meeting", "max_minutes", 30).unwrap();
         assert_eq!(Config::parse(&out).unwrap().meeting.max_minutes, 30);

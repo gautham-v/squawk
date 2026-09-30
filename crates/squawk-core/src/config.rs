@@ -83,8 +83,6 @@ pub struct MeetingConfig {
     /// Stop and save a meeting after this many minutes, with a warning two
     /// minutes before.
     pub max_minutes: u64,
-    /// Stop and save when the call app the meeting follows lets go of the mic.
-    pub stop_when_call_ends: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -130,7 +128,6 @@ impl Default for MeetingConfig {
             heads_up_secs: 15,
             detect_calls: true,
             max_minutes: 120,
-            stop_when_call_ends: true,
         }
     }
 }
@@ -270,8 +267,6 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# squawk settings. Every key is optiona
 # detect_calls = true
 # Stop and save after this many minutes (warns 2 min before).
 # max_minutes = 120
-# Stop and save when the call app lets go of the mic for 10 s.
-# stop_when_call_ends = true
 
 [model]
 # dir = "parakeet-tdt-0.6b-v3-int8"
@@ -318,13 +313,8 @@ mod tests {
     fn notetaker_defaults_and_clamps() {
         let m = Config::default().meeting;
         assert_eq!(
-            (
-                m.heads_up_secs,
-                m.detect_calls,
-                m.max_minutes,
-                m.stop_when_call_ends
-            ),
-            (15, true, 120, true)
+            (m.heads_up_secs, m.detect_calls, m.max_minutes),
+            (15, true, 120)
         );
         let c = Config::parse("[meeting]\nheads_up_secs = -40\nmax_minutes = 0\n").unwrap();
         assert_eq!(c.meeting.heads_up_secs, -1);
@@ -338,6 +328,20 @@ mod tests {
     fn unknown_keys_are_ignored() {
         let c = Config::parse("future_key = 1\n[hotkey]\nwhatever = \"x\"\n").unwrap();
         assert_eq!(c, Config::default());
+    }
+
+    /// Files written while "Stop when the call ends" existed still load,
+    /// quietly.
+    #[test]
+    fn the_retired_stop_when_call_ends_key_is_ignored() {
+        let text = "[meeting]\nstop_when_call_ends = false\n";
+        assert_eq!(Config::parse(text).unwrap(), Config::default());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        let (config, note) = Config::load(&path);
+        assert_eq!(config, Config::default());
+        assert_eq!(note, None);
     }
 
     #[test]

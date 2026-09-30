@@ -1,4 +1,4 @@
-//! The notetaker: the four `[meeting]` settings the popover's Settings tab
+//! The notetaker: the three `[meeting]` settings the popover's Settings tab
 //! edits, and the pure state machine behind them.
 //!
 //! - **Heads-up** before a calendar event with other people or a call link
@@ -7,11 +7,12 @@
 //!   a prompt with Start / Not now. Not now (or ignoring it) holds for the
 //!   rest of that call.
 //! - **Maximum recording length**: a prompt two minutes before (Keep going
-//!   adds 30 minutes), then stop and save.
-//! - **Stop when the call ends**: a meeting follows a call (the one it was
-//!   started from, else the one that has the mic while it records); once
-//!   that app has let go of the mic for 10 s, stop and save, then show a
-//!   brief "Saved notes" prompt with Open.
+//!   adds 30 minutes), then stop and save, then a brief "Saved notes" prompt
+//!   with Open.
+//!
+//! Otherwise a meeting stops only when the user stops it (⌥M, the popover,
+//! `squawk meet stop`). A call app letting go of the mic never stops one:
+//! some do that on mute, mid-call.
 //!
 //! [`Notetaker`] takes explicit times (a monotonic `Instant` for the timers,
 //! wall-clock `DateTime<Local>` for the calendar), so every rule is tested
@@ -29,7 +30,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 
 use crate::config::MeetingConfig;
-use calls::{Call, CallEvent, CallId, CallTracker};
+use calls::{CallEvent, CallId, CallTracker};
 use heads_up::UpcomingEvent;
 
 /// The heads-up choices, in seconds before the start (-1 = off).
@@ -72,7 +73,6 @@ pub enum Setting {
     HeadsUpSecs(i64),
     DetectCalls(bool),
     MaxMinutes(u64),
-    StopWhenCallEnds(bool),
 }
 
 impl Setting {
@@ -81,7 +81,6 @@ impl Setting {
             Setting::HeadsUpSecs(_) => "heads_up_secs",
             Setting::DetectCalls(_) => "detect_calls",
             Setting::MaxMinutes(_) => "max_minutes",
-            Setting::StopWhenCallEnds(_) => "stop_when_call_ends",
         }
     }
 
@@ -89,7 +88,7 @@ impl Setting {
         match self {
             Setting::HeadsUpSecs(v) => v.into(),
             Setting::MaxMinutes(v) => (v as i64).into(),
-            Setting::DetectCalls(v) | Setting::StopWhenCallEnds(v) => v.into(),
+            Setting::DetectCalls(v) => v.into(),
         }
     }
 
@@ -99,7 +98,6 @@ impl Setting {
             Setting::HeadsUpSecs(v) => meeting.heads_up_secs = v,
             Setting::DetectCalls(v) => meeting.detect_calls = v,
             Setting::MaxMinutes(v) => meeting.max_minutes = v,
-            Setting::StopWhenCallEnds(v) => meeting.stop_when_call_ends = v,
         }
     }
 }
@@ -111,7 +109,6 @@ pub struct Settings {
     pub heads_up: Option<Duration>,
     pub detect_calls: bool,
     pub max_length: Duration,
-    pub stop_when_call_ends: bool,
 }
 
 impl From<&MeetingConfig> for Settings {
@@ -120,7 +117,6 @@ impl From<&MeetingConfig> for Settings {
             heads_up: u64::try_from(m.heads_up_secs).ok().map(Duration::from_secs),
             detect_calls: m.detect_calls,
             max_length: Duration::from_secs(m.max_minutes * 60),
-            stop_when_call_ends: m.stop_when_call_ends,
         }
     }
 }
@@ -136,8 +132,6 @@ impl Default for Settings {
 pub enum StopReason {
     /// It reached the maximum length.
     MaxLength,
-    /// The call it followed ended (the app's name).
-    CallEnded(String),
 }
 
 /// What the panel under the menu bar icon shows.
@@ -202,8 +196,6 @@ struct Watch {
     started: Instant,
     limit: Duration,
     warned: bool,
-    /// The call this meeting follows.
-    call: Option<Call>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,17 +260,12 @@ impl Notetaker {
 
     /// Whether the mic needs watching at all.
     pub fn wants_mic(&self) -> bool {
-        self.settings.detect_calls || self.settings.stop_when_call_ends
+        self.settings.detect_calls
     }
 
     /// Whether the calendar needs reading.
     pub fn wants_calendar(&self) -> bool {
         self.settings.heads_up.is_some()
-    }
-
-    /// The call a running meeting follows.
-    pub fn meeting_call(&self) -> Option<&Call> {
-        self.meeting.as_ref().and_then(|m| m.call.as_ref())
     }
 
     fn show(&mut self, prompt: Prompt, until: Option<Instant>) {
@@ -299,12 +286,13 @@ impl Notetaker {
 
         for event in self.tracker.update(now, mic) {
             match event {
+                // A call that starts during a meeting is not offered: the
+                // notes are already running.
                 CallEvent::Started(call) => {
-                    if let Some(m) = self.meeting.as_mut() {
-                        if m.call.is_none() {
-                            m.call = Some(call);
-                        }
-                    } else if self.settings.detect_calls && self.offered.insert(call.id) {
+                    if self.meeting.is_none()
+                        && self.settings.detect_calls
+                        && self.offered.insert(call.id)
+                    {
                         let app = call.app.clone();
                         self.show(
                             Prompt::Call { call: call.id, app },
@@ -318,14 +306,6 @@ impl Notetaker {
                     {
                         self.shown = None;
                     }
-                    if let Some(m) = self.meeting.as_mut() {
-                        if m.call.as_ref().map(|c| c.id) == Some(call.id) {
-                            m.call = None;
-                            if self.settings.stop_when_call_ends {
-                                stop = Some(StopReason::CallEnded(call.app));
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -333,7 +313,7 @@ impl Notetaker {
         if let Some(m) = self.meeting.as_mut() {
             let elapsed = now.saturating_duration_since(m.started);
             if elapsed >= m.limit {
-                stop.get_or_insert(StopReason::MaxLength);
+                stop = Some(StopReason::MaxLength);
             } else if !m.warned && elapsed + WARN_BEFORE >= m.limit {
                 m.warned = true;
                 let prompt = Prompt::StoppingSoon {
@@ -404,23 +384,23 @@ impl Notetaker {
         }
     }
 
-    /// A meeting started (from a prompt, ⌥M, the popover or the CLI). It
-    /// follows `call` if that call is still going, else whichever call has
-    /// the mic now, else the next one to start.
+    /// A meeting started (from a prompt, ⌥M, the popover or the CLI). The
+    /// call it was started from (`call`, else whichever call has the mic
+    /// now) counts as offered, so it is not offered again after the
+    /// meeting stops.
     pub fn meeting_started(&mut self, now: Instant, title: &str, call: Option<CallId>) {
         let call = call
             .and_then(|id| self.tracker.get(id))
             .or_else(|| self.tracker.current())
-            .cloned();
-        if let Some(c) = &call {
-            self.offered.insert(c.id);
+            .map(|c| c.id);
+        if let Some(id) = call {
+            self.offered.insert(id);
         }
         self.meeting = Some(Watch {
             title: title.to_string(),
             started: now,
             limit: self.settings.max_length,
             warned: false,
-            call,
         });
         // Whatever the panel was offering, the user now has notes running.
         self.shown = None;
@@ -553,7 +533,7 @@ mod tests {
     fn settings_come_from_the_config() {
         let s = Settings::default();
         assert_eq!(s.heads_up, Some(secs(15)));
-        assert!(s.detect_calls && s.stop_when_call_ends);
+        assert!(s.detect_calls);
         assert_eq!(s.max_length, mins(120));
         let mut m = MeetingConfig::default();
         Setting::HeadsUpSecs(-1).apply(&mut m);
@@ -618,8 +598,8 @@ mod tests {
         let mut c = Clock::new();
         c.run(&mut n, 30, &zoom(), &[]);
         assert_eq!(n.prompt(), None);
-        // But the mic is still watched so the meeting can stop with the call.
-        assert!(n.wants_mic());
+        // Nothing else needs the mic watched.
+        assert!(!n.wants_mic());
     }
 
     #[test]
@@ -635,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn start_from_the_call_prompt_then_stop_when_the_call_ends() {
+    fn a_meeting_started_from_the_call_prompt_outlasts_the_call() {
         let mut n = Notetaker::new(settings());
         let mut c = Clock::new();
         c.run(&mut n, 4, &zoom(), &[]);
@@ -650,25 +630,16 @@ mod tests {
         assert_eq!(title, None);
         assert_eq!(fallback, "Zoom call");
         n.meeting_started(c.now(), "Zoom call", call);
-        assert_eq!(n.meeting_call().map(|c| c.app.as_str()), Some("Zoom"));
 
         assert_eq!(c.run(&mut n, 600, &zoom(), &[]), None);
-        // Zoom lets go of the mic: nothing for 9 s, then stop.
-        assert_eq!(c.run(&mut n, 610, &[], &[]), None);
-        assert_eq!(
-            c.run(&mut n, 611, &[], &[]),
-            Some(StopReason::CallEnded("Zoom".into()))
-        );
+        // Zoom lets go of the mic (muted, say): the meeting keeps recording.
+        assert_eq!(c.run(&mut n, 900, &[], &[]), None);
+        assert_eq!(n.prompt(), None);
+        // Stopped by hand while Zoom still has the mic: not offered again.
+        c.run(&mut n, 910, &zoom(), &[]);
         n.meeting_stopped();
-        n.saved(
-            c.now(),
-            "Zoom call".into(),
-            "/m.md".into(),
-            608,
-            StopReason::CallEnded("Zoom".into()),
-        );
-        assert!(matches!(n.prompt(), Some(Prompt::Saved { .. })));
-        assert_eq!(n.reply(Reply::Accept), Outcome::Open("/m.md".into()));
+        c.run(&mut n, 1000, &zoom(), &[]);
+        assert_eq!(n.prompt(), None);
     }
 
     #[test]
@@ -682,6 +653,7 @@ mod tests {
             1,
             StopReason::MaxLength,
         );
+        assert!(matches!(n.prompt(), Some(Prompt::Saved { .. })));
         c.run(&mut n, 7, &[], &[]);
         assert!(n.prompt().is_some());
         c.run(&mut n, 8, &[], &[]);
@@ -689,31 +661,25 @@ mod tests {
     }
 
     #[test]
-    fn a_manual_meeting_follows_the_call_that_has_the_mic() {
+    fn a_manual_meeting_takes_the_call_prompt_down_and_ignores_the_mic() {
         let mut n = Notetaker::new(settings());
         let mut c = Clock::new();
         c.run(&mut n, 5, &zoom(), &[]);
-        // ⌥M while the call prompt is up: the prompt goes, the meeting follows Zoom.
+        // ⌥M while the call prompt is up: the prompt goes, notes run.
         n.meeting_started(c.now(), "Weekly sync", None);
         assert_eq!(n.prompt(), None);
-        assert_eq!(n.meeting_call().map(|c| c.app.as_str()), Some("Zoom"));
         c.run(&mut n, 100, &zoom(), &[]);
-        assert_eq!(
-            c.run(&mut n, 115, &[], &[]),
-            Some(StopReason::CallEnded("Zoom".into()))
-        );
+        assert_eq!(c.run(&mut n, 400, &[], &[]), None);
     }
 
     #[test]
-    fn a_call_that_starts_during_a_meeting_is_followed_and_not_offered() {
+    fn a_call_that_starts_during_a_meeting_is_not_offered() {
         let mut n = Notetaker::new(settings());
         let mut c = Clock::new();
         n.meeting_started(c.now(), "Meeting", None);
-        assert_eq!(n.meeting_call(), None);
         c.run(&mut n, 60, &[], &[]);
         c.run(&mut n, 70, &zoom(), &[]);
         assert_eq!(n.prompt(), None);
-        assert_eq!(n.meeting_call().map(|c| c.app.as_str()), Some("Zoom"));
     }
 
     #[test]
@@ -722,19 +688,6 @@ mod tests {
         let mut c = Clock::new();
         n.meeting_started(c.now(), "In person", None);
         assert_eq!(c.run(&mut n, 3000, &[], &[]), None);
-    }
-
-    #[test]
-    fn stop_when_call_ends_off_keeps_recording() {
-        let mut n = Notetaker::new(Settings {
-            stop_when_call_ends: false,
-            ..settings()
-        });
-        let mut c = Clock::new();
-        c.run(&mut n, 5, &zoom(), &[]);
-        n.meeting_started(c.now(), "M", None);
-        c.run(&mut n, 100, &zoom(), &[]);
-        assert_eq!(c.run(&mut n, 200, &[], &[]), None);
     }
 
     #[test]

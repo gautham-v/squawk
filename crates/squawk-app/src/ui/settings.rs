@@ -116,16 +116,6 @@ pub fn rows(m: &MeetingConfig, calendar: Option<bool>) -> Vec<Row> {
                 value: max_length_label(m.max_minutes),
             },
         },
-        Row {
-            id: "setting-stop-with-call",
-            label: "Stop when the call ends",
-            note: "After the call app lets go of the mic for 10 s".into(),
-            fix: None,
-            control: Control::Switch {
-                on: m.stop_when_call_ends,
-                toggled: Setting::StopWhenCallEnds(!m.stop_when_call_ends),
-            },
-        },
     ]
 }
 
@@ -379,8 +369,7 @@ mod tests {
             [
                 "Heads-up before meetings",
                 "Detect calls",
-                "Maximum recording length",
-                "Stop when the call ends"
+                "Maximum recording length"
             ]
         );
         assert_eq!(
@@ -402,13 +391,6 @@ mod tests {
             Control::Choice {
                 menu: Menu::MaxLength,
                 value: "2 h".into()
-            }
-        );
-        assert_eq!(
-            rows[3].control,
-            Control::Switch {
-                on: true,
-                toggled: Setting::StopWhenCallEnds(false)
             }
         );
     }

@@ -149,7 +149,6 @@ defaults plus a human note (`Config::load -> (Config, Option<String>)`) that the
 | `[meeting] heads_up_secs` | `15` (−1–3600; < 0 = off) | heads-up this long before a qualifying calendar event; 0 = at the start |
 | `[meeting] detect_calls` | `true` | offer notes when a call app starts using the mic |
 | `[meeting] max_minutes` | `120` (5–1440) | stop and save after this long, warning 2 min before |
-| `[meeting] stop_when_call_ends` | `true` | stop and save 10 s after the followed call app lets go of the mic |
 | `[model] dir` | `parakeet-tdt-0.6b-v3-int8` | directory under models/ |
 | `[model] url` | `https://blob.handy.computer/parakeet-v3-int8.tar.gz` | where to download it |
 | `[model] threads` | `0` | ORT intra-op threads, 0 = ORT decides |
@@ -231,19 +230,21 @@ calendar) so the tests use synthetic timestamps.
   Outcome`, `meeting_started(now, title, Option<CallId>)`, `meeting_stopped()`, `saved(..)`,
   `wants_mic()`, `wants_calendar()`. `Prompt::{HeadsUp, Call, StoppingSoon, Saved}`,
   `Outcome::{Nothing, StartMeeting{title, fallback, call}, Extended, Open(path)}`,
-  `StopReason::{MaxLength, CallEnded(app)}`, `Setting::{HeadsUpSecs, DetectCalls, MaxMinutes,
-  StopWhenCallEnds}` (`key()`, `value()`, `apply()`). Rules:
+  `StopReason::MaxLength`, `Setting::{HeadsUpSecs, DetectCalls, MaxMinutes}` (`key()`,
+  `value()`, `apply()`). Rules:
   - a started call with no meeting and `detect_calls` → `Prompt::Call` for 20 s (no answer =
     Not now); each call is offered once; its end takes its prompt down;
-  - a meeting follows the call it was started from, else the call holding the mic when it
-    started, else the next call to start during it; that call's end → `StopReason::CallEnded`
-    when `stop_when_call_ends`;
+  - a call that starts during a meeting is not offered; the call a meeting was started from
+    (else the one holding the mic then) counts as offered. A call ending never stops a meeting:
+    some apps let go of the mic on mute, mid-call. Meetings stop at `max_length` or by hand
+    (⌥M, the popover, `squawk meet stop`); an old `stop_when_call_ends` key in config.toml is
+    ignored like any unknown key;
   - `max_length − 2 min` → `Prompt::StoppingSoon` (stays up); Accept adds 30 min and re-arms the
     warning; `max_length` → `StopReason::MaxLength`; a changed setting applies to the running
     meeting;
   - heads-up only with no meeting, once per event, up until 60 s after the start (at least 30 s
     on screen); Accept → `StartMeeting` with the event's title;
-  - `Saved` (after an automatic stop) for 8 s, Accept → `Open(path)`;
+  - `Saved` (after the maximum-length stop) for 8 s, Accept → `Open(path)`;
   - the newest prompt replaces the one showing; starting a meeting clears it.
 
 ### squawk-core::context
@@ -611,8 +612,8 @@ One thread; owns `Engine`, the live `DictationSession`, the live `MeetingHandle`
   current calendar event, else the fallback, e.g. "Zoom call") / open the file. Every meeting
   start (⌥M, popover, IPC, prompt) calls `meeting_started`, every stop `meeting_stopped`.
   `SetSetting(Setting)` → `config_edit::set_in_file(config, "meeting", key, value)` then the
-  normal reload. The mic watcher starts once `detect_calls` or `stop_when_call_ends` is on (and
-  then runs for the app's life; samples are ignored while both are off); Calendar access is
+  normal reload. The mic watcher starts once `detect_calls` is on (and then runs for the app's
+  life; samples are ignored while it is off); Calendar access is
   requested (in the background) the first time the heads-up is on and access is undetermined.
   `Snapshot` carries `meeting_config`, `prompt` and `calendar_access`.
 
@@ -670,7 +671,7 @@ buttons (the first semibold). `panel_text(&Prompt)` is the pure wording:
 | `HeadsUp` | event title | `15:00–15:30` | Record · Not now |
 | `Call` | Call detected in Zoom | Start notes? | Start · Not now |
 | `StoppingSoon` | Stopping in 2 min | Weekly sync · 2 h limit | Keep going +30 min |
-| `Saved` | Saved notes · Weekly sync | 42:10 · the call ended | Open |
+| `Saved` | Saved notes · Weekly sync | 2:00:00 · reached the time limit | Open |
 
 ### Call detection (mic_watch.rs)
 
@@ -696,15 +697,15 @@ title "Meet – abc-defg-hij - Google Chrome" → Google Meet; Firefox Developer
 from its main process (`org.mozilla.firefoxdeveloperedition`), title "Meet – abc-defg-hij".
 `mic_probe watch` (the watcher and a `Notetaker`) with the page taking the mic for 2 s, letting go
 for 6 s, holding it 20 s, letting go 5 s, holding 8 s: the 2 s use was ignored, the call prompt
-came 3.2 s into the 20 s hold, the 5 s gap stayed the same call, and the stop came 10 s after
+came 3.2 s into the 20 s hold, the 5 s gap stayed the same call, and the call ended 10 s after
 the last release.
 
 ### Settings tab (ui/settings.rs)
 
 Rows (`settings::rows(&MeetingConfig, calendar_access)`, pure): a "Meetings" caption, then
 label + muted line + control — Heads-up before meetings (pop-up: Off / At start / 15 s / 1 min /
-5 min), Detect calls (switch), Maximum recording length (pop-up: 30 min / 1 h / 2 h / 3 h / 4 h),
-Stop when the call ends (switch) — a hairline, and "Edit config.toml" (muted, "Dictation, model"
+5 min), Detect calls (switch), Maximum recording length (pop-up: 30 min / 1 h / 2 h / 3 h / 4 h)
+— a hairline, and "Edit config.toml" (muted, "Dictation, model"
 on the right) which opens the file. A value off the menu (hand-edited `max_minutes = 90`) shows
 as "1 h 30 min" with nothing checked. With the heads-up on and Calendar refused, its line
 becomes "Needs Calendar access · Open Settings" (opens `Pane::Calendars`). Pop-ups are a
