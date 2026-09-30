@@ -10,8 +10,9 @@
 //! request if a partial file exists), then unpack into
 //! `<models_dir>/<dir>.partial/` and rename to `<models_dir>/<dir>/` only once
 //! every required file is there, so a half-unpacked model is never mistaken
-//! for a good one. Delete the tarball afterwards. The only network access
-//! squawk ever makes.
+//! for a good one. Delete the tarball afterwards. One of the two network
+//! accesses squawk makes; the other is the cleanup model's download
+//! (`normalizer`), which reuses [`fetch`] and the checksum.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, Write};
@@ -136,7 +137,7 @@ const BODY_WINDOW: Duration = Duration::from_secs(60);
 /// Stream `url` into `part`, resuming from its current length, and keep
 /// resuming as long as each attempt makes progress. An attempt that adds
 /// nothing (a stall, an HTTP error) ends it with that attempt's error.
-fn fetch(
+pub(crate) fn fetch(
     url: &str,
     part: &Path,
     expected: Option<u64>,
@@ -277,7 +278,7 @@ fn parse_content_range_total(v: &str) -> Option<u64> {
     v.rsplit('/').next()?.trim().parse().ok()
 }
 
-fn verify_sha256(path: &Path, want: &str) -> Result<(), EngineError> {
+pub(crate) fn verify_sha256(path: &Path, want: &str) -> Result<(), EngineError> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];

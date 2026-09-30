@@ -418,6 +418,9 @@ fn main() {
                 PopoverEvent::SetSetting(setting) => {
                     controller.send(Command::SetSetting(*setting));
                 }
+                PopoverEvent::SetCleanupModel(on) => {
+                    controller.send(Command::SetCleanupModel(*on));
+                }
             }
         })
         .detach();

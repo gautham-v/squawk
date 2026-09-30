@@ -89,6 +89,8 @@ pub enum PopoverEvent {
     ToggleMeeting,
     /// A Settings-tab change, to be written to config.toml.
     SetSetting(Setting),
+    /// "Clean up with S1-mini" switched, to be written to config.toml.
+    SetCleanupModel(bool),
 }
 
 actions!(
@@ -390,6 +392,14 @@ impl Popover {
         cx.notify();
     }
 
+    /// The dictation cleanup switch: shown at once, written by the owner.
+    pub(crate) fn set_cleanup_model(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.open_menu = None;
+        self.snapshot.cleanup_model = on;
+        cx.emit(PopoverEvent::SetCleanupModel(on));
+        cx.notify();
+    }
+
     fn scroll_to_top(&self) {
         self.list_scroll.set_offset(Point::default());
         let dictionary = self.dictionary_scroll.0.borrow();
@@ -643,6 +653,10 @@ impl Popover {
                     self.theme,
                     &self.snapshot.meeting_config,
                     self.snapshot.calendar_access,
+                    settings::Cleanup {
+                        on: self.snapshot.cleanup_model,
+                        status: &self.snapshot.cleanup_status,
+                    },
                     self.open_menu,
                     cx,
                 ),

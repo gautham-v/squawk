@@ -19,9 +19,15 @@ anyhow.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 log.workspace = true
+libc.workspace = true
 
 # speech to text: NVIDIA Parakeet TDT 0.6B v3 (int8 ONNX)
 transcribe-rs = { version = "0.3.11", features = ["onnx"] }
+
+# dictation cleanup: S1-mini by Superwhisper (GGUF) through llama.cpp on
+# the GPU. No OpenMP (Apple clang has none; Metal does the work).
+llama-cpp-2 = { version = "0.1.157", default-features = false, features = ["metal"] }
+llama-cpp-sys-2 = { version = "0.1.157", default-features = false }
 
 # audio
 cpal = "0.18"

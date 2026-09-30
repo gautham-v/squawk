@@ -13,6 +13,7 @@ pub mod dictionary;
 pub mod error;
 pub mod hotkey;
 pub mod ipc;
+pub mod normalize;
 pub mod notetaker;
 pub mod paths;
 pub mod pipeline;

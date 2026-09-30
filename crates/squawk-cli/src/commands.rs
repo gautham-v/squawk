@@ -8,10 +8,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use squawk_core::cleanup::CleanupOptions;
+use squawk_core::config::CLEANUP_MODEL_URL;
 use squawk_core::context::{Agent, Context, RepoVocab, Session};
 use squawk_core::ipc::{self, Request, Response};
+use squawk_core::normalize::Normalizer;
 use squawk_core::{dictionary, pipeline, Config, Dictionary, ModelStatus, Paths, Store};
-use squawk_engine::{model, Engine, EngineConfig};
+use squawk_engine::{model, normalizer, Engine, EngineConfig};
 
 use crate::format;
 
@@ -234,9 +236,42 @@ pub fn model_download(env: &Env) -> anyhow::Result<()> {
     let config = env.engine_config();
     let dir = config.model_dir();
     if model::is_installed(&dir) {
-        return emit(&format!("Model already installed: {}\n", dir.display()));
+        emit(&format!("Model already installed: {}\n", dir.display()))?;
+    } else {
+        std::fs::create_dir_all(&config.paths.models_dir)?;
+        let dir = with_progress(|progress| {
+            model::download(
+                &config.model.url,
+                &config.paths.models_dir,
+                &config.model.dir,
+                progress,
+            )
+        })?;
+        emit(&format!("Model ready: {}\n", dir.display()))?;
     }
-    std::fs::create_dir_all(&config.paths.models_dir)?;
+    if !config.cleanup_model {
+        return Ok(());
+    }
+    let s1 = normalizer::model_path(&config.paths.models_dir);
+    if normalizer::is_installed(&config.paths.models_dir) {
+        return emit(&format!(
+            "S1-mini by Superwhisper already installed: {}\n",
+            s1.display()
+        ));
+    }
+    with_progress(|progress| {
+        normalizer::download(CLEANUP_MODEL_URL, &config.paths.models_dir, progress)
+    })?;
+    emit(&format!(
+        "S1-mini by Superwhisper ready: {}\n",
+        s1.display()
+    ))
+}
+
+/// Run a download with its progress on one stderr line, rewritten in place.
+fn with_progress<T>(
+    run: impl FnOnce(&mut dyn FnMut(ModelStatus)) -> Result<T, squawk_engine::EngineError>,
+) -> anyhow::Result<T> {
     let mut stderr = std::io::stderr();
     let mut last_len = 0usize;
     // one line, rewritten in place; padded so a shorter line erases a longer
@@ -246,20 +281,15 @@ pub fn model_download(env: &Env) -> anyhow::Result<()> {
         let _ = write!(stderr, "\r{line}{}", " ".repeat(pad));
         let _ = stderr.flush();
     };
-    let result = model::download(
-        &config.model.url,
-        &config.paths.models_dir,
-        &config.model.dir,
-        &mut |status| match status {
-            ModelStatus::Downloading { downloaded, total } => {
-                show(format::download_progress(downloaded, total))
-            }
-            other => show(other.label()),
-        },
-    );
+    let result = run(&mut |status| match status {
+        ModelStatus::Downloading { downloaded, total } => {
+            show(format::download_progress(downloaded, total))
+        }
+        ModelStatus::Extracting => show("Checking the download".into()),
+        other => show(other.label()),
+    });
     eprintln!();
-    let dir = result?;
-    emit(&format!("Model ready: {}\n", dir.display()))
+    Ok(result?)
 }
 
 pub fn transcribe(env: &Env, file: &Path, raw: bool, cwd: Option<&Path>) -> anyhow::Result<()> {
@@ -273,9 +303,23 @@ pub fn transcribe(env: &Env, file: &Path, raw: bool, cwd: Option<&Path>) -> anyh
         Some(dir) => Some(offline_context(dir)?),
         None => None,
     };
+    let cleanup_model = config.cleanup_model;
     let engine = Engine::new(config);
     let t = Instant::now();
     engine.load_model_blocking()?;
+    let normalizer = if cleanup_model {
+        match engine.load_cleanup_model_blocking() {
+            Ok(n) => Some(n),
+            Err(e) => {
+                if raw {
+                    eprintln!("S1-mini: {e} (run `squawk model download`); rules only");
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
     let load = t.elapsed();
     let samples = squawk_engine::audio::load_file(file)?;
     let audio_secs = samples.len() as f64 / squawk_engine::SAMPLE_RATE as f64;
@@ -288,13 +332,25 @@ pub fn transcribe(env: &Env, file: &Path, raw: bool, cwd: Option<&Path>) -> anyh
         remove_fillers: env.config.dictation.remove_fillers,
         fix_doubles: true,
     };
-    let clean = pipeline::finish(&text, &dict, context.as_ref(), &opts);
+    let finished = pipeline::finish_with(
+        &text,
+        normalizer.as_ref().map(|n| n as &dyn Normalizer),
+        &dict,
+        context.as_ref(),
+        &opts,
+    );
+    let clean = finished.text;
     if raw {
+        let s1 = match &finished.model_text {
+            Some(answer) => format!("s1:    {answer}\n"),
+            None => String::new(),
+        };
         emit(&format!(
-            "raw:   {}\nclean: {}\n{}\n",
+            "raw:   {}\n{s1}clean: {}\n{}{}\n",
             text.trim(),
             clean,
-            format::timings(audio_secs, load, run)
+            format::timings(audio_secs, load, run),
+            format::cleanup_timing(&finished.cleanup.label(), finished.model_time)
         ))
     } else if clean.is_empty() {
         Err(exit(1, "No speech found."))

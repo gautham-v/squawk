@@ -1,0 +1,5 @@
+# The app says it runs on macOS 15 (LSMinimumSystemVersion in scripts/bundle.sh).
+# Without this, C/C++ built by build scripts (llama.cpp) targets the SDK's version
+# (26.x with a current Xcode), and its availability checks compile away.
+[env]
+MACOSX_DEPLOYMENT_TARGET = "15.0"

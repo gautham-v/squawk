@@ -17,6 +17,12 @@ pub const DEFAULT_MODEL_URL: &str = "https://blob.handy.computer/parakeet-v3-int
 /// The directory the tarball unpacks to, under `Paths::models_dir`.
 pub const DEFAULT_MODEL_DIR: &str = "parakeet-tdt-0.6b-v3-int8";
 
+/// "S1-mini" by "Superwhisper", the dictation cleanup model: one GGUF file
+/// (Q4_K_M), pinned to a revision so the checksum holds.
+pub const CLEANUP_MODEL_URL: &str = "https://huggingface.co/superwhisper/s1-mini-GGUF/resolve/34add00a48a2e5d24e5a4ee5405a99620a3a240c/s1-mini-q4_k_m.gguf";
+/// The file it is saved as, under `Paths::models_dir`.
+pub const CLEANUP_MODEL_FILE: &str = "s1-mini-q4_k_m.gguf";
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -59,6 +65,10 @@ pub struct DictationConfig {
     /// A dictation longer than this is stopped and pasted, in case a fn
     /// release was missed.
     pub max_secs: u64,
+    /// Clean each dictation with "S1-mini" by "Superwhisper" (fillers, false
+    /// starts, broken sentences, numbers) before the rules and the
+    /// dictionary. Downloads the model (462 MB) the first time.
+    pub cleanup_model: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -114,6 +124,7 @@ impl Default for DictationConfig {
             paste_restore_ms: 300,
             input_device: String::new(),
             max_secs: 600,
+            cleanup_model: true,
         }
     }
 }
@@ -250,6 +261,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# squawk settings. Every key is optiona
 # paste_restore_ms = 300
 # input_device = ""
 # max_secs = 600
+# Clean dictations with S1-mini by Superwhisper: fillers, false starts, broken sentences,
+# numbers. Downloads the model (462 MB) the first time. The popover's Settings tab changes it.
+# cleanup_model = true
 
 [meeting]
 # chunk_secs = 30
@@ -299,6 +313,14 @@ mod tests {
         assert!(c.dictation.claude_code_mode);
         assert_eq!(c.meeting.chunk_secs, 30);
         assert_eq!(c.model.url, DEFAULT_MODEL_URL);
+    }
+
+    #[test]
+    fn the_cleanup_model_is_on_unless_turned_off() {
+        assert!(Config::default().dictation.cleanup_model);
+        let c = Config::parse("[dictation]\ncleanup_model = false\n").unwrap();
+        assert!(!c.dictation.cleanup_model);
+        assert!(c.dictation.remove_fillers);
     }
 
     #[test]

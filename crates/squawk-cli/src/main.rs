@@ -61,10 +61,11 @@ enum Command {
         #[command(subcommand)]
         command: ModelCommand,
     },
-    /// Transcribe an audio file offline and print the cleaned text.
+    /// Transcribe an audio file offline and print the cleaned text (with
+    /// S1-mini when `cleanup_model` is on and it is downloaded).
     Transcribe {
         file: std::path::PathBuf,
-        /// Print the raw model text too, and timings.
+        /// Print the raw model text and S1-mini's answer too, and timings.
         #[arg(long)]
         raw: bool,
         /// Apply Claude Code mode as if a session were running in this
@@ -104,7 +105,8 @@ enum DictCommand {
 
 #[derive(Debug, Subcommand)]
 enum ModelCommand {
-    /// Download the model if it is missing (~480 MB, once).
+    /// Download the models if they are missing, once: Parakeet (~480 MB)
+    /// and, while `cleanup_model` is on, S1-mini by Superwhisper (462 MB).
     Download,
 }
 
