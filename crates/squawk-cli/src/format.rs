@@ -181,6 +181,15 @@ pub fn timings(audio_secs: f64, load: std::time::Duration, run: std::time::Durat
     )
 }
 
+/// ` · cleanup s1 412ms` (or `rules`, `fallback:timeout 4000ms`).
+pub fn cleanup_timing(label: &str, model: std::time::Duration) -> String {
+    if model.is_zero() {
+        format!(" · cleanup {label}")
+    } else {
+        format!(" · cleanup {label} {}ms", model.as_millis())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
