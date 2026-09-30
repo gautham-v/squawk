@@ -13,7 +13,7 @@
 use std::time::{Duration, Instant};
 
 use squawk_app::mic_watch;
-use squawk_core::notetaker::{calls, Notetaker, Outcome, Reply, Settings};
+use squawk_core::notetaker::{calls, Auto, Notetaker, Outcome, Reply, Settings};
 
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("watch") {
@@ -85,7 +85,7 @@ fn watch(secs: u64) {
         }
         next_tick += Duration::from_secs(1);
         let now = Instant::now();
-        if let Some(reason) = notetaker.tick(now, chrono::Local::now(), &apps, &[]) {
+        if let Some(Auto::Stop(reason)) = notetaker.tick(now, chrono::Local::now(), &apps, &[]) {
             println!("[{:5.1}s] notetaker: stop the meeting ({reason:?})", t());
             notetaker.meeting_stopped();
         }

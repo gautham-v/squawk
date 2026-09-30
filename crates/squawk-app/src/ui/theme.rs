@@ -158,6 +158,8 @@ pub const HAIRLINE: Pixels = px(1.0);
 /// A Settings-tab switch.
 pub const SWITCH_WIDTH: Pixels = px(28.);
 pub const SWITCH_HEIGHT: Pixels = px(16.);
+/// A control another setting has turned off.
+pub const DISABLED_OPACITY: f32 = 0.45;
 /// After a pop-up button's value.
 pub const POPUP_CHEVRON: &str = "\u{25BE}";
 

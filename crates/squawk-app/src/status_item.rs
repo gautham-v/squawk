@@ -418,6 +418,7 @@ mod tests {
             path: "/m.md".into(),
             since: now - Duration::from_secs(724),
             started_at: chrono::Local::now(),
+            app: None,
             mic_lost: false,
         });
         assert_eq!(MenuBarState::from_snapshot(&s), MenuBarState::Meeting);

@@ -3,14 +3,14 @@
 //!
 //! ```text
 //! cargo run -p squawk-app --example popover_preview -- \
-//!     ready|meetings|dictionary|settings|settings-menu|settings-nocal|recording|meeting|
-//!     downloading|permissions|empty|panels \
+//!     ready|meetings|meetings-nocal|dictionary|settings|settings-menu|settings-nocal|
+//!     recording|meeting|downloading|permissions|empty|panels \
 //!     [light|dark|system] [end]
 //! ```
 //!
 //! The optional second argument forces the appearance (by default the
 //! window follows the system); `end` scrolls the list to its bottom.
-//! `panels` shows the notetaker's four prompt panels instead of the popover.
+//! `panels` shows the notetaker's prompt panels instead of the popover.
 
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,7 @@ use squawk_app::ui::settings::Menu;
 use squawk_app::ui::theme;
 use squawk_core::dictionary::Entry;
 use squawk_core::notetaker::calls::CallId;
+use squawk_core::notetaker::heads_up::UpcomingEvent;
 use squawk_core::notetaker::{Prompt, StopReason};
 use squawk_core::status::Permissions;
 use squawk_core::store::{DictationEntry, MeetingSummary};
@@ -35,7 +36,7 @@ struct Preview {
     popover: gpui::Entity<Popover>,
 }
 
-/// The four prompt panels, stacked.
+/// The prompt panels, stacked.
 struct Panels {
     panels: Vec<gpui::Entity<PromptPanel>>,
 }
@@ -71,10 +72,22 @@ fn prompts() -> Vec<Prompt> {
             title: "Design review".into(),
             start,
             end: start + chrono::Duration::minutes(30),
+            auto: false,
+        },
+        Prompt::HeadsUp {
+            key: "design-review".into(),
+            title: "Design review".into(),
+            start,
+            end: start + chrono::Duration::minutes(30),
+            auto: true,
         },
         Prompt::Call {
             call: CallId(1),
             app: "Zoom".into(),
+        },
+        Prompt::Recording {
+            title: "Design review".into(),
+            app: "Google Meet".into(),
         },
         Prompt::StoppingSoon {
             title: "Weekly sync".into(),
@@ -258,6 +271,7 @@ fn snapshot(mode: &str) -> Snapshot {
                 path: "/tmp/m.md".into(),
                 since: now - Duration::from_secs(724),
                 started_at: Local::now(),
+                app: Some("Zoom".into()),
                 mic_lost: false,
             })
         }
@@ -271,13 +285,31 @@ fn snapshot(mode: &str) -> Snapshot {
             s.permissions.accessibility = Some(false);
             s.config_note = Some("config.toml: expected a number for tap_max_ms".into());
         }
-        "settings-nocal" => s.calendar_access = Some(false),
+        "settings-nocal" | "meetings-nocal" => s.calendar_access = Some(false),
         _ => {}
     }
     if s.calendar_access.is_none() {
         s.calendar_access = Some(true);
     }
+    s.permissions.screen_recording = Some(true);
+    s.next_meeting = Some(next_meeting());
     s
+}
+
+/// A meeting 25 minutes from now with a Meet link.
+fn next_meeting() -> UpcomingEvent {
+    let start = Local::now() + chrono::Duration::minutes(25);
+    UpcomingEvent {
+        key: "design-review".into(),
+        title: "Design review".into(),
+        start,
+        end: start + chrono::Duration::minutes(30),
+        all_day: false,
+        other_attendees: true,
+        call_app: Some("Google Meet"),
+        declined: false,
+        cancelled: false,
+    }
 }
 
 fn main() {
@@ -313,7 +345,7 @@ fn main() {
             },
             |window, cx| {
                 let tab = match mode.as_str() {
-                    "meetings" | "meeting" => Tab::Meetings,
+                    "meetings" | "meeting" | "meetings-nocal" => Tab::Meetings,
                     "dictionary" => Tab::Dictionary,
                     "settings" | "settings-menu" | "settings-nocal" => Tab::Settings,
                     _ => Tab::History,

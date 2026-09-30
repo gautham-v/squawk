@@ -33,8 +33,10 @@ use squawk_core::dictionary::DictionaryCache;
 use squawk_core::hotkey::{Action, Timings};
 use squawk_core::ipc::{Request, Response};
 use squawk_core::notetaker::calls::CallId;
-use squawk_core::notetaker::heads_up::UpcomingEvent;
-use squawk_core::notetaker::{Notetaker, Outcome, Prompt, Reply, Setting, Settings, StopReason};
+use squawk_core::notetaker::heads_up::{self, UpcomingEvent};
+use squawk_core::notetaker::{
+    Auto, Notetaker, Outcome, Prompt, Reply, Setting, Settings, StopReason,
+};
 use squawk_core::status::{AppState, MeetingInfo, Permissions, StatusInfo};
 use squawk_core::store::DictationEntry;
 use squawk_core::{config_edit, pipeline, Config, ModelStatus, Paths, Store};
@@ -48,7 +50,8 @@ use crate::{calendar, frontmost, mic_watch, paste, permissions};
 
 /// How often the notetaker is ticked.
 const TICK: Duration = Duration::from_secs(1);
-/// How often the calendar is re-read for heads-ups.
+/// How often the calendar is re-read (heads-ups, automatic recording, the
+/// next meeting).
 const CALENDAR_EVERY: Duration = Duration::from_secs(30);
 
 /// What the dictation side is doing, for the menu bar and the popover.
@@ -66,6 +69,8 @@ pub struct MeetingSnap {
     pub path: PathBuf,
     pub since: Instant,
     pub started_at: DateTime<Local>,
+    /// The call app it was started from or during ("Zoom").
+    pub app: Option<String>,
     /// The mic dropped out and could not be reopened: "You" is no longer
     /// being recorded. Stays until the meeting ends.
     pub mic_lost: bool,
@@ -96,8 +101,11 @@ pub struct Snapshot {
     pub meeting_config: MeetingConfig,
     /// What the panel under the menu bar icon asks, if anything.
     pub prompt: Option<Prompt>,
-    /// Calendar access, once it matters (heads-up on): `None` = not asked.
+    /// Calendar access: `None` = not asked yet.
     pub calendar_access: Option<bool>,
+    /// The next meeting on the calendar through tomorrow (one under way
+    /// counts), for the Meetings tab.
+    pub next_meeting: Option<UpcomingEvent>,
 }
 
 impl Snapshot {
@@ -116,6 +124,7 @@ impl Snapshot {
             meeting_config: MeetingConfig::default(),
             prompt: None,
             calendar_access: None,
+            next_meeting: None,
         }
     }
 }
@@ -339,6 +348,14 @@ impl Worker {
                 self.reload_if_config_changed();
                 self.recheck_permissions();
                 self.retry_model_if_needed();
+                // The Meetings tab shows the next meeting: ask for the
+                // calendar the first time the popover opens, if nothing
+                // else has.
+                let calendar = self.snap.calendar_access;
+                self.ask_calendar_once();
+                if self.snap.calendar_access != calendar {
+                    self.publish();
+                }
             }
             Command::TapInstalled(ok) => {
                 self.tap_ok = Some(ok);
@@ -376,11 +393,15 @@ impl Worker {
             Command::CalendarEvents(events) => {
                 self.events = events;
                 self.events_pending = false;
+                if self.sync_next_meeting() {
+                    self.publish();
+                }
             }
             Command::CalendarAccess(granted) => {
                 self.snap.calendar_access = Some(granted);
                 self.events_read = None;
                 self.publish();
+                self.tick();
             }
             Command::Quit { done } => {
                 if let Some(live) = self.live.take() {
@@ -660,12 +681,16 @@ impl Worker {
             path,
             since: Instant::now() - handle.elapsed(),
             started_at,
+            app: None,
             mic_lost: false,
         });
         self.snap.revision += 1;
         self.meeting = Some(handle);
         self.notetaker
             .meeting_started(Instant::now(), &info.title, call);
+        if let Some(meeting) = self.snap.meeting.as_mut() {
+            meeting.app = self.notetaker.meeting_app().map(str::to_string);
+        }
         self.sync_prompt();
         self.publish();
         log::info!(target: "meeting", "started");
@@ -720,8 +745,8 @@ impl Worker {
     // ── Notetaker ──────────────────────────────────────────────────────────
 
     /// Start what the settings need: the mic watcher (once; it runs for the
-    /// life of the app) and, the first time the heads-up is on, the
-    /// calendar prompt.
+    /// life of the app) and, the first time the heads-up or automatic
+    /// recording needs it, the calendar prompt.
     fn start_notetaker_inputs(&mut self) {
         if self.notetaker.wants_mic() && !self.mic_watching {
             self.mic_watching = true;
@@ -730,24 +755,34 @@ impl Worker {
                 let _ = tx.send(Command::MicCalls(apps));
             });
         }
+        self.snap.calendar_access = calendar::access();
         if self.notetaker.wants_calendar() {
-            self.snap.calendar_access = calendar::access();
-            if self.snap.calendar_access.is_none() && !self.calendar_requested {
-                self.calendar_requested = true;
-                let tx = self.tx.clone();
-                calendar::request_access(move |granted| {
-                    let _ = tx.send(Command::CalendarAccess(granted));
-                });
-            }
+            self.ask_calendar_once();
+        }
+    }
+
+    /// Show the calendar prompt in the background, once per run, if macOS
+    /// has not asked yet.
+    fn ask_calendar_once(&mut self) {
+        self.snap.calendar_access = calendar::access();
+        if self.snap.calendar_access.is_none() && !self.calendar_requested {
+            self.calendar_requested = true;
+            let tx = self.tx.clone();
+            calendar::request_access(move |granted| {
+                let _ = tx.send(Command::CalendarAccess(granted));
+            });
         }
     }
 
     /// Once a second: re-read the calendar when due, advance the notetaker,
-    /// stop the meeting if it says so, publish a changed prompt.
+    /// start or stop a meeting if it says so, publish a changed prompt or
+    /// next meeting.
     fn tick(&mut self) {
         let now = Instant::now();
         self.last_tick = now;
-        if self.notetaker.wants_calendar() {
+        // Read whenever it is allowed: the Meetings tab's next meeting
+        // needs it even with the heads-up and automatic recording off.
+        if self.snap.calendar_access == Some(true) {
             let stale = self
                 .events_read
                 .is_none_or(|at| now.duration_since(at) >= CALENDAR_EVERY);
@@ -772,15 +807,39 @@ impl Worker {
         } else {
             &[]
         };
-        let stop = self.notetaker.tick(now, Local::now(), mic, &self.events);
-        if let Some(reason) = stop {
-            if self.meeting.is_some() {
-                self.stop_meeting(None, Some(reason));
+        match self.notetaker.tick(now, Local::now(), mic, &self.events) {
+            Some(Auto::Stop(reason)) => {
+                if self.meeting.is_some() {
+                    self.stop_meeting(None, Some(reason));
+                }
             }
+            Some(Auto::Start {
+                title,
+                fallback,
+                call,
+            }) => {
+                if let Err(e) = self.start_meeting(title, &fallback, Some(call)) {
+                    self.fail(e);
+                }
+            }
+            None => {}
         }
-        if self.sync_prompt() {
+        let prompt_changed = self.sync_prompt();
+        let next_changed = self.sync_next_meeting();
+        if prompt_changed || next_changed {
             self.publish();
         }
+    }
+
+    /// Work out the next meeting from the last calendar read. Returns
+    /// whether it changed.
+    fn sync_next_meeting(&mut self) -> bool {
+        let next = heads_up::next(&self.events, Local::now()).cloned();
+        if next == self.snap.next_meeting {
+            return false;
+        }
+        self.snap.next_meeting = next;
+        true
     }
 
     /// Copy the notetaker's prompt into the snapshot. Returns whether it
@@ -795,6 +854,9 @@ impl Worker {
                 log::info!(target: "notetaker", "call detected: {app}")
             }
             Some(Prompt::HeadsUp { .. }) => log::info!(target: "notetaker", "heads-up"),
+            Some(Prompt::Recording { app, .. }) => {
+                log::info!(target: "notetaker", "recording a call in {app} on its own")
+            }
             _ => {}
         }
         self.snap.prompt = prompt;
@@ -813,6 +875,7 @@ impl Worker {
                     self.fail(e);
                 }
             }
+            Outcome::StopMeeting => self.stop_meeting(None, None),
             Outcome::Open(path) => {
                 let _ = std::process::Command::new("/usr/bin/open")
                     .arg(path)
@@ -900,7 +963,9 @@ impl Worker {
         let mut checked = permissions::check();
         checked.accessibility =
             Some(checked.accessibility == Some(true) && self.tap_ok != Some(false));
-        checked.screen_recording = self.snap.permissions.screen_recording;
+        // Read without prompting, for the Meetings tab's ready line; the
+        // prompt itself waits for the first meeting.
+        checked.screen_recording = Some(permissions::screen_recording());
         if checked != self.snap.permissions {
             self.snap.permissions = checked;
             self.publish();
@@ -1232,6 +1297,7 @@ pub(crate) mod tests {
             path: "/tmp/m.md".into(),
             since: now - Duration::from_secs(724),
             started_at: Local::now(),
+            app: None,
             mic_lost: false,
         });
         let meeting = status_info(&s, now).meeting.unwrap();
