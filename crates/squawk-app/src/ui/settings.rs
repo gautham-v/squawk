@@ -1,6 +1,7 @@
 //! The popover's Settings tab: "Clean up with S1-mini" (`[dictation]
-//! cleanup_model`), then the notetaker's `[meeting]` settings, as rows (a
-//! label, a muted line, a pop-up or a switch), then "Edit config.toml" for
+//! cleanup_model`), then the notetaker's four `[meeting]` settings, as rows
+//! (a label, a muted line, a pop-up or a switch; "Record automatically"
+//! goes dim while Detect calls is off), then "Edit config.toml" for
 //! everything else. config.toml stays the source of truth:
 //! a change is written to the file (comments and other keys kept) and the
 //! app reloads it; the tab shows what the file says.
@@ -15,7 +16,8 @@ use gpui::{
 };
 use squawk_core::config::MeetingConfig;
 use squawk_core::notetaker::{
-    heads_up_label, max_length_label, Setting, HEADS_UP_CHOICES, MAX_LENGTH_CHOICES,
+    auto_record_label, heads_up_label, max_length_label, AutoRecord, Setting, AUTO_RECORD_CHOICES,
+    HEADS_UP_CHOICES, MAX_LENGTH_CHOICES,
 };
 use squawk_core::ModelStatus;
 
@@ -27,6 +29,7 @@ use crate::ui::theme::{self, Theme};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Menu {
     HeadsUp,
+    AutoRecord,
     MaxLength,
 }
 
@@ -40,6 +43,16 @@ impl Menu {
                 .map(|&s| {
                     let current = s == m.heads_up_secs || (s < 0 && m.heads_up_secs < 0);
                     (heads_up_label(s), Setting::HeadsUpSecs(s), current)
+                })
+                .collect(),
+            Menu::AutoRecord => AUTO_RECORD_CHOICES
+                .iter()
+                .map(|&a| {
+                    (
+                        auto_record_label(a).to_string(),
+                        Setting::AutoRecord(a),
+                        a == m.auto_record,
+                    )
                 })
                 .collect(),
             Menu::MaxLength => MAX_LENGTH_CHOICES
@@ -72,6 +85,8 @@ pub struct Row {
     /// The note is a fix: clicking it opens this System Settings pane.
     pub fix: Option<Pane>,
     pub control: Control,
+    /// Dimmed and inert when false (a setting another one turns off).
+    pub enabled: bool,
 }
 
 pub const SECTION: &str = "Meetings";
@@ -110,6 +125,16 @@ pub fn cleanup_note(cleanup: Cleanup) -> String {
 pub const EDIT_CONFIG: &str = "Edit config.toml";
 pub const EDIT_CONFIG_NOTE: &str = "Dictation, model";
 
+/// Record automatically's note for each value, and while Detect calls is off.
+pub fn auto_record_note(auto: AutoRecord, detect_calls: bool) -> &'static str {
+    match (detect_calls, auto) {
+        (false, _) => "Needs Detect calls",
+        (true, AutoRecord::Off) => "Calls ask \u{201c}Start notes?\u{201d}",
+        (true, AutoRecord::Calendar) => "Calls during a calendar meeting. Others still ask.",
+        (true, AutoRecord::All) => "Every detected call",
+    }
+}
+
 /// The Settings tab's rows for `m`. `calendar` is the Calendar grant
 /// (`None` = not asked yet).
 pub fn rows(m: &MeetingConfig, calendar: Option<bool>) -> Vec<Row> {
@@ -129,6 +154,7 @@ pub fn rows(m: &MeetingConfig, calendar: Option<bool>) -> Vec<Row> {
                 menu: Menu::HeadsUp,
                 value: heads_up_label(m.heads_up_secs),
             },
+            enabled: true,
         },
         Row {
             id: "setting-detect-calls",
@@ -139,6 +165,18 @@ pub fn rows(m: &MeetingConfig, calendar: Option<bool>) -> Vec<Row> {
                 on: m.detect_calls,
                 toggled: Setting::DetectCalls(!m.detect_calls),
             },
+            enabled: true,
+        },
+        Row {
+            id: "setting-auto-record",
+            label: "Record automatically",
+            note: auto_record_note(m.auto_record, m.detect_calls).into(),
+            fix: None,
+            control: Control::Choice {
+                menu: Menu::AutoRecord,
+                value: auto_record_label(m.auto_record).into(),
+            },
+            enabled: m.detect_calls,
         },
         Row {
             id: "setting-max-length",
@@ -149,6 +187,7 @@ pub fn rows(m: &MeetingConfig, calendar: Option<bool>) -> Vec<Row> {
                 menu: Menu::MaxLength,
                 value: max_length_label(m.max_minutes),
             },
+            enabled: true,
         },
     ]
 }
@@ -295,6 +334,7 @@ fn setting_row(
             div()
                 .text_size(theme::TEXT_BODY)
                 .line_height(theme::LINE_BODY)
+                .when(!row.enabled, |el| el.text_color(theme.tertiary))
                 .child(row.label),
         )
         .child(note);
@@ -309,9 +349,17 @@ fn setting_row(
         .px(theme::ROW_PAD_X)
         .py(theme::LIST_ROW_PAD_Y)
         .rounded(theme::ROW_RADIUS)
-        .cursor_pointer()
-        .hover(move |s| s.bg(theme.hover))
         .child(label);
+    if !row.enabled {
+        let value = match row.control {
+            Control::Choice { value, .. } => value,
+            Control::Switch { .. } => String::new(),
+        };
+        return base
+            .child(popup_button(theme, value).opacity(theme::DISABLED_OPACITY))
+            .into_any_element();
+    }
+    let base = base.cursor_pointer().hover(move |s| s.bg(theme.hover));
     match row.control {
         Control::Switch { on, toggled } => base
             .on_click(cx.listener(move |this, _, _, cx| this.change_setting(toggled, cx)))
@@ -489,6 +537,7 @@ mod tests {
             [
                 "Heads-up before meetings",
                 "Detect calls",
+                "Record automatically",
                 "Maximum recording length"
             ]
         );
@@ -509,9 +558,47 @@ mod tests {
         assert_eq!(
             rows[2].control,
             Control::Choice {
+                menu: Menu::AutoRecord,
+                value: "Calendar meetings".into()
+            }
+        );
+        assert_eq!(
+            rows[3].control,
+            Control::Choice {
                 menu: Menu::MaxLength,
                 value: "2 h".into()
             }
+        );
+        assert!(rows.iter().all(|r| r.enabled));
+    }
+
+    #[test]
+    fn record_automatically_explains_each_choice_and_dims_without_detect_calls() {
+        let mut m = MeetingConfig::default();
+        let note = |m: &MeetingConfig| rows(m, Some(true))[2].note.clone();
+        assert_eq!(
+            note(&m),
+            "Calls during a calendar meeting. Others still ask."
+        );
+        m.auto_record = AutoRecord::All;
+        assert_eq!(note(&m), "Every detected call");
+        m.auto_record = AutoRecord::Off;
+        assert_eq!(note(&m), "Calls ask \u{201c}Start notes?\u{201d}");
+        m.detect_calls = false;
+        assert_eq!(note(&m), "Needs Detect calls");
+        assert!(!rows(&m, Some(true))[2].enabled);
+        let items: Vec<_> = Menu::AutoRecord
+            .items(&MeetingConfig::default())
+            .into_iter()
+            .map(|(label, _, current)| (label, current))
+            .collect();
+        assert_eq!(
+            items,
+            [
+                ("Off".to_string(), false),
+                ("Calendar meetings".to_string(), true),
+                ("All calls".to_string(), false),
+            ]
         );
     }
 
@@ -569,7 +656,7 @@ mod tests {
         assert!(Menu::HeadsUp.items(&m).iter().all(|(_, _, c)| !c));
         let rows = rows(&m, Some(true));
         assert_eq!(
-            rows[2].control,
+            rows[3].control,
             Control::Choice {
                 menu: Menu::MaxLength,
                 value: "1 h 30 min".into()

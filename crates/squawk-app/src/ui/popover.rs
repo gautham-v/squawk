@@ -12,7 +12,10 @@
 //!   selected one in primary ink);
 //! - body (scrolls): History = the 50 most recent dictations, "app ·
 //!   project" and time, then the text clamped to 2 lines; click copies.
-//!   Meetings = title, date · length; click opens the file. Dictionary =
+//!   Meetings = the next meeting pinned on top ("Next · in 25 min", its
+//!   title, "14:30–15:00 · Google Meet · will record", then a ready line:
+//!   ✓ Calendar ✓ Call detection ✓ System audio; "Now" while one records),
+//!   then title, date · length per meeting; click opens the file. Dictionary =
 //!   "Edit dictionary.txt" pinned above the list (opens the file), then one
 //!   line per entry, a replacement as "spoken → written". Settings = the
 //!   notetaker's `[meeting]` settings, then "Edit config.toml"
@@ -641,11 +644,12 @@ impl Popover {
 
     /// The tab's list. It takes whatever height is left between the tabs
     /// and the footer and scrolls inside it; a tab may pin a row above the
-    /// scrolling part (Dictionary's "Edit dictionary.txt").
+    /// scrolling part (Meetings' next meeting, Dictionary's "Edit
+    /// dictionary.txt").
     fn body(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (pinned, rows): (Option<gpui::AnyElement>, Vec<gpui::AnyElement>) = match self.tab {
             Tab::History => (None, self.history_rows(cx)),
-            Tab::Meetings => (None, self.meeting_rows(cx)),
+            Tab::Meetings => (Some(self.next_meeting_row(cx)), self.meeting_rows(cx)),
             Tab::Dictionary => (Some(self.dictionary_edit_row(cx)), Vec::new()),
             Tab::Settings => (
                 None,
@@ -751,6 +755,114 @@ impl Popover {
                     .into_any_element()
             })
             .collect()
+    }
+
+    /// The next meeting (or the one recording), pinned above the list: a
+    /// small label line, the title, a meta line, then the ready line and a
+    /// separator. From the snapshot only: the controller reads the
+    /// calendar.
+    fn next_meeting_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = self.theme;
+        let row = format::next_row(&self.snapshot, Instant::now(), Local::now());
+        let small = |text: SharedString| {
+            div()
+                .text_size(theme::TEXT_TINY)
+                .line_height(theme::LINE_TINY)
+                .child(text)
+        };
+        let label_line = |label: &'static str, when: String, live: bool| {
+            div()
+                .flex()
+                .flex_row()
+                .justify_between()
+                .gap(px(8.))
+                .text_color(theme.tertiary)
+                .child(small(label.into()).when(live, |el| el.text_color(theme.accent)))
+                .child(small(when.into()))
+        };
+        let title = |text: String| {
+            div()
+                .text_size(theme::TEXT_BODY)
+                .line_height(theme::LINE_BODY)
+                .truncate()
+                .child(text)
+        };
+        let block = div()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .px(theme::ROW_PAD_X)
+            .pt(px(4.))
+            .pb(px(2.));
+        let block = match row {
+            format::NextRow::Now { title: t, meta } => block
+                .child(label_line(format::NOW_LABEL, String::new(), true))
+                .child(title(t))
+                .child(small(meta.into()).text_color(theme.accent)),
+            format::NextRow::Next {
+                when,
+                title: t,
+                meta,
+            } => block
+                .child(label_line(format::NEXT_LABEL, when, false))
+                .child(title(t))
+                .child(small(meta.into()).text_color(theme.secondary)),
+            format::NextRow::Line { text, note, fix } => block
+                .child(label_line(format::NEXT_LABEL, String::new(), false))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .items_center()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .text_size(theme::TEXT_SMALL)
+                                        .line_height(theme::LINE_SMALL)
+                                        .text_color(if fix.is_some() {
+                                            theme.text
+                                        } else {
+                                            theme.tertiary
+                                        })
+                                        .child(text),
+                                )
+                                .children(
+                                    note.map(|n| small(n.into()).text_color(theme.secondary)),
+                                ),
+                        )
+                        .children(fix.map(|pane| self.fix_button(pane, cx))),
+                ),
+        };
+        let checks = format::ready_checks(&self.snapshot);
+        let ready = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_x(px(8.))
+            .px(theme::ROW_PAD_X)
+            .pt(px(2.))
+            .children(checks.into_iter().map(|(name, ok)| {
+                small(format::ready_check(name, ok).into()).text_color(if ok {
+                    theme.tertiary
+                } else {
+                    theme.secondary
+                })
+            }));
+        div()
+            .id("next-meeting")
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .child(block)
+            .child(ready)
+            .child(separator(theme))
+            .into_any_element()
     }
 
     fn meeting_rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {

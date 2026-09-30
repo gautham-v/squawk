@@ -1,7 +1,8 @@
 //! The calendar, through EventKit (as in daybar's `calendar/eventkit.rs`):
-//! the meeting title (the event happening now) and the events around now for
-//! the notetaker's heads-up ([`upcoming_events`]; which of them qualify is
-//! `squawk_core::notetaker::heads_up`).
+//! the meeting title (the event happening now) and the events from now
+//! through tomorrow ([`upcoming_events`]) for the notetaker's heads-up, for
+//! recording a call during a meeting, and for the popover's next meeting
+//! (which of them qualify is `squawk_core::notetaker::heads_up`).
 //!
 //! Title:
 //! Among non-all-day events whose span contains now, prefer the one that
@@ -98,8 +99,8 @@ pub fn access() -> Option<bool> {
     }
 }
 
-/// Timed and all-day events from 10 minutes ago to an hour ahead, for the
-/// heads-up. `None` without calendar access.
+/// Timed and all-day events from 10 minutes ago (and any still under way)
+/// to the end of tomorrow. `None` without calendar access.
 pub fn upcoming_events() -> Option<Vec<UpcomingEvent>> {
     if access() != Some(true) {
         return None;
@@ -109,7 +110,7 @@ pub fn upcoming_events() -> Option<Vec<UpcomingEvent>> {
         // SAFETY: a fresh store used on this thread only.
         let store = unsafe { EKEventStore::new() };
         let start = ns_date(now - Duration::minutes(10));
-        let end = ns_date(now + Duration::hours(1));
+        let end = ns_date(heads_up::end_of_tomorrow(now).unwrap_or(now + Duration::days(2)));
         // SAFETY: valid dates; `None` = all calendars.
         let events = unsafe {
             let predicate =
@@ -151,7 +152,7 @@ fn upcoming(ev: &EKEvent) -> Option<UpcomingEvent> {
             end: from_ns_date(&ev.endDate())?,
             all_day: ev.isAllDay(),
             other_attendees,
-            video_link: heads_up::has_video_link(texts.iter().flatten().map(String::as_str)),
+            call_app: heads_up::call_app(texts.iter().flatten().map(String::as_str)),
             declined,
             cancelled: ev.status() == EKEventStatus::Canceled,
         })

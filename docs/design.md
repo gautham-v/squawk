@@ -151,6 +151,7 @@ defaults plus a human note (`Config::load -> (Config, Option<String>)`) that the
 | `[meeting] echo_cancellation` | `true` | echo-cancelled mic + drop "You" lines that repeat "Them" (see "Meetings: echo") |
 | `[meeting] heads_up_secs` | `15` (−1–3600; < 0 = off) | heads-up this long before a qualifying calendar event; 0 = at the start |
 | `[meeting] detect_calls` | `true` | offer notes when a call app starts using the mic |
+| `[meeting] auto_record` | `"calendar"` (`"off"`, `"calendar"`, `"all"`; anything else reads as `"calendar"`) | which detected calls record without asking: those during a calendar meeting, or all |
 | `[meeting] max_minutes` | `120` (5–1440) | stop and save after this long, warning 2 min before |
 | `[model] dir` | `parakeet-tdt-0.6b-v3-int8` | directory under models/ |
 | `[model] url` | `https://blob.handy.computer/parakeet-v3-int8.tar.gz` | where to download it |
@@ -242,19 +243,30 @@ calendar) so the tests use synthetic timestamps.
   active_apps) -> Vec<CallEvent>`: a call `Started` once an app has held the mic `MIN_USE` (3 s)
   without a break (a shorter use is forgotten), `Ended` once it has let go for `END_AFTER` (10 s);
   taking the mic back within that is the same call (`CallId`).
-- `heads_up` — `UpcomingEvent {key, title, start, end, all_day, other_attendees, video_link,
+- `heads_up` — `UpcomingEvent {key, title, start, end, all_day, other_attendees, call_app,
   declined, cancelled}`; `is_meeting` (timed, not declined/cancelled, titled, other people or a
   call link), `is_due(now, lead)` from `start − lead` until `start + LATE` (60 s), `due(events,
-  now, lead, done)` the soonest not yet offered; `has_video_link(texts)` (`VIDEO_HOSTS`).
+  now, lead, done)` the soonest not yet offered; `call_app(texts)` names the app of the first
+  call link (`CALL_LINKS`: zoom.us/j/ → Zoom, meet.google.com/ → Google Meet, …);
+  `happening(events, now)` the meeting on now (from `JOIN_EARLY`, 5 min, before its start until
+  its end; the latest start wins); `next(events, now)` the soonest meeting not yet over that
+  starts before `end_of_tomorrow(now)`.
 - `Notetaker` — `new(Settings)`, `set_settings`, `tick(now, wall, mic_apps, events) ->
-  Option<StopReason>`, `prompt() -> Option<&Prompt>`, `reply(Reply::{Accept, Dismiss}) ->
-  Outcome`, `meeting_started(now, title, Option<CallId>)`, `meeting_stopped()`, `saved(..)`,
-  `wants_mic()`, `wants_calendar()`. `Prompt::{HeadsUp, Call, StoppingSoon, Saved}`,
-  `Outcome::{Nothing, StartMeeting{title, fallback, call}, Extended, Open(path)}`,
-  `StopReason::MaxLength`, `Setting::{HeadsUpSecs, DetectCalls, MaxMinutes}` (`key()`,
-  `value()`, `apply()`). Rules:
+  Option<Auto>` (`Auto::{Start{title, fallback, call}, Stop(StopReason)}`), `prompt() ->
+  Option<&Prompt>`, `reply(Reply::{Accept, Dismiss}) -> Outcome`, `meeting_started(now, title,
+  Option<CallId>)`, `meeting_stopped()`, `meeting_app()`, `saved(..)`, `wants_mic()`,
+  `wants_calendar()` (heads-up on, or some calls record on their own).
+  `Prompt::{HeadsUp{.., auto}, Call, Recording{title, app}, StoppingSoon, Saved}`,
+  `Outcome::{Nothing, StartMeeting{title, fallback, call}, StopMeeting, Extended, Open(path)}`,
+  `StopReason::MaxLength`, `Setting::{HeadsUpSecs, DetectCalls, AutoRecord, MaxMinutes}`
+  (`key()`, `value()`, `apply()`); `Settings::{auto_records(), will_record(event)}`. Rules:
   - a started call with no meeting and `detect_calls` → `Prompt::Call` for 20 s (no answer =
     Not now); each call is offered once; its end takes its prompt down;
+  - …unless it records on its own: `auto_record = all`, or `calendar` with a meeting
+    `happening` now, and that meeting not skipped → `Auto::Start` (title: the meeting's, else
+    none and the fallback "Zoom call"). The app starts the meeting and reports it with that
+    `call`; `meeting_started` then shows `Prompt::Recording` for 8 s, whose Accept (Stop) →
+    `Outcome::StopMeeting`. A start the app could not make leaves nothing behind;
   - a call that starts during a meeting is not offered; the call a meeting was started from
     (else the one holding the mic then) counts as offered. A call ending never stops a meeting:
     some apps let go of the mic on mute, mid-call. Meetings stop at `max_length` or by hand
@@ -264,7 +276,10 @@ calendar) so the tests use synthetic timestamps.
     warning; `max_length` → `StopReason::MaxLength`; a changed setting applies to the running
     meeting;
   - heads-up only with no meeting, once per event, up until 60 s after the start (at least 30 s
-    on screen); Accept → `StartMeeting` with the event's title;
+    on screen); Accept → `StartMeeting` with the event's title. When the event's call will
+    record on its own (`will_record`), the heads-up has `auto: true` and its Accept is Skip this
+    one: the event is remembered and its call gets `Prompt::Call` instead (with `all` too). A
+    settings change that flips `auto` takes a showing heads-up down;
   - `Saved` (after the maximum-length stop) for 8 s, Accept → `Open(path)`;
   - the newest prompt replaces the one showing; starting a meeting clears it.
 
@@ -661,19 +676,26 @@ One thread; owns `Engine`, the live `DictationSession`, the live `MeetingHandle`
   captured, then `last_error`. `MeetingMicLost` → "mic lost" on the meeting header line.
 - Notetaker: the loop waits with `recv_timeout(1 s)` and ticks the `Notetaker` at least once a
   second (and on every `MicCalls`) with the call apps last reported by `mic_watch` and the
-  calendar's events (`calendar::upcoming_events`, re-read every 30 s while the heads-up is on). A
-  `StopReason` → the usual stop path; when the file is saved, `Notetaker::saved` puts up "Saved
-  notes". `Prompt(Reply)` → `Notetaker::reply` → start a meeting (title: the event's, else the
-  current calendar event, else the fallback, e.g. "Zoom call") / open the file. Every meeting
-  start (⌥M, popover, IPC, prompt) calls `meeting_started`, every stop `meeting_stopped`.
+  calendar's events from 10 minutes ago through the end of tomorrow (`calendar::upcoming_events`,
+  re-read on a helper thread every 30 s whenever Calendar access is granted: the Meetings tab
+  needs it even with the heads-up off). `Auto::Stop` → the usual stop path; when the file is
+  saved, `Notetaker::saved` puts up "Saved notes". `Auto::Start` → `start_meeting(title,
+  fallback, Some(call))`. `Prompt(Reply)` → `Notetaker::reply` → start a meeting (title: the
+  event's, else the current calendar event, else the fallback, e.g. "Zoom call") / stop it
+  (`StopMeeting`) / open the file. Every meeting start (⌥M, popover, IPC, prompt, on its own)
+  calls `meeting_started` and copies `meeting_app()` into `MeetingSnap.app`; every stop calls
+  `meeting_stopped`. After each calendar read and each tick, `heads_up::next(events, now)` →
+  `Snapshot.next_meeting`.
   `SetSetting(Setting)` → `config_edit::set_in_file(config, "meeting", key, value)` then the
   normal reload. `SetCleanupModel(bool)` → the same for `[dictation] cleanup_model`; the reload
   hands `engine.update_config` the change, which loads (downloading if needed) or frees S1-mini.
   Engine `CleanupModel(status)` → `snapshot.cleanup_status`; a failed one is retried when the
   popover opens. The mic watcher starts once `detect_calls` is on (and then runs for the app's
   life; samples are ignored while it is off); Calendar access is
-  requested (in the background) the first time the heads-up is on and access is undetermined.
-  `Snapshot` carries `meeting_config`, `prompt` and `calendar_access`.
+  requested (in the background) when undetermined, the first time the heads-up or automatic
+  recording is on or the popover opens (for the next meeting). `RecheckPermissions` also reads
+  Screen & System Audio Recording without prompting, for the ready line.
+  `Snapshot` carries `meeting_config`, `prompt`, `calendar_access` and `next_meeting`.
 
 ### Paste (paste.rs)
 
@@ -727,7 +749,9 @@ buttons (the first semibold). `panel_text(&Prompt)` is the pure wording:
 | prompt | title | line | buttons |
 |---|---|---|---|
 | `HeadsUp` | event title | `15:00–15:30` | Record · Not now |
+| `HeadsUp` (`auto`) | event title | `15:00–15:30 · records when the call starts` | Skip this one |
 | `Call` | Call detected in Zoom | Start notes? | Start · Not now |
+| `Recording` | Recording · Design review | Started with Zoom | Stop |
 | `StoppingSoon` | Stopping in 2 min | Weekly sync · 2 h limit | Keep going +30 min |
 | `Saved` | Saved notes · Weekly sync | 2:00:00 · reached the time limit | Open |
 
@@ -767,7 +791,9 @@ muted line "by Superwhisper · fillers, false starts, numbers", or while it is o
 
 Rows (`settings::rows(&MeetingConfig, calendar_access)`, pure): a "Meetings" caption, then
 label + muted line + control — Heads-up before meetings (pop-up: Off / At start / 15 s / 1 min /
-5 min), Detect calls (switch), Maximum recording length (pop-up: 30 min / 1 h / 2 h / 3 h / 4 h)
+5 min), Detect calls (switch), Record automatically (pop-up: Off / Calendar meetings / All
+calls; its line explains the choice, and with Detect calls off it reads "Needs Detect calls",
+dimmed and inert), Maximum recording length (pop-up: 30 min / 1 h / 2 h / 3 h / 4 h)
 — a hairline, and "Edit config.toml" (muted, "Dictation, model"
 on the right) which opens the file. A value off the menu (hand-edited `max_minutes = 90`) shows
 as "1 h 30 min" with nothing checked. With the heads-up on and Calendar refused, its line
@@ -787,8 +813,16 @@ Microphone" with an "Open Settings" button (`permissions::open_pane`); plus the 
 error as a muted line). A one-time hint line until dismissed: "Set Keyboard › Press 🌐 key to › Do
 nothing" (button opens `Pane::Keyboard`). Tabs: **History | Meetings | Dictionary | Settings**
 (text tabs, selected in primary ink). History: the 50 most recent dictations; row = "app · project" left, time
-right, then the text clamped to 2 lines; click copies ("Copied" flashes). Meetings: title, "Sep 29
-14:00 · 42:10" (and "recording" for the live one); click opens the file (`open`). Dictionary: the
+right, then the text clamped to 2 lines; click copies ("Copied" flashes). Meetings: pinned on
+top, the next meeting (`format::next_row`, pure): a tertiary "Next" with "in 25 min" / "in 2 h"
+/ "tomorrow" on the right, the title, "14:30–15:00 · Google Meet · will record" ("heads-up"
+when it will only ask); while a meeting records "Now" (copper), its title, "Recording · 4:12 ·
+Zoom" (copper); without Calendar access "Can’t see your calendar" / "Calendar access is off" with
+Open Settings; not asked yet "Asking for Calendar access…"; nothing through tomorrow "No
+meetings today or tomorrow". Under it the ready line (`format::ready_checks`): ✓/✕ Calendar,
+Call detection, System audio (left out when `system_audio` is off), then a hairline. Then per
+meeting: title, "Sep 29 14:00 · 42:10" (and "recording" for the live one); click opens the file
+(`open`); ↑ ↓ move through these rows only. Dictionary: the
 entries; "Edit" opens dictionary.txt. Settings: see "Settings tab". Footer: "Record meeting ⌥M"
 / "Stop meeting ⌥M". Keys (`ui::nav`, pure and tested): ← → switch tabs (wrapping), ↑ ↓ move a
 selection (the hover wash) through History, Meetings or Dictionary and scroll it into view,
@@ -825,9 +859,10 @@ every frame's duration to stderr.
 
 Accessibility (`AXIsProcessTrusted`; the tap failing to create is the real test), Microphone
 (`AVCaptureDevice authorizationStatusForMediaType: AVMediaTypeAudio`), Screen & System Audio
-Recording (`CGPreflightScreenCaptureAccess`, checked only when a meeting with system audio starts),
-Calendars (`calendar::access()`, EventKit full access; asked only while the heads-up is on, or on
-the first meeting for its title). Panes: `Pane::url()`.
+Recording (`CGPreflightScreenCaptureAccess`, read without prompting on each popover open for the
+ready line; asked for when a meeting with system audio starts), Calendars (`calendar::access()`,
+EventKit full access; asked while the heads-up or automatic recording is on, the first time the
+popover opens, or on the first meeting for its title). Panes: `Pane::url()`.
 
 ### Tests
 

@@ -6,7 +6,9 @@
 //! | prompt | title | line | buttons |
 //! |---|---|---|---|
 //! | heads-up | the event | 15:00–15:30 | Record · Not now |
+//! | heads-up, records on its own | the event | 15:00–15:30 · records when the call starts | Skip this one |
 //! | call | Call detected in Zoom | Start notes? | Start · Not now |
+//! | recording on its own | Recording · Design review | Started with Zoom | Stop |
 //! | limit | Stopping in 2 min | Weekly sync · 2 h limit | Keep going +30 min |
 //! | saved | Saved notes · Weekly sync | 2:00:00 · reached the time limit | Open |
 //!
@@ -42,18 +44,40 @@ pub struct PanelText {
 pub fn panel_text(prompt: &Prompt) -> PanelText {
     match prompt {
         Prompt::HeadsUp {
-            title, start, end, ..
-        } => PanelText {
-            title: title.clone(),
-            line: format!("{}–{}", start.format("%H:%M"), end.format("%H:%M")),
-            accept: "Record",
-            dismiss: Some("Not now"),
-        },
+            title,
+            start,
+            end,
+            auto,
+            ..
+        } => {
+            let span = format!("{}–{}", start.format("%H:%M"), end.format("%H:%M"));
+            if *auto {
+                PanelText {
+                    title: title.clone(),
+                    line: format!("{span} · records when the call starts"),
+                    accept: "Skip this one",
+                    dismiss: None,
+                }
+            } else {
+                PanelText {
+                    title: title.clone(),
+                    line: span,
+                    accept: "Record",
+                    dismiss: Some("Not now"),
+                }
+            }
+        }
         Prompt::Call { app, .. } => PanelText {
             title: format!("Call detected in {app}"),
             line: "Start notes?".into(),
             accept: "Start",
             dismiss: Some("Not now"),
+        },
+        Prompt::Recording { title, app } => PanelText {
+            title: format!("Recording · {title}"),
+            line: format!("Started with {app}"),
+            accept: "Stop",
+            dismiss: None,
         },
         Prompt::StoppingSoon { title, limit } => PanelText {
             title: format!("Stopping in {} min", WARN_BEFORE.as_secs() / 60),
@@ -220,10 +244,37 @@ mod tests {
             title: "Design review".into(),
             start,
             end: start + chrono::Duration::minutes(30),
+            auto: false,
         });
         assert_eq!(text.title, "Design review");
         assert_eq!(text.line, "15:00–15:30");
         assert_eq!((text.accept, text.dismiss), ("Record", Some("Not now")));
+    }
+
+    #[test]
+    fn a_heads_up_for_a_meeting_that_records_itself_offers_only_skip() {
+        let start = Local.with_ymd_and_hms(2026, 9, 30, 15, 0, 0).unwrap();
+        let text = panel_text(&Prompt::HeadsUp {
+            key: "k".into(),
+            title: "Design review".into(),
+            start,
+            end: start + chrono::Duration::minutes(30),
+            auto: true,
+        });
+        assert_eq!(text.title, "Design review");
+        assert_eq!(text.line, "15:00–15:30 · records when the call starts");
+        assert_eq!((text.accept, text.dismiss), ("Skip this one", None));
+    }
+
+    #[test]
+    fn a_call_recording_on_its_own_says_so_and_offers_stop() {
+        let text = panel_text(&Prompt::Recording {
+            title: "Design review".into(),
+            app: "Google Meet".into(),
+        });
+        assert_eq!(text.title, "Recording · Design review");
+        assert_eq!(text.line, "Started with Google Meet");
+        assert_eq!((text.accept, text.dismiss), ("Stop", None));
     }
 
     #[test]

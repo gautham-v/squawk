@@ -90,7 +90,8 @@ model is not ready, or takes more than 4 seconds, or answers with something impl
 dictation gets the rules alone; nothing is ever lost to it.
 
 The popover (click the menu bar item) has your recent dictations (click one to copy it),
-meetings (click to open), your dictionary, and the meeting settings. From the keyboard: ← and →
+meetings (click to open; your next meeting is pinned on top), your dictionary, and the meeting
+settings. From the keyboard: ← and →
 switch tabs, ↑ and ↓ pick a row, return copies the dictation / opens the meeting / opens
 dictionary.txt, esc closes.
 
@@ -199,7 +200,7 @@ off: `echo_cancellation = false` under `[meeting]`. Dictation never uses it.
 
 ## Notetaker
 
-Squawk can notice meetings for you. The popover's **Settings** tab has three settings; each one
+Squawk can notice meetings for you. The popover's **Settings** tab has four settings; each one
 is a key under `[meeting]` in `~/.config/squawk/config.toml`, and the tab writes the file (your
 comments and other keys stay as they are). Edit the file by hand if you prefer; the tab shows
 what the file says.
@@ -208,6 +209,7 @@ what the file says.
 |---|---|---|---|
 | Heads-up before meetings | `heads_up_secs` | `15` | off (`-1`), at start (`0`), 15 s, 1 min, 5 min |
 | Detect calls | `detect_calls` | `true` | |
+| Record automatically | `auto_record` | `"calendar"` | off (`"off"`), calendar meetings (`"calendar"`), all calls (`"all"`) |
 | Maximum recording length | `max_minutes` | `120` | 30 min, 1 h, 2 h, 3 h, 4 h |
 
 Questions come as a small panel under the menu bar icon, never as notifications, and never take
@@ -225,6 +227,13 @@ focus from the call:
   that call. Squawk itself and short mic uses (dictation apps, Siri) never count. Needs macOS
   14.2 or later (Core Audio's per-process list); browser tabs are read by window title, which
   uses the Accessibility access squawk already has.
+- **Record automatically.** Skips that question. With **Calendar meetings** (the default), a
+  call that starts during a calendar meeting (from 5 minutes before it until it ends; same rule
+  as the heads-up: other people or a call link) records at once, named after the event; other
+  calls still ask. **All calls** records every detected call. Either way "Recording · Design
+  review" / "Started with Zoom" shows for a few seconds with **Stop**. The heads-up for a
+  meeting that will record this way says "records when the call starts" and offers **Skip this
+  one** instead: that meeting's call then asks like any other. Needs Detect calls.
 - **Maximum recording length.** Two minutes before, "Stopping in 2 min" with **Keep going +30
   min**; then the meeting stops and saves as if you pressed ⌥M, and "Saved notes · Weekly sync"
   offers **Open**.
@@ -232,6 +241,12 @@ focus from the call:
 Otherwise a meeting keeps recording until you stop it (⌥M, the popover or `squawk meet stop`),
 even when the call ends: some call apps let go of the mic when you mute, so that is no sign the
 call is over.
+
+The **Meetings** tab shows the next meeting on your calendar through tomorrow on top: "Next · in
+25 min", the title, "14:30–15:00 · Google Meet · will record" (or "heads-up" when it will only
+ask), then a ready line, "✓ Calendar ✓ Call detection ✓ System audio", with ✕ for anything
+squawk cannot do yet. While a meeting records it reads "Now" and the time so far. Without
+Calendar access it says so, with Open Settings.
 
 The menu bar item stays as it is: no titles or countdowns there.
 

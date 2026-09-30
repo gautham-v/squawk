@@ -1,4 +1,4 @@
-//! The notetaker: the three `[meeting]` settings the popover's Settings tab
+//! The notetaker: the four `[meeting]` settings the popover's Settings tab
 //! edits, and the pure state machine behind them.
 //!
 //! - **Heads-up** before a calendar event with other people or a call link
@@ -6,6 +6,11 @@
 //! - **Detect calls** ([`calls`]): when a call app has used the mic for 3 s,
 //!   a prompt with Start / Not now. Not now (or ignoring it) holds for the
 //!   rest of that call.
+//! - **Record automatically** ([`AutoRecord`]): instead of that prompt, the
+//!   meeting starts at once for a call during a calendar meeting (or for
+//!   every call), then "Recording · <title>" with Stop shows briefly. The
+//!   heads-up for a meeting that will record this way says so, and offers
+//!   Skip this one: that meeting's call then asks like any other.
 //! - **Maximum recording length**: a prompt two minutes before (Keep going
 //!   adds 30 minutes), then stop and save, then a brief "Saved notes" prompt
 //!   with Open.
@@ -29,14 +34,18 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 
+pub use crate::config::AutoRecord;
 use crate::config::MeetingConfig;
-use calls::{CallEvent, CallId, CallTracker};
+use calls::{Call, CallEvent, CallId, CallTracker};
 use heads_up::UpcomingEvent;
 
 /// The heads-up choices, in seconds before the start (-1 = off).
 pub const HEADS_UP_CHOICES: [i64; 5] = [-1, 0, 15, 60, 300];
 /// The maximum-length choices, in minutes.
 pub const MAX_LENGTH_CHOICES: [u64; 5] = [30, 60, 120, 180, 240];
+/// The record-automatically choices, in menu order.
+pub const AUTO_RECORD_CHOICES: [AutoRecord; 3] =
+    [AutoRecord::Off, AutoRecord::Calendar, AutoRecord::All];
 /// How long before the maximum length the warning appears.
 pub const WARN_BEFORE: Duration = Duration::from_secs(120);
 /// What Keep going adds.
@@ -47,6 +56,8 @@ pub const CALL_PROMPT_FOR: Duration = Duration::from_secs(20);
 pub const HEADS_UP_MIN_FOR: Duration = Duration::from_secs(30);
 /// How long "Saved notes" stays up.
 pub const SAVED_FOR: Duration = Duration::from_secs(8);
+/// How long "Recording · <title>" stays up after an automatic start.
+pub const STARTED_FOR: Duration = Duration::from_secs(8);
 
 /// "Off", "At start", "15 s", "1 min", "5 min".
 pub fn heads_up_label(secs: i64) -> String {
@@ -67,11 +78,21 @@ pub fn max_length_label(minutes: u64) -> String {
     }
 }
 
+/// "Off", "Calendar meetings", "All calls".
+pub fn auto_record_label(auto: AutoRecord) -> &'static str {
+    match auto {
+        AutoRecord::Off => "Off",
+        AutoRecord::Calendar => "Calendar meetings",
+        AutoRecord::All => "All calls",
+    }
+}
+
 /// One Settings-tab change: the `[meeting]` key it writes and its value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Setting {
     HeadsUpSecs(i64),
     DetectCalls(bool),
+    AutoRecord(AutoRecord),
     MaxMinutes(u64),
 }
 
@@ -80,6 +101,7 @@ impl Setting {
         match self {
             Setting::HeadsUpSecs(_) => "heads_up_secs",
             Setting::DetectCalls(_) => "detect_calls",
+            Setting::AutoRecord(_) => "auto_record",
             Setting::MaxMinutes(_) => "max_minutes",
         }
     }
@@ -89,6 +111,7 @@ impl Setting {
             Setting::HeadsUpSecs(v) => v.into(),
             Setting::MaxMinutes(v) => (v as i64).into(),
             Setting::DetectCalls(v) => v.into(),
+            Setting::AutoRecord(v) => v.as_str().into(),
         }
     }
 
@@ -97,6 +120,7 @@ impl Setting {
         match self {
             Setting::HeadsUpSecs(v) => meeting.heads_up_secs = v,
             Setting::DetectCalls(v) => meeting.detect_calls = v,
+            Setting::AutoRecord(v) => meeting.auto_record = v,
             Setting::MaxMinutes(v) => meeting.max_minutes = v,
         }
     }
@@ -108,7 +132,21 @@ pub struct Settings {
     /// `None` = no heads-up.
     pub heads_up: Option<Duration>,
     pub detect_calls: bool,
+    pub auto_record: AutoRecord,
     pub max_length: Duration,
+}
+
+impl Settings {
+    /// Whether some calls record without asking (detection is on and
+    /// record-automatically is not off).
+    pub fn auto_records(&self) -> bool {
+        self.detect_calls && self.auto_record != AutoRecord::Off
+    }
+
+    /// Whether the call for this calendar event would record on its own.
+    pub fn will_record(&self, event: &UpcomingEvent) -> bool {
+        self.auto_records() && event.is_meeting()
+    }
 }
 
 impl From<&MeetingConfig> for Settings {
@@ -116,6 +154,7 @@ impl From<&MeetingConfig> for Settings {
         Settings {
             heads_up: u64::try_from(m.heads_up_secs).ok().map(Duration::from_secs),
             detect_calls: m.detect_calls,
+            auto_record: m.auto_record,
             max_length: Duration::from_secs(m.max_minutes * 60),
         }
     }
@@ -137,15 +176,19 @@ pub enum StopReason {
 /// What the panel under the menu bar icon shows.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Prompt {
-    /// Record / Not now.
+    /// Record / Not now; or, when its call will record on its own (`auto`),
+    /// Skip this one.
     HeadsUp {
         key: String,
         title: String,
         start: DateTime<Local>,
         end: DateTime<Local>,
+        auto: bool,
     },
     /// Start / Not now.
     Call { call: CallId, app: String },
+    /// A call started recording on its own: Stop.
+    Recording { title: String, app: String },
     /// Keep going +30 min.
     StoppingSoon { title: String, limit: Duration },
     /// Open.
@@ -160,7 +203,7 @@ pub enum Prompt {
 /// A button on the panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reply {
-    /// Record / Start / Keep going / Open.
+    /// Record / Start / Skip this one / Stop / Keep going / Open.
     Accept,
     /// Not now.
     Dismiss,
@@ -177,10 +220,27 @@ pub enum Outcome {
         fallback: String,
         call: Option<CallId>,
     },
+    /// Stop the running meeting and save it.
+    StopMeeting,
     /// The limit moved (nothing else to do).
     Extended,
     /// Open this meeting file.
     Open(PathBuf),
+}
+
+/// What [`Notetaker::tick`] wants done on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Auto {
+    /// Start a meeting for this call without asking: `title` and
+    /// `fallback` as in [`Outcome::StartMeeting`]. Report the start with
+    /// [`Notetaker::meeting_started`] and this `call`.
+    Start {
+        title: Option<String>,
+        fallback: String,
+        call: CallId,
+    },
+    /// Stop the running meeting.
+    Stop(StopReason),
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +253,8 @@ struct Shown {
 #[derive(Debug, Clone)]
 struct Watch {
     title: String,
+    /// The call app it was started from or during, if any.
+    app: Option<String>,
     started: Instant,
     limit: Duration,
     warned: bool,
@@ -208,6 +270,10 @@ pub struct Notetaker {
     offered: HashSet<CallId>,
     /// Events already offered.
     heads_up_done: HashSet<String>,
+    /// Events whose call should ask instead of recording on its own.
+    skipped: HashSet<String>,
+    /// The call [`Auto::Start`] asked the app to record, and its app.
+    auto_pending: Option<(CallId, String)>,
 }
 
 impl Notetaker {
@@ -219,6 +285,8 @@ impl Notetaker {
             meeting: None,
             offered: HashSet::new(),
             heads_up_done: HashSet::new(),
+            skipped: HashSet::new(),
+            auto_pending: None,
         }
     }
 
@@ -233,7 +301,9 @@ impl Notetaker {
         self.settings = settings;
         let hide = match self.shown.as_ref().map(|s| &s.prompt) {
             Some(Prompt::Call { .. }) => !settings.detect_calls,
-            Some(Prompt::HeadsUp { .. }) => settings.heads_up.is_none(),
+            Some(Prompt::HeadsUp { auto, .. }) => {
+                settings.heads_up.is_none() || *auto != settings.auto_records()
+            }
             _ => false,
         };
         if hide {
@@ -258,6 +328,11 @@ impl Notetaker {
         self.shown.as_ref().map(|s| &s.prompt)
     }
 
+    /// The call app the running meeting was started from or during.
+    pub fn meeting_app(&self) -> Option<&str> {
+        self.meeting.as_ref().and_then(|m| m.app.as_deref())
+    }
+
     /// Whether the mic needs watching at all.
     pub fn wants_mic(&self) -> bool {
         self.settings.detect_calls
@@ -265,7 +340,7 @@ impl Notetaker {
 
     /// Whether the calendar needs reading.
     pub fn wants_calendar(&self) -> bool {
-        self.settings.heads_up.is_some()
+        self.settings.heads_up.is_some() || self.settings.auto_records()
     }
 
     fn show(&mut self, prompt: Prompt, until: Option<Instant>) {
@@ -273,16 +348,16 @@ impl Notetaker {
     }
 
     /// Advance to `now`: `mic` is the call apps using the mic, `events` the
-    /// calendar around now. Returns a reason when the running meeting
-    /// should stop.
+    /// calendar around now. Returns what to do on its own: start a meeting
+    /// for a call that records automatically, or stop the running one.
     pub fn tick(
         &mut self,
         now: Instant,
         wall: DateTime<Local>,
         mic: &[String],
         events: &[UpcomingEvent],
-    ) -> Option<StopReason> {
-        let mut stop = None;
+    ) -> Option<Auto> {
+        let mut todo = None;
 
         for event in self.tracker.update(now, mic) {
             match event {
@@ -293,11 +368,15 @@ impl Notetaker {
                         && self.settings.detect_calls
                         && self.offered.insert(call.id)
                     {
-                        let app = call.app.clone();
-                        self.show(
-                            Prompt::Call { call: call.id, app },
-                            Some(now + CALL_PROMPT_FOR),
-                        );
+                        if let Some(start) = self.auto_start(&call, wall, events) {
+                            todo = Some(start);
+                        } else {
+                            let app = call.app.clone();
+                            self.show(
+                                Prompt::Call { call: call.id, app },
+                                Some(now + CALL_PROMPT_FOR),
+                            );
+                        }
                     }
                 }
                 CallEvent::Ended(call) => {
@@ -313,7 +392,7 @@ impl Notetaker {
         if let Some(m) = self.meeting.as_mut() {
             let elapsed = now.saturating_duration_since(m.started);
             if elapsed >= m.limit {
-                stop = Some(StopReason::MaxLength);
+                todo = Some(Auto::Stop(StopReason::MaxLength));
             } else if !m.warned && elapsed + WARN_BEFORE >= m.limit {
                 m.warned = true;
                 let prompt = Prompt::StoppingSoon {
@@ -338,6 +417,7 @@ impl Notetaker {
                     title: event.title.trim().to_string(),
                     start: event.start,
                     end: event.end,
+                    auto: self.settings.will_record(event),
                 };
                 self.show(prompt, Some(now + left));
             }
@@ -351,7 +431,33 @@ impl Notetaker {
         {
             self.shown = None;
         }
-        stop
+        todo
+    }
+
+    /// Whether `call` records without asking, and under what title: a call
+    /// during a calendar meeting (`calendar`), or any call (`all`) — unless
+    /// the meeting on now was skipped from its heads-up.
+    fn auto_start(
+        &mut self,
+        call: &Call,
+        wall: DateTime<Local>,
+        events: &[UpcomingEvent],
+    ) -> Option<Auto> {
+        let on = heads_up::happening(events, wall);
+        if on.is_some_and(|e| self.skipped.contains(&e.key)) {
+            return None;
+        }
+        let title = match self.settings.auto_record {
+            AutoRecord::Off => return None,
+            AutoRecord::Calendar => Some(on?.title.trim().to_string()),
+            AutoRecord::All => on.map(|e| e.title.trim().to_string()),
+        };
+        self.auto_pending = Some((call.id, call.app.clone()));
+        Some(Auto::Start {
+            title,
+            fallback: format!("{} call", call.app),
+            call: call.id,
+        })
     }
 
     /// A button on the panel.
@@ -363,6 +469,13 @@ impl Notetaker {
             return Outcome::Nothing;
         }
         match shown.prompt {
+            // Skip this one: its call asks instead.
+            Prompt::HeadsUp {
+                key, auto: true, ..
+            } => {
+                self.skipped.insert(key);
+                Outcome::Nothing
+            }
             Prompt::HeadsUp { title, .. } => Outcome::StartMeeting {
                 fallback: title.clone(),
                 title: Some(title),
@@ -373,6 +486,7 @@ impl Notetaker {
                 fallback: format!("{app} call"),
                 call: Some(call),
             },
+            Prompt::Recording { .. } => Outcome::StopMeeting,
             Prompt::StoppingSoon { .. } => {
                 if let Some(m) = self.meeting.as_mut() {
                     m.limit += EXTEND_BY;
@@ -384,32 +498,45 @@ impl Notetaker {
         }
     }
 
-    /// A meeting started (from a prompt, ⌥M, the popover or the CLI). The
-    /// call it was started from (`call`, else whichever call has the mic
-    /// now) counts as offered, so it is not offered again after the
-    /// meeting stops.
+    /// A meeting started (from a prompt, on its own, ⌥M, the popover or the
+    /// CLI). The call it was started from (`call`, else whichever call has
+    /// the mic now) counts as offered, so it is not offered again after the
+    /// meeting stops. Started on its own ([`Auto::Start`]): "Recording ·
+    /// <title>" shows briefly.
     pub fn meeting_started(&mut self, now: Instant, title: &str, call: Option<CallId>) {
+        let auto = self.auto_pending.take().filter(|(id, _)| call == Some(*id));
         let call = call
             .and_then(|id| self.tracker.get(id))
-            .or_else(|| self.tracker.current())
-            .map(|c| c.id);
-        if let Some(id) = call {
-            self.offered.insert(id);
+            .or_else(|| self.tracker.current());
+        let app = call.map(|c| c.app.clone());
+        if let Some(c) = call {
+            self.offered.insert(c.id);
         }
         self.meeting = Some(Watch {
             title: title.to_string(),
+            app,
             started: now,
             limit: self.settings.max_length,
             warned: false,
         });
         // Whatever the panel was offering, the user now has notes running.
         self.shown = None;
+        if let Some((_, app)) = auto {
+            let prompt = Prompt::Recording {
+                title: title.to_string(),
+                app,
+            };
+            self.show(prompt, Some(now + STARTED_FOR));
+        }
     }
 
     /// The meeting stopped (for any reason).
     pub fn meeting_stopped(&mut self) {
         self.meeting = None;
-        if matches!(self.prompt(), Some(Prompt::StoppingSoon { .. })) {
+        if matches!(
+            self.prompt(),
+            Some(Prompt::StoppingSoon { .. } | Prompt::Recording { .. })
+        ) {
             self.shown = None;
         }
     }
@@ -456,6 +583,14 @@ mod tests {
         Settings::default()
     }
 
+    /// Every call asks: the behaviour the call and heads-up tests pin down.
+    fn asking() -> Settings {
+        Settings {
+            auto_record: AutoRecord::Off,
+            ..settings()
+        }
+    }
+
     fn zoom() -> Vec<String> {
         vec!["Zoom".to_string()]
     }
@@ -468,7 +603,7 @@ mod tests {
             end: start + chrono::Duration::minutes(30),
             all_day: false,
             other_attendees: true,
-            video_link: true,
+            call_app: Some("Zoom"),
             declined: false,
             cancelled: false,
         }
@@ -492,25 +627,30 @@ mod tests {
         fn now(&self) -> Instant {
             self.t0 + secs(self.at)
         }
-        /// Tick every second up to and including `to`; the first stop wins.
+        /// Tick every second up to and including `to`; the first thing to
+        /// do wins.
         fn run(
             &mut self,
             n: &mut Notetaker,
             to: u64,
             mic: &[String],
             events: &[UpcomingEvent],
-        ) -> Option<StopReason> {
-            let mut stop = None;
+        ) -> Option<Auto> {
+            let mut todo = None;
             while self.at < to {
                 self.at += 1;
                 let w = self.w0 + chrono::Duration::seconds(self.at as i64);
-                let s = n.tick(self.now(), w, mic, events);
-                if stop.is_none() {
-                    stop = s;
+                let t = n.tick(self.now(), w, mic, events);
+                if todo.is_none() {
+                    todo = t;
                 }
             }
-            stop
+            todo
         }
+    }
+
+    fn stop() -> Option<Auto> {
+        Some(Auto::Stop(StopReason::MaxLength))
     }
 
     #[test]
@@ -527,6 +667,11 @@ mod tests {
         assert_eq!(max, ["30 min", "1 h", "2 h", "3 h", "4 h"]);
         assert_eq!(heads_up_label(30), "30 s");
         assert_eq!(max_length_label(90), "1 h 30 min");
+        let auto: Vec<_> = AUTO_RECORD_CHOICES
+            .iter()
+            .map(|&a| auto_record_label(a))
+            .collect();
+        assert_eq!(auto, ["Off", "Calendar meetings", "All calls"]);
     }
 
     #[test]
@@ -534,15 +679,43 @@ mod tests {
         let s = Settings::default();
         assert_eq!(s.heads_up, Some(secs(15)));
         assert!(s.detect_calls);
+        assert_eq!(s.auto_record, AutoRecord::Calendar);
         assert_eq!(s.max_length, mins(120));
         let mut m = MeetingConfig::default();
         Setting::HeadsUpSecs(-1).apply(&mut m);
         Setting::MaxMinutes(30).apply(&mut m);
+        Setting::AutoRecord(AutoRecord::All).apply(&mut m);
         assert_eq!(Settings::from(&m).heads_up, None);
         assert_eq!(Settings::from(&m).max_length, mins(30));
+        assert_eq!(Settings::from(&m).auto_record, AutoRecord::All);
         assert_eq!(Setting::MaxMinutes(30).key(), "max_minutes");
         assert_eq!(Setting::DetectCalls(false).value().as_bool(), Some(false));
         assert_eq!(Setting::HeadsUpSecs(-1).value().as_integer(), Some(-1));
+        assert_eq!(Setting::AutoRecord(AutoRecord::Off).key(), "auto_record");
+        assert_eq!(
+            Setting::AutoRecord(AutoRecord::Off).value().as_str(),
+            Some("off")
+        );
+    }
+
+    #[test]
+    fn auto_record_needs_detect_calls() {
+        let off = Settings {
+            detect_calls: false,
+            ..settings()
+        };
+        assert!(settings().auto_records());
+        assert!(!off.auto_records());
+        assert!(!asking().auto_records());
+        let e = event("Design review", wall(15, 0, 0));
+        assert!(settings().will_record(&e));
+        assert!(!off.will_record(&e));
+        // Without a heads-up, recording on its own still reads the calendar.
+        let n = Notetaker::new(Settings {
+            heads_up: None,
+            ..settings()
+        });
+        assert!(n.wants_calendar());
     }
 
     #[test]
@@ -596,8 +769,9 @@ mod tests {
             ..settings()
         });
         let mut c = Clock::new();
-        c.run(&mut n, 30, &zoom(), &[]);
-        assert_eq!(n.prompt(), None);
+        let events = [event("Design review", wall(14, 0, 0))];
+        assert_eq!(c.run(&mut n, 30, &zoom(), &events), None);
+        assert!(!matches!(n.prompt(), Some(Prompt::Call { .. })));
         // Nothing else needs the mic watched.
         assert!(!n.wants_mic());
     }
@@ -630,6 +804,9 @@ mod tests {
         assert_eq!(title, None);
         assert_eq!(fallback, "Zoom call");
         n.meeting_started(c.now(), "Zoom call", call);
+        assert_eq!(n.meeting_app(), Some("Zoom"));
+        // Started from the prompt, not on its own: nothing more to say.
+        assert_eq!(n.prompt(), None);
 
         assert_eq!(c.run(&mut n, 600, &zoom(), &[]), None);
         // Zoom lets go of the mic (muted, say): the meeting keeps recording.
@@ -673,13 +850,18 @@ mod tests {
     }
 
     #[test]
-    fn a_call_that_starts_during_a_meeting_is_not_offered() {
-        let mut n = Notetaker::new(settings());
-        let mut c = Clock::new();
-        n.meeting_started(c.now(), "Meeting", None);
-        c.run(&mut n, 60, &[], &[]);
-        c.run(&mut n, 70, &zoom(), &[]);
-        assert_eq!(n.prompt(), None);
+    fn a_call_that_starts_during_a_meeting_is_not_offered_or_recorded() {
+        for s in [settings(), asking()] {
+            let mut n = Notetaker::new(Settings {
+                auto_record: AutoRecord::All,
+                ..s
+            });
+            let mut c = Clock::new();
+            n.meeting_started(c.now(), "Meeting", None);
+            c.run(&mut n, 60, &[], &[]);
+            assert_eq!(c.run(&mut n, 70, &zoom(), &[]), None);
+            assert_eq!(n.prompt(), None);
+        }
     }
 
     #[test]
@@ -710,10 +892,7 @@ mod tests {
         );
         assert_eq!(c.run(&mut n, 30 * 60 - 1, &[], &[]), None);
         assert!(n.prompt().is_some(), "stays up until the stop");
-        assert_eq!(
-            c.run(&mut n, 30 * 60, &[], &[]),
-            Some(StopReason::MaxLength)
-        );
+        assert_eq!(c.run(&mut n, 30 * 60, &[], &[]), stop());
         n.meeting_stopped();
         assert_eq!(n.prompt(), None);
     }
@@ -736,10 +915,7 @@ mod tests {
             n.prompt(),
             Some(Prompt::StoppingSoon { limit, .. }) if *limit == mins(90)
         ));
-        assert_eq!(
-            c.run(&mut n, 90 * 60, &[], &[]),
-            Some(StopReason::MaxLength)
-        );
+        assert_eq!(c.run(&mut n, 90 * 60, &[], &[]), stop());
     }
 
     #[test]
@@ -752,23 +928,21 @@ mod tests {
             max_length: mins(30),
             ..settings()
         });
-        assert_eq!(
-            c.run(&mut n, 40 * 60 + 1, &[], &[]),
-            Some(StopReason::MaxLength)
-        );
+        assert_eq!(c.run(&mut n, 40 * 60 + 1, &[], &[]), stop());
     }
 
     #[test]
     fn heads_up_fifteen_seconds_before_then_record() {
-        let mut n = Notetaker::new(settings());
+        let mut n = Notetaker::new(asking());
         let mut c = Clock::new();
         let events = [event("Design review", wall(14, 1, 0))];
         c.run(&mut n, 44, &[], &events);
         assert_eq!(n.prompt(), None);
         c.run(&mut n, 45, &[], &events);
-        assert!(
-            matches!(n.prompt(), Some(Prompt::HeadsUp { title, .. }) if title == "Design review")
-        );
+        assert!(matches!(
+            n.prompt(),
+            Some(Prompt::HeadsUp { title, auto: false, .. }) if title == "Design review"
+        ));
         assert_eq!(
             n.reply(Reply::Accept),
             Outcome::StartMeeting {
@@ -785,7 +959,7 @@ mod tests {
 
     #[test]
     fn heads_up_not_now_is_final_and_it_expires_after_the_start() {
-        let mut n = Notetaker::new(settings());
+        let mut n = Notetaker::new(asking());
         let mut c = Clock::new();
         let events = [
             event("Standup", wall(14, 1, 0)),
@@ -808,7 +982,7 @@ mod tests {
     fn heads_up_off_offers_nothing() {
         let mut n = Notetaker::new(Settings {
             heads_up: None,
-            ..settings()
+            ..asking()
         });
         let mut c = Clock::new();
         c.run(&mut n, 120, &[], &[event("Standup", wall(14, 1, 0))]);
@@ -833,5 +1007,154 @@ mod tests {
     fn a_reply_with_nothing_shown_does_nothing() {
         let mut n = Notetaker::new(settings());
         assert_eq!(n.reply(Reply::Accept), Outcome::Nothing);
+    }
+
+    // ── Record automatically ─────────────────────────────────────────────
+
+    /// The call the machine asked to record, reported back as started.
+    fn start_it(n: &mut Notetaker, c: &Clock, todo: Option<Auto>) -> (Option<String>, String) {
+        let Some(Auto::Start {
+            title,
+            fallback,
+            call,
+        }) = todo
+        else {
+            panic!("expected an automatic start, got {todo:?}");
+        };
+        let name = title.clone().unwrap_or_else(|| fallback.clone());
+        n.meeting_started(c.now(), &name, Some(call));
+        (title, fallback)
+    }
+
+    #[test]
+    fn a_call_during_a_calendar_meeting_records_on_its_own_then_says_so() {
+        let mut n = Notetaker::new(settings());
+        let mut c = Clock::new();
+        // Joined a minute early.
+        let events = [event("Design review", wall(14, 1, 0))];
+        assert_eq!(c.run(&mut n, 3, &zoom(), &events), None);
+        let todo = c.run(&mut n, 4, &zoom(), &events);
+        assert_eq!(n.prompt(), None, "no Start / Not now");
+        let (title, fallback) = start_it(&mut n, &c, todo);
+        assert_eq!(title.as_deref(), Some("Design review"));
+        assert_eq!(fallback, "Zoom call");
+        assert_eq!(
+            n.prompt(),
+            Some(&Prompt::Recording {
+                title: "Design review".into(),
+                app: "Zoom".into()
+            })
+        );
+        assert_eq!(n.meeting_app(), Some("Zoom"));
+        // Up briefly, then gone; the meeting keeps going.
+        c.run(&mut n, 11, &zoom(), &events);
+        assert!(n.prompt().is_some());
+        c.run(&mut n, 12, &zoom(), &events);
+        assert_eq!(n.prompt(), None);
+    }
+
+    #[test]
+    fn stop_on_the_recording_prompt_stops_the_meeting() {
+        let mut n = Notetaker::new(settings());
+        let mut c = Clock::new();
+        let events = [event("Design review", wall(14, 0, 0))];
+        let todo = c.run(&mut n, 4, &zoom(), &events);
+        start_it(&mut n, &c, todo);
+        assert_eq!(n.reply(Reply::Accept), Outcome::StopMeeting);
+        n.meeting_stopped();
+        assert_eq!(n.prompt(), None);
+        // Same call, still on: not offered again.
+        assert_eq!(c.run(&mut n, 60, &zoom(), &events), None);
+        assert_eq!(n.prompt(), None);
+    }
+
+    #[test]
+    fn a_call_with_no_meeting_on_still_asks_in_calendar_mode() {
+        let mut n = Notetaker::new(settings());
+        let mut c = Clock::new();
+        // Starts in 10 minutes: too early to be this call.
+        let events = [event("Later", wall(14, 10, 0))];
+        assert_eq!(c.run(&mut n, 4, &zoom(), &events), None);
+        assert!(matches!(n.prompt(), Some(Prompt::Call { .. })));
+    }
+
+    #[test]
+    fn all_calls_records_any_call_and_takes_the_meeting_title_when_there_is_one() {
+        let all = Settings {
+            auto_record: AutoRecord::All,
+            ..settings()
+        };
+        let mut n = Notetaker::new(all);
+        let mut c = Clock::new();
+        let todo = c.run(&mut n, 4, &zoom(), &[]);
+        let (title, fallback) = start_it(&mut n, &c, todo);
+        assert_eq!((title, fallback.as_str()), (None, "Zoom call"));
+
+        let mut n = Notetaker::new(all);
+        let mut c = Clock::new();
+        let events = [event("Standup", wall(14, 0, 0))];
+        let todo = c.run(&mut n, 4, &zoom(), &events);
+        assert_eq!(start_it(&mut n, &c, todo).0.as_deref(), Some("Standup"));
+    }
+
+    #[test]
+    fn off_asks_as_before() {
+        let mut n = Notetaker::new(asking());
+        let mut c = Clock::new();
+        let events = [event("Design review", wall(14, 0, 0))];
+        assert_eq!(c.run(&mut n, 4, &zoom(), &events), None);
+        assert!(matches!(n.prompt(), Some(Prompt::Call { .. })));
+    }
+
+    #[test]
+    fn the_heads_up_for_a_meeting_that_records_itself_offers_skip() {
+        let mut n = Notetaker::new(settings());
+        let mut c = Clock::new();
+        let events = [event("Design review", wall(14, 1, 0))];
+        c.run(&mut n, 45, &[], &events);
+        assert!(matches!(
+            n.prompt(),
+            Some(Prompt::HeadsUp { auto: true, .. })
+        ));
+        // Skip this one: nothing starts, and its call asks instead.
+        assert_eq!(n.reply(Reply::Accept), Outcome::Nothing);
+        assert_eq!(c.run(&mut n, 55, &zoom(), &events), None);
+        assert!(matches!(n.prompt(), Some(Prompt::Call { .. })));
+    }
+
+    #[test]
+    fn a_skipped_meeting_asks_even_with_all_calls() {
+        let mut n = Notetaker::new(Settings {
+            auto_record: AutoRecord::All,
+            ..settings()
+        });
+        let mut c = Clock::new();
+        let events = [event("Design review", wall(14, 1, 0))];
+        c.run(&mut n, 45, &[], &events);
+        n.reply(Reply::Accept);
+        assert_eq!(c.run(&mut n, 55, &zoom(), &events), None);
+        assert!(matches!(n.prompt(), Some(Prompt::Call { .. })));
+    }
+
+    #[test]
+    fn a_manual_start_after_an_automatic_one_was_asked_for_says_nothing() {
+        let mut n = Notetaker::new(settings());
+        let mut c = Clock::new();
+        let events = [event("Design review", wall(14, 0, 0))];
+        let todo = c.run(&mut n, 4, &zoom(), &events);
+        assert!(matches!(todo, Some(Auto::Start { .. })));
+        // The app could not start it; ⌥M later is a plain start.
+        n.meeting_started(c.now(), "Meeting", None);
+        assert_eq!(n.prompt(), None);
+    }
+
+    #[test]
+    fn changing_auto_record_takes_a_stale_heads_up_down() {
+        let mut n = Notetaker::new(settings());
+        let mut c = Clock::new();
+        c.run(&mut n, 45, &[], &[event("Design review", wall(14, 1, 0))]);
+        assert!(n.prompt().is_some());
+        n.set_settings(asking());
+        assert_eq!(n.prompt(), None);
     }
 }

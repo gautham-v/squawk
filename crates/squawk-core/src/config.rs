@@ -90,9 +90,57 @@ pub struct MeetingConfig {
     pub heads_up_secs: i64,
     /// Offer to take notes when a call app starts using the mic.
     pub detect_calls: bool,
+    /// Which detected calls start recording without asking.
+    pub auto_record: AutoRecord,
     /// Stop and save a meeting after this many minutes, with a warning two
     /// minutes before.
     pub max_minutes: u64,
+}
+
+/// Which detected calls record on their own (the rest still ask "Start
+/// notes?"). Needs `detect_calls`.
+///
+/// An unknown value reads as the default, like a clamped number: failing
+/// the whole file over it would reset every other setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AutoRecord {
+    /// None: every call asks.
+    Off,
+    /// A call during a calendar meeting (other people or a call link).
+    #[default]
+    Calendar,
+    /// Every detected call.
+    All,
+}
+
+impl AutoRecord {
+    /// As config.toml spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AutoRecord::Off => "off",
+            AutoRecord::Calendar => "calendar",
+            AutoRecord::All => "all",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<AutoRecord> {
+        [AutoRecord::Off, AutoRecord::Calendar, AutoRecord::All]
+            .into_iter()
+            .find(|a| a.as_str() == value.trim().to_ascii_lowercase())
+    }
+}
+
+impl<'de> Deserialize<'de> for AutoRecord {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(d)?;
+        Ok(AutoRecord::parse(&value).unwrap_or_else(|| {
+            log::warn!(
+                "config: auto_record = {value:?} is not off, calendar or all; using calendar"
+            );
+            AutoRecord::default()
+        }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -138,6 +186,7 @@ impl Default for MeetingConfig {
             echo_cancellation: true,
             heads_up_secs: 15,
             detect_calls: true,
+            auto_record: AutoRecord::default(),
             max_minutes: 120,
         }
     }
@@ -279,6 +328,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# squawk settings. Every key is optiona
 # Offer to take notes when Zoom, Teams, FaceTime, Slack, Webex, Discord or a Meet tab
 # starts using the mic.
 # detect_calls = true
+# Start recording a detected call without asking: "off", "calendar" (a call during a
+# calendar meeting; other calls still ask) or "all".
+# auto_record = "calendar"
 # Stop and save after this many minutes (warns 2 min before).
 # max_minutes = 120
 
@@ -344,6 +396,28 @@ mod tests {
         let c = Config::parse("[meeting]\nheads_up_secs = 99999\nmax_minutes = 99999\n").unwrap();
         assert_eq!(c.meeting.heads_up_secs, 3600);
         assert_eq!(c.meeting.max_minutes, 1440);
+    }
+
+    #[test]
+    fn auto_record_is_calendar_unless_set() {
+        assert_eq!(Config::default().meeting.auto_record, AutoRecord::Calendar);
+        for (text, want) in [
+            ("off", AutoRecord::Off),
+            ("calendar", AutoRecord::Calendar),
+            ("all", AutoRecord::All),
+        ] {
+            let c = Config::parse(&format!("[meeting]\nauto_record = \"{text}\"\n")).unwrap();
+            assert_eq!(c.meeting.auto_record, want);
+            assert_eq!(want.as_str(), text);
+        }
+    }
+
+    #[test]
+    fn an_unknown_auto_record_value_reads_as_the_default_and_keeps_the_rest() {
+        let c =
+            Config::parse("[meeting]\nauto_record = \"sometimes\"\nmax_minutes = 30\n").unwrap();
+        assert_eq!(c.meeting.auto_record, AutoRecord::Calendar);
+        assert_eq!(c.meeting.max_minutes, 30);
     }
 
     #[test]
