@@ -4,8 +4,11 @@
 //! policy, the status item, the popover window anchored under it (toggled by
 //! a click, closed on Esc, an outside click or focus loss), and the wiring
 //! between the controller's snapshots and the views. See docs/design.md, "Startup".
-//! Also the notetaker's prompt panel: a second PopUp window hung under the
-//! item while the snapshot has a prompt and the popover is closed.
+//!
+//! Unlike claudebar, the popover window is made once, hidden, at startup and
+//! only moved, shown and hidden after that (see [`Panel`]). The notetaker's
+//! prompt panel is a second PopUp window hung under the item while the
+//! snapshot has a prompt and the popover is hidden.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -13,10 +16,15 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use gpui::{
-    point, px, size, App, AppContext, Application, Bounds, Entity, Focusable, Pixels, Subscription,
-    WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind, WindowOptions,
+    point, px, size, App, AppContext, Application, AsyncApp, Bounds, Entity, Focusable, Pixels,
+    Subscription, WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowKind,
+    WindowOptions,
 };
+use objc2::rc::Retained;
 use objc2::MainThreadMarker;
+use objc2_app_kit::{NSView, NSWindow};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use squawk_core::hotkey::Timings;
 use squawk_core::{Config, Paths};
 use squawk_engine::{Engine, EngineConfig};
@@ -27,7 +35,7 @@ use squawk_app::status_item::{Anchor, MenuBarState, ScreenRect, StatusItem, Stat
 use squawk_app::ui::panel::{self, PanelReply, PromptPanel};
 use squawk_app::ui::popover::{self, Popover, PopoverEvent};
 use squawk_app::ui::theme;
-use squawk_app::{ipc_server, logger, permissions};
+use squawk_app::{ipc_server, launch_at_login, logger, permissions};
 
 /// Keep the popover this far from the screen edges.
 const SCREEN_MARGIN: f32 = 8.0;
@@ -45,8 +53,169 @@ const TAP_RETRY: Duration = Duration::from_secs(2);
 /// How long quitting waits for a running meeting's last chunks.
 const QUIT_WAIT: Duration = Duration::from_secs(30);
 
-type WindowSlot = Rc<RefCell<Option<WindowHandle<Popover>>>>;
 type PanelSlot = Rc<RefCell<Option<WindowHandle<PromptPanel>>>>;
+
+/// The popover's one window, made hidden at startup and then only moved,
+/// shown and hidden, like a native menu. Measured: a fresh gpui window costs
+/// a Metal renderer and its pipelines (~270 ms the first time, ~10 ms after)
+/// before its first frame, while a window that becomes key again presents
+/// its next frame synchronously, in the same transaction that shows it.
+///
+/// AppKit calls go through the `NSWindow` directly, outside any gpui update:
+/// showing it re-enters gpui (the key-status change draws a frame), which
+/// would find the app already borrowed if done from inside one.
+#[derive(Clone)]
+struct Panel {
+    window: Rc<RefCell<Option<PanelWindow>>>,
+    shown: Rc<Cell<bool>>,
+    /// Whether it has become key since it was last shown: only losing key
+    /// status after that is focus loss.
+    became_key: Rc<Cell<bool>>,
+    /// When the panel last hid itself on focus loss (see [`TOGGLE_GRACE`]).
+    closed_at: Rc<Cell<Option<Instant>>>,
+}
+
+struct PanelWindow {
+    ns_window: Retained<NSWindow>,
+    handle: WindowHandle<Popover>,
+    _activation: Subscription,
+}
+
+impl Panel {
+    fn new() -> Panel {
+        Panel {
+            window: Rc::new(RefCell::new(None)),
+            shown: Rc::new(Cell::new(false)),
+            became_key: Rc::new(Cell::new(false)),
+            closed_at: Rc::new(Cell::new(None)),
+        }
+    }
+
+    fn is_shown(&self) -> bool {
+        self.shown.get()
+    }
+
+    /// Make the window, hidden. Called at startup, and again on a click if
+    /// that failed.
+    fn create(&self, cx: &mut App, popover: Entity<Popover>) -> anyhow::Result<()> {
+        if self.window.borrow().is_some() {
+            return Ok(());
+        }
+        let bounds = Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(theme::POPOVER_WIDTH, px(theme::POPOVER_HEIGHT_PX)),
+        };
+        let panel = self.clone();
+        let mut made: Option<(Retained<NSWindow>, Subscription)> = None;
+        let handle = cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: None,
+                focus: false,
+                show: false,
+                // PopUp is a borderless, non-activating NSPanel: the menu bar
+                // popover behaviour.
+                kind: WindowKind::PopUp,
+                is_movable: false,
+                is_resizable: false,
+                is_minimizable: false,
+                window_background: WindowBackgroundAppearance::Blurred,
+                window_min_size: None,
+                display_id: None,
+                app_id: None,
+                window_decorations: None,
+                tabbing_identifier: None,
+            },
+            |window, cx| {
+                let subscription = popover.update(cx, |_, cx| {
+                    // Focus loss hides it. gpui also reports the state once
+                    // at registration, and AppKit can report a spurious
+                    // resign while the panel is being shown; only a
+                    // deactivation after it really became key counts.
+                    cx.observe_window_activation(window, move |_, window, cx| {
+                        if window.is_window_active() {
+                            panel.became_key.set(panel.is_shown());
+                        } else if panel.is_shown() && panel.became_key.get() {
+                            panel.closed_at.set(Some(Instant::now()));
+                            panel.hide(cx);
+                        }
+                    })
+                });
+                made = ns_window_of(window).map(|w| (w, subscription));
+                window.focus(&popover.focus_handle(cx));
+                popover.clone()
+            },
+        )?;
+        let (ns_window, activation) =
+            made.ok_or_else(|| anyhow::anyhow!("popover window has no NSWindow"))?;
+        *self.window.borrow_mut() = Some(PanelWindow {
+            ns_window,
+            handle,
+            _activation: activation,
+        });
+        Ok(())
+    }
+
+    /// Give the popover's view keyboard focus again, so ←/→/↑/↓, Return
+    /// and Esc reach it as soon as the window is key. Call before
+    /// [`Panel::show`].
+    fn focus(&self, cx: &mut App, popover: &Entity<Popover>) {
+        let Some(handle) = self.window.borrow().as_ref().map(|w| w.handle) else {
+            return;
+        };
+        let _ = handle.update(cx, |_, window, cx| {
+            window.focus(&popover.focus_handle(cx));
+        });
+    }
+
+    /// Move the window to `frame` (AppKit coordinates) and make it key.
+    /// Must run outside any gpui update: see the type's docs.
+    fn show(&self, frame: NSRect) {
+        let Some(ns_window) = self.ns_window() else {
+            return;
+        };
+        self.shown.set(true);
+        self.became_key.set(false);
+        ns_window.setFrame_display(frame, false);
+        ns_window.makeKeyAndOrderFront(None);
+    }
+
+    /// Hide the window if it is showing; returns whether it was. The
+    /// `orderOut` itself runs on the next turn of the main loop, outside
+    /// the current gpui update.
+    fn hide(&self, cx: &mut App) -> bool {
+        if !self.shown.replace(false) {
+            return false;
+        }
+        if let Some(ns_window) = self.ns_window() {
+            let shown = self.shown.clone();
+            cx.spawn(async move |_| {
+                // A click may have shown it again in the meantime.
+                if !shown.get() {
+                    ns_window.orderOut(None);
+                }
+            })
+            .detach();
+        }
+        true
+    }
+
+    fn ns_window(&self) -> Option<Retained<NSWindow>> {
+        self.window.borrow().as_ref().map(|w| w.ns_window.clone())
+    }
+}
+
+/// The `NSWindow` behind a gpui window.
+fn ns_window_of(window: &gpui::Window) -> Option<Retained<NSWindow>> {
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return None;
+    };
+    // SAFETY: gpui's AppKit handle points at its live content NSView; we
+    // are on the main thread, inside gpui's window callback.
+    let view: &NSView = unsafe { appkit.ns_view.cast::<NSView>().as_ref() };
+    view.window()
+}
 
 /// Where the popover goes: the left and top edges it is pinned to, and the
 /// bottom of the display it is on.
@@ -124,7 +293,16 @@ fn main() {
         let item = Rc::new(item);
         let current = Rc::new(RefCell::new(initial.clone()));
         let popover = cx.new(|cx| Popover::new(initial, cx));
-        let window: WindowSlot = Rc::new(RefCell::new(None));
+        // Read the files and the launch-at-login status now, in the
+        // background, so the first open already has them.
+        popover.update(cx, |p, cx| p.reload(cx));
+        cx.background_executor()
+            .spawn(async { launch_at_login::refresh() })
+            .detach();
+        let panel = Panel::new();
+        if let Err(err) = panel.create(cx, popover.clone()) {
+            log::warn!("could not make the popover window: {err}");
+        }
         let prompt_panel = cx.new(|_| PromptPanel::new(None));
         let panel_window: PanelSlot = Rc::new(RefCell::new(None));
 
@@ -140,7 +318,7 @@ fn main() {
             let item = item.clone();
             let popover = popover.clone();
             let current = current.clone();
-            let window = window.clone();
+            let panel = panel.clone();
             let prompt_panel = prompt_panel.clone();
             let panel_window = panel_window.clone();
             cx.spawn(async move |cx| {
@@ -150,7 +328,7 @@ fn main() {
                     let prompt = snapshot.prompt.clone();
                     let updated = cx.update(|cx| {
                         popover.update(cx, |p, cx| p.set_snapshot(snapshot, cx));
-                        let popover_open = window.borrow().is_some();
+                        let popover_open = panel.is_shown();
                         sync_panel(
                             cx,
                             prompt,
@@ -175,13 +353,13 @@ fn main() {
             let item = item.clone();
             let popover = popover.clone();
             let current = current.clone();
-            let window = window.clone();
+            let panel = panel.clone();
             let prompt_panel = prompt_panel.clone();
             let panel_window = panel_window.clone();
             cx.spawn(async move |cx| loop {
                 cx.background_executor().timer(REDRAW_EVERY).await;
                 let prompt = current.borrow().prompt.clone();
-                let popover_open = window.borrow().is_some();
+                let popover_open = panel.is_shown();
                 let shown = panel_window.borrow().is_some();
                 if shown != (prompt.is_some() && !popover_open)
                     && cx
@@ -204,7 +382,7 @@ fn main() {
                     continue;
                 }
                 item.set_state(mtm, state);
-                if window.borrow().is_some()
+                if panel.is_shown()
                     && cx
                         .update(|cx| popover.update(cx, |_, cx| cx.notify()))
                         .is_err()
@@ -218,15 +396,15 @@ fn main() {
         start_hotkeys(cx, machine, controller.clone());
 
         cx.subscribe(&popover, {
-            let window = window.clone();
+            let panel = panel.clone();
             let controller = controller.clone();
             move |_popover, event, cx| match event {
                 PopoverEvent::Close => {
-                    close_popover(&window, cx);
+                    panel.hide(cx);
                 }
                 PopoverEvent::ToggleMeeting => {
                     controller.send(Command::ToggleMeeting);
-                    close_popover(&window, cx);
+                    panel.hide(cx);
                 }
                 PopoverEvent::SetSetting(setting) => {
                     controller.send(Command::SetSetting(*setting));
@@ -235,46 +413,34 @@ fn main() {
         })
         .detach();
 
-        let closed_at: Rc<Cell<Option<Instant>>> = Rc::new(Cell::new(None));
-        let activation: Rc<RefCell<Option<Subscription>>> = Rc::new(RefCell::new(None));
         cx.spawn({
             let item = item.clone();
             let popover = popover.clone();
             async move |cx| {
                 while let Some(event) = clicks.next().await {
                     if event == StatusItemEvent::ClickedOutside {
-                        if cx.update(|cx| close_popover(&window, cx)).is_err() {
+                        if cx.update(|cx| panel.hide(cx)).is_err() {
                             break;
                         }
                         continue;
                     }
-                    let anchor = item.anchor(mtm);
-                    let result = cx.update(|cx| {
-                        if close_popover(&window, cx) {
-                            closed_at.set(None);
-                            return;
+                    match toggle_popover(
+                        cx,
+                        &panel,
+                        &panel_window,
+                        &popover,
+                        &controller,
+                        item.anchor(mtm),
+                    ) {
+                        Ok(Some(frame)) => {
+                            panel.show(frame);
+                            log::debug!(
+                                "popover shown {:.1} ms after the click",
+                                squawk_app::status_item::since_click().as_secs_f64() * 1e3
+                            );
                         }
-                        if closed_at.take().is_some_and(|t| t.elapsed() < TOGGLE_GRACE) {
-                            return;
-                        }
-                        controller.send(Command::RecheckPermissions);
-                        close_panel(&panel_window, cx);
-                        popover.update(cx, |p, cx| p.reset(cx));
-                        let placed = placement_for(cx, anchor, theme::POPOVER_WIDTH_PX);
-                        match open_popover(
-                            cx,
-                            placed,
-                            popover.clone(),
-                            &activation,
-                            &window,
-                            &closed_at,
-                        ) {
-                            Ok(handle) => *window.borrow_mut() = Some(handle),
-                            Err(err) => log::warn!("could not open popover: {err}"),
-                        }
-                    });
-                    if result.is_err() {
-                        break;
+                        Ok(None) => {}
+                        Err(_) => break,
                     }
                 }
             }
@@ -376,75 +542,60 @@ fn close_panel(slot: &PanelSlot, cx: &mut App) {
     }
 }
 
-/// Close the popover if one is open. Returns whether it closed something.
-fn close_popover(window: &WindowSlot, cx: &mut App) -> bool {
-    let handle = window.borrow_mut().take();
-    match handle {
-        Some(handle) => handle.update(cx, |_, w, _| w.remove_window()).is_ok(),
-        None => false,
-    }
+/// A click on the item: hide the popover if it is showing, else get it
+/// ready to show and return where (the caller shows it, outside this
+/// update). `Err` once the app is gone.
+fn toggle_popover(
+    cx: &mut AsyncApp,
+    panel: &Panel,
+    panel_window: &PanelSlot,
+    popover: &Entity<Popover>,
+    controller: &Controller,
+    anchor: Option<Anchor>,
+) -> anyhow::Result<Option<NSRect>> {
+    cx.update(|cx| {
+        if panel.hide(cx) {
+            panel.closed_at.set(None);
+            return None;
+        }
+        if panel
+            .closed_at
+            .take()
+            .is_some_and(|t| t.elapsed() < TOGGLE_GRACE)
+        {
+            return None;
+        }
+        if let Err(err) = panel.create(cx, popover.clone()) {
+            log::warn!("could not open popover: {err}");
+            return None;
+        }
+        // Permissions, config and model are re-checked on the controller
+        // thread; the popover reads its files in the background.
+        controller.send(Command::RecheckPermissions);
+        close_panel(panel_window, cx);
+        popover.update(cx, |p, cx| p.reset(cx));
+        panel.focus(cx, popover);
+        let bounds = popover_bounds(
+            placement_for(cx, anchor, theme::POPOVER_WIDTH_PX),
+            px(theme::POPOVER_HEIGHT_PX),
+        );
+        Some(appkit_frame(bounds, primary_height(cx)))
+    })
 }
 
-fn open_popover(
-    cx: &mut App,
-    placed: Placement,
-    popover: Entity<Popover>,
-    activation: &Rc<RefCell<Option<Subscription>>>,
-    window_slot: &WindowSlot,
-    closed_at: &Rc<Cell<Option<Instant>>>,
-) -> anyhow::Result<WindowHandle<Popover>> {
-    let bounds = popover_bounds(placed, px(theme::POPOVER_HEIGHT_PX));
-    let activation = activation.clone();
-    let window_slot = window_slot.clone();
-    let closed_at = closed_at.clone();
-    let handle = cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: None,
-            focus: true,
-            show: true,
-            // PopUp is a borderless, non-activating NSPanel: the menu bar
-            // popover behaviour.
-            kind: WindowKind::PopUp,
-            is_movable: false,
-            is_resizable: false,
-            is_minimizable: false,
-            window_background: WindowBackgroundAppearance::Blurred,
-            window_min_size: None,
-            display_id: None,
-            app_id: None,
-            window_decorations: None,
-            tabbing_identifier: None,
-        },
-        |window, cx| {
-            let subscription = popover.update(cx, |_, cx| {
-                // gpui fires this once at registration, before the panel is
-                // key; only a deactivation after a real activation closes.
-                let was_active = Cell::new(false);
-                cx.observe_window_activation(window, move |_, window, _| {
-                    if window.is_window_active() {
-                        was_active.set(true);
-                    } else if was_active.get() {
-                        *window_slot.borrow_mut() = None;
-                        closed_at.set(Some(Instant::now()));
-                        window.remove_window();
-                    }
-                })
-            });
-            *activation.borrow_mut() = Some(subscription);
-            window.focus(&popover.focus_handle(cx));
-            popover.clone()
-        },
-    )?;
-    handle.update(cx, |_, window, _| window.activate_window())?;
-    Ok(handle)
+fn primary_bounds(cx: &App) -> Bounds<Pixels> {
+    cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
+        origin: point(px(0.), px(0.)),
+        size: size(px(1440.), px(900.)),
+    })
+}
+
+fn primary_height(cx: &App) -> f32 {
+    primary_bounds(cx).size.height.into()
 }
 
 fn placement_for(cx: &App, anchor: Option<Anchor>, width: f32) -> Placement {
-    let b = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
-        origin: point(px(0.), px(0.)),
-        size: size(px(1440.), px(900.)),
-    });
+    let b = primary_bounds(cx);
     let primary = ScreenRect {
         x: b.origin.x.into(),
         y: b.origin.y.into(),
@@ -481,6 +632,19 @@ fn popover_bounds(placed: Placement, height: Pixels) -> Bounds<Pixels> {
         origin: point(px(placed.x), px(placed.top)),
         size: size(theme::POPOVER_WIDTH, px(height)),
     }
+}
+
+/// gpui's screen coordinates (top-left origin, y down) to an AppKit frame
+/// (bottom-left origin, y up), flipped through the primary display.
+fn appkit_frame(bounds: Bounds<Pixels>, primary_height: f32) -> NSRect {
+    let x: f32 = bounds.origin.x.into();
+    let top: f32 = bounds.origin.y.into();
+    let width: f32 = bounds.size.width.into();
+    let height: f32 = bounds.size.height.into();
+    NSRect::new(
+        NSPoint::new(x as f64, (primary_height - top - height) as f64),
+        NSSize::new(width as f64, height as f64),
+    )
 }
 
 /// Clip to the room under the menu bar rather than growing off the screen.
@@ -550,6 +714,23 @@ mod tests {
         assert_eq!(placed.top, 24.0);
         let placed = placement(anchor_on(primary, 1420.0), primary, panel::PANEL_WIDTH_PX);
         assert_eq!(placed.x, 1440.0 - panel::PANEL_WIDTH_PX - SCREEN_MARGIN);
+    }
+
+    #[test]
+    fn frames_flip_into_appkit_coordinates() {
+        let bounds = Bounds {
+            origin: point(px(100.), px(24.)),
+            size: size(px(340.), px(480.)),
+        };
+        let frame = appkit_frame(bounds, 900.0);
+        assert_eq!(frame.origin, NSPoint::new(100.0, 900.0 - 24.0 - 480.0));
+        assert_eq!(frame.size, NSSize::new(340.0, 480.0));
+        // A display above the primary one has negative gpui y.
+        let above = Bounds {
+            origin: point(px(0.), px(-1416.)),
+            size: size(px(340.), px(480.)),
+        };
+        assert_eq!(appkit_frame(above, 982.0).origin.y, 982.0 + 1416.0 - 480.0);
     }
 
     #[test]

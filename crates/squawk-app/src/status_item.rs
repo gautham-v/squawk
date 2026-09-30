@@ -8,7 +8,8 @@
 //! gpui task, so nothing AppKit-shaped leaks into the views.
 
 use std::cell::RefCell;
-use std::time::Instant;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -124,11 +125,30 @@ define_class!(
     impl StatusItemTarget {
         #[unsafe(method(squawkStatusItemClicked:))]
         fn clicked(&self, _sender: *mut AnyObject) {
+            mark_click();
             // Fails only once the receiver is gone (shutting down).
             let _ = self.ivars().tx.unbounded_send(StatusItemEvent::Clicked);
         }
     }
 );
+
+/// When the item was last clicked, for the open-latency debug log.
+static CLICKED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn mark_click() {
+    if let Ok(mut at) = CLICKED_AT.lock() {
+        *at = Some(Instant::now());
+    }
+}
+
+/// How long ago the item was last clicked (zero if never).
+pub fn since_click() -> Duration {
+    CLICKED_AT
+        .lock()
+        .ok()
+        .and_then(|at| *at)
+        .map_or(Duration::ZERO, |at| at.elapsed())
+}
 
 impl StatusItemTarget {
     fn new(tx: UnboundedSender<StatusItemEvent>) -> Retained<Self> {

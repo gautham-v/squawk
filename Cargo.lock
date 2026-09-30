@@ -6126,6 +6126,7 @@ dependencies = [
  "objc2-event-kit",
  "objc2-foundation",
  "objc2-service-management",
+ "raw-window-handle",
  "serde_json",
  "squawk-core",
  "squawk-engine",
