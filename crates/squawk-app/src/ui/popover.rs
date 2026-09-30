@@ -18,9 +18,11 @@
 //! - footer: Record meeting ⌥M, Settings (config.toml), Launch at login,
 //!   Quit.
 //!
-//! The data comes from the files through [`PopoverData::load`], re-read when
-//! the popover opens and, while it is open, whenever the snapshot's
-//! `revision` moves; the preview example feeds fixture data instead.
+//! The data comes from the files through [`PopoverData::load`], read on the
+//! background executor at startup, whenever the snapshot's `revision` moves
+//! and each time the popover opens (the files can change behind the app's
+//! back). The view keeps the last read in memory, so opening or scrolling
+//! never waits on the disk; the preview example feeds fixture data instead.
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -28,9 +30,10 @@ use std::time::{Duration, Instant};
 use chrono::Local;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    actions, div, px, relative, App, Context, Div, EventEmitter, FocusHandle, Focusable,
-    FontWeight, InteractiveElement, IntoElement, KeyBinding, ParentElement, Point, Render, Rgba,
-    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window,
+    actions, div, px, relative, uniform_list, App, Context, Div, EventEmitter, FocusHandle,
+    Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding, ParentElement, Point,
+    Render, Rgba, ScrollHandle, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
+    UniformListScrollHandle, Window,
 };
 use squawk_core::dictionary::{Dictionary, Entry, DICTIONARY_HEADER};
 use squawk_core::store::{DictationEntry, MeetingSummary};
@@ -130,9 +133,8 @@ pub struct Popover {
     data: PopoverData,
     /// Read the files again (`None` in the preview: fixture data).
     live_files: bool,
-    /// The files changed since they were read; re-read on the next render
-    /// (which only happens while the popover is open).
-    stale: bool,
+    /// Bumped by each background read, so only the newest one lands.
+    load_seq: u64,
     /// The History row showing "Copied", and when it was clicked.
     copied: Option<(usize, Instant)>,
     /// Whether the fn key is set to something that fights squawk.
@@ -141,6 +143,9 @@ pub struct Popover {
     /// The list's scroll position: back to the top on open and on a tab
     /// switch, so the newest entries are what shows.
     list_scroll: ScrollHandle,
+    /// The same for the Dictionary list, which is virtualized: it can run
+    /// to thousands of entries, and only the visible rows are laid out.
+    dictionary_scroll: UniformListScrollHandle,
     theme: Theme,
     appearance: Option<gpui::Subscription>,
 }
@@ -154,11 +159,12 @@ impl Popover {
             snapshot,
             data: PopoverData::default(),
             live_files: true,
-            stale: true,
+            load_seq: 0,
             copied: None,
             fn_hint: false,
             login_error: None,
             list_scroll: ScrollHandle::new(),
+            dictionary_scroll: UniformListScrollHandle::new(),
             theme: Theme::default(),
             appearance: None,
         }
@@ -184,55 +190,79 @@ impl Popover {
         &self.snapshot
     }
 
-    /// Called every time the popover opens: re-read the files and check the
-    /// fn-key setting (in the background; `defaults` takes a few ms).
+    /// Called every time the popover opens. Shows what is already in
+    /// memory straight away; re-reading the files, the fn-key setting
+    /// (`defaults` takes a few ms) and the launch-at-login status (an XPC
+    /// round trip) all happen in the background and land when ready.
     pub fn reset(&mut self, cx: &mut Context<Self>) {
         self.copied = None;
         self.login_error = None;
         self.scroll_to_top();
-        self.reload(cx);
+        cx.notify();
         if !self.live_files {
             return;
         }
-        let dismissed = self.hint_dismissed_path().exists();
-        if dismissed {
-            self.fn_hint = false;
-            return;
-        }
+        self.reload(cx);
+        let dismissed = self.hint_dismissed_path();
         cx.spawn(async move |this, cx| {
-            let does_nothing = cx
+            let fn_hint = cx
                 .background_executor()
-                .spawn(async { permissions::fn_key_does_nothing() })
+                .spawn(async move { !dismissed.exists() && !permissions::fn_key_does_nothing() })
                 .await;
             let _ = this.update(cx, |this, cx| {
-                this.fn_hint = !does_nothing;
-                cx.notify();
+                if this.fn_hint != fn_hint {
+                    this.fn_hint = fn_hint;
+                    cx.notify();
+                }
             });
+        })
+        .detach();
+        cx.spawn(async move |this, cx| {
+            let before = launch_at_login::is_enabled();
+            let now = cx
+                .background_executor()
+                .spawn(async { launch_at_login::refresh() })
+                .await;
+            if now != before {
+                let _ = this.update(cx, |_, cx| cx.notify());
+            }
         })
         .detach();
     }
 
     /// A new snapshot from the controller.
     pub fn set_snapshot(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
-        if snapshot.revision != self.snapshot.revision || snapshot.paths != self.snapshot.paths {
-            self.stale = true;
-        }
+        let files_changed =
+            snapshot.revision != self.snapshot.revision || snapshot.paths != self.snapshot.paths;
         self.snapshot = snapshot;
-        cx.notify();
-    }
-
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        self.stale = true;
-        cx.notify();
-    }
-
-    /// Re-read the files if they changed. Called from `render`, which only
-    /// runs while the popover is open, so a closed popover reads nothing.
-    fn load_if_stale(&mut self) {
-        if self.stale && self.live_files {
-            self.data = PopoverData::load(&self.snapshot.paths);
+        if files_changed {
+            self.reload(cx);
         }
-        self.stale = false;
+        cx.notify();
+    }
+
+    /// Read the files on the background executor and swap the result in
+    /// when it lands (only the newest read counts).
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        if !self.live_files {
+            return;
+        }
+        self.load_seq += 1;
+        let seq = self.load_seq;
+        let paths = self.snapshot.paths.clone();
+        cx.spawn(async move |this, cx| {
+            let data = cx
+                .background_executor()
+                .spawn(async move { PopoverData::load(&paths) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.load_seq == seq && this.data != data {
+                    this.data = data;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn hint_dismissed_path(&self) -> std::path::PathBuf {
@@ -249,12 +279,18 @@ impl Popover {
 
     fn scroll_to_top(&self) {
         self.list_scroll.set_offset(Point::default());
+        let dictionary = self.dictionary_scroll.0.borrow();
+        dictionary.base_handle.set_offset(Point::default());
     }
 
     /// Scroll the list to its end (the preview uses it to show the bottom
     /// of a long list).
     pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
         self.list_scroll.scroll_to_bottom();
+        if let Some(last) = self.data.dictionary.len().checked_sub(1) {
+            self.dictionary_scroll
+                .scroll_to_item(last, ScrollStrategy::Bottom);
+        }
         cx.notify();
     }
 
@@ -318,10 +354,21 @@ impl Popover {
         cx.notify();
     }
 
+    /// `SMAppService` register/unregister is a slow XPC round trip: do it
+    /// in the background and show the result when it lands.
     fn toggle_launch_at_login(&mut self, cx: &mut Context<Self>) {
         let wanted = !launch_at_login::is_enabled();
-        self.login_error = launch_at_login::set_enabled(wanted).err().map(Into::into);
-        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { launch_at_login::set_enabled(wanted) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.login_error = result.err().map(Into::into);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn on_dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
@@ -472,7 +519,23 @@ impl Popover {
         let (pinned, rows): (Option<gpui::AnyElement>, Vec<gpui::AnyElement>) = match self.tab {
             Tab::History => (None, self.history_rows(cx)),
             Tab::Meetings => (None, self.meeting_rows(cx)),
-            Tab::Dictionary => (Some(self.dictionary_edit_row(cx)), self.dictionary_rows()),
+            Tab::Dictionary => (Some(self.dictionary_edit_row(cx)), Vec::new()),
+        };
+        let list = if self.tab == Tab::Dictionary && !self.data.dictionary.is_empty() {
+            self.dictionary_list(cx)
+        } else if self.tab == Tab::Dictionary {
+            self.empty(EMPTY_DICTIONARY)
+        } else {
+            div()
+                .id("list")
+                .track_scroll(&self.list_scroll)
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .children(rows)
+                .into_any_element()
         };
         div()
             .flex()
@@ -480,17 +543,7 @@ impl Popover {
             .flex_1()
             .min_h(px(0.))
             .children(pinned)
-            .child(
-                div()
-                    .id("list")
-                    .track_scroll(&self.list_scroll)
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .overflow_y_scroll()
-                    .children(rows),
-            )
+            .child(list)
     }
 
     fn empty(&self, line: &'static str) -> gpui::AnyElement {
@@ -628,19 +681,37 @@ impl Popover {
             .into_any_element()
     }
 
+    /// The entries, one uniform-height row each, laid out only while
+    /// visible: scrolling a long dictionary costs the same as a short one.
+    fn dictionary_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        uniform_list(
+            "dictionary",
+            self.data.dictionary.len(),
+            cx.processor(|this, range: std::ops::Range<usize>, _window, _cx| {
+                this.dictionary_rows(range)
+            }),
+        )
+        .track_scroll(self.dictionary_scroll.clone())
+        .flex_1()
+        .min_h(px(0.))
+        .into_any_element()
+    }
+
     /// One line per entry: a term as it is written, a replacement as the
     /// spoken side (muted), an arrow, and the written side. Either side
     /// ends in an ellipsis when the line runs out of room.
-    fn dictionary_rows(&self) -> Vec<gpui::AnyElement> {
-        if self.data.dictionary.is_empty() {
-            return vec![self.empty(EMPTY_DICTIONARY)];
-        }
+    fn dictionary_rows(&self, range: std::ops::Range<usize>) -> Vec<gpui::AnyElement> {
         let theme = self.theme;
-        self.data
-            .dictionary
+        let end = range.end.min(self.data.dictionary.len());
+        let start = range.start.min(end);
+        self.data.dictionary[start..end]
             .iter()
             .map(|entry| {
+                // `w_full`: the list lays each row out on its own, and
+                // without it a long row sizes to its text and overflows
+                // instead of ending in an ellipsis.
                 let row = div()
+                    .w_full()
                     .flex()
                     .flex_row()
                     .flex_shrink_0()
@@ -835,7 +906,6 @@ impl Render for Popover {
         }
         self.theme = Theme::for_appearance(window.appearance());
         let theme = self.theme;
-        self.load_if_stale();
 
         let header = self.header(cx);
         let hint = self.hint(cx);

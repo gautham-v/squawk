@@ -594,6 +594,25 @@ entries; "Edit" opens dictionary.txt. Footer: "Record meeting ⌥M" / "Stop meet
 "Settings" (opens config.toml). Esc closes. `examples/popover_preview.rs` renders it with fixture
 data (generic names, `you@example.com` if an email is ever needed).
 
+Opening has to feel like a native menu (visible within a frame of the click), and gpui re-renders
+the whole view on every scroll event and hover change, so nothing slow runs on the open path or
+in `render`:
+- The window is made once, hidden, at startup (`Panel` in main.rs) and only moved, shown
+  (`makeKeyAndOrderFront`) and hidden (`orderOut`) after that. A new gpui window costs a Metal
+  renderer (~270 ms the first time, ~10 ms after); a reused one draws its next frame synchronously
+  as it becomes key.
+- `PopoverData` is read on the background executor at startup, on every `revision` change and on
+  each open (files can change behind the app's back); the view shows the last read at once.
+- `launch_at_login::is_enabled()` is a cached flag. `SMAppService.status` is a synchronous XPC
+  call (80–300 ms measured) and used to run in the footer on every render: ~3 fps scrolling and
+  up to a second before the popover settled. It is refreshed in the background at startup and
+  on each open; `set_enabled` runs in the background too.
+- The Dictionary list is a `uniform_list`: only visible rows are laid out (2,000 entries: 20 ms
+  per frame before, ~2 ms after).
+
+`SQUAWK_LOG=debug` logs "popover shown N ms after the click"; gpui's `ZED_MEASUREMENTS=1` prints
+every frame's duration to stderr.
+
 ### Permissions (permissions.rs)
 
 Accessibility (`AXIsProcessTrusted`; the tap failing to create is the real test), Microphone
