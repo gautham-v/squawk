@@ -442,10 +442,10 @@ transcribe}`, `Recognized{text, segments}`), `recognizer` (`Priority::{Dictation
 
 ### Latency (the core goal)
 
-- Segmenter cuts at pauses (≥ 350 ms of silence once ≥ 3 s is buffered, shrinking to 150 ms as
-  more is buffered; forced at 10 s at the quietest frame of the last 2 s; see "Changes during
-  build" for the details and the early tail transcription). So when fn comes up only the tail since the last pause (usually
-  < 3 s) is left to transcribe. `finish`: stop capture (flush resampler), submit the tail, wait for
+- Segmenter cuts at pauses (≥ 500 ms of silence once ≥ 8 s is buffered, shrinking to 300 ms as
+  more is buffered; forced at 20 s at the quietest frame of the last 2 s; see "Changes during
+  build" for the details and the early tail transcription). So when fn comes up only the tail
+  since the last pause is left to transcribe, and speculation has usually done it already. `finish`: stop capture (flush resampler), submit the tail, wait for
   every outstanding segment, join texts with single spaces.
 - Target: `finish` < 250 ms for a 20 s utterance on an M4 (Parakeet int8 is ~30× real time on
   CPU; a 3 s tail is ~100 ms). Log `tail_latency`. Consider pre-warming the model with one short
@@ -455,6 +455,9 @@ transcribe}`, `Recognized{text, segments}`), `recognizer` (`Priority::{Dictation
   segments may use `transcribe_raw` with a small pad of your choosing. Do not keep the mic open
   while idle (the orange mic indicator must mean squawk is listening).
 - Too little audio (< 0.25 s) or no speech frames at all → `Transcript.text = ""`, no inference.
+- Every clip gets ±0.001 of deterministic noise before Parakeet (`model::dither`). Some Bluetooth
+  headsets (a SoundCore 2) send exact digital silence between words, and Parakeet drops the
+  speech after a run of zeros or hallucinates a word after one.
 
 ### Model
 
@@ -866,9 +869,13 @@ test fixtures use generic names and `you@example.com`. `.gitignore` covers `targ
   ("Dock", "Privacy") are never recased, only joined. `detect` reads the process table with
   `PROC_PIDT_SHORTBSDINFO` (the only flavour that works for root-owned `login` between the
   terminal and the shell) and uses tty atime (last typed into) to pick among tabs.
-- Segmenter, for latency: dictation `max_segment` is 10 s (not 20), and the pause
-  needed to cut shrinks by 80 ms per second buffered past `min_segment`, from `pause` (0.35 s) to
-  a new `SegmenterConfig::min_pause` (0.15 s; meetings 0.5 → 0.25 s). The cut lands on the quiet
+- Segmenter: the pause needed to cut shrinks by 80 ms per second buffered past `min_segment`,
+  from `pause` to a new `SegmenterConfig::min_pause` (dictation 0.5 → 0.3 s; meetings
+  0.5 → 0.25 s). Dictation segments are 8–20 s. They were 3–10 s cut at 0.35 → 0.15 s gaps, for
+  latency, but Parakeet hears each segment alone: cuts landed at gaps between words and inside
+  phrases, and a 90 s read-aloud test came out with "no wait" → "no eight" and "three thirty
+  PM" → "three thirty two. PM". Longer pieces cut only at real pauses fixed those; short
+  dictations are one piece either way, and speculation still does the tail early. The cut lands on the quiet
   middle of the pause (frames within 2× of its quietest), so a soft trailing consonant stays with
   its word. The noise floor is min(quietest frame of the last 4 s, a slow tracker), so talking
   does not lift it. `Segmenter::speculate(after_silence)` / `speculation()` / `take_tail()` and

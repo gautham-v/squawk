@@ -30,6 +30,13 @@
 
 /// Tunables. The defaults are what dictation uses; meetings use
 /// [`SegmenterConfig::for_meeting`].
+///
+/// Dictation segments are long on purpose: Parakeet hears each one alone,
+/// and with 3–10 s pieces cut at gaps between words it lost context and
+/// cuts landed inside phrases ("no wait" → "no eight", "three thirty PM" →
+/// "three thirty two. PM"). 8–20 s pieces cut only at a real pause cost
+/// nothing on short dictations (one piece either way) and little on long
+/// ones: the tail is usually transcribed early by speculation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SegmenterConfig {
     pub sample_rate: u32,
@@ -50,10 +57,10 @@ impl Default for SegmenterConfig {
     fn default() -> Self {
         SegmenterConfig {
             sample_rate: crate::SAMPLE_RATE,
-            min_segment: 3.0,
-            max_segment: 10.0,
-            pause: 0.35,
-            min_pause: 0.15,
+            min_segment: 8.0,
+            max_segment: 20.0,
+            pause: 0.5,
+            min_pause: 0.3,
             min_speech_rms: 0.004,
         }
     }
@@ -382,9 +389,43 @@ mod tests {
         samples as f32 / SR as f32
     }
 
+    /// Short segments, so the cut mechanics are tested with seconds of
+    /// audio (the numbers dictation used before its defaults grew).
+    fn short() -> SegmenterConfig {
+        SegmenterConfig {
+            min_segment: 3.0,
+            max_segment: 10.0,
+            pause: 0.35,
+            min_pause: 0.15,
+            ..SegmenterConfig::default()
+        }
+    }
+
+    #[test]
+    fn dictation_cuts_only_at_a_real_pause_after_8_s() {
+        let c = SegmenterConfig::default();
+        assert_eq!((c.min_segment, c.max_segment), (8.0, 20.0));
+        assert_eq!(c.pause_needed(8.0), 0.5);
+        assert_eq!(c.pause_needed(19.0), 0.3);
+        // Word gaps of 0.2 s never cut, even past 8 s; a 1 s pause at 6 s
+        // is too early; the pause that starts at 9.8 s cuts, inside it.
+        let mut seg = Segmenter::new(c);
+        let mut parts = vec![tone(6.0), hush(1.0)];
+        for _ in 0..3 {
+            parts.push(tone(0.8));
+            parts.push(hush(0.2));
+        }
+        parts.push(hush(0.6));
+        parts.push(tone(1.0));
+        let cuts = feed(&mut seg, &parts, 320);
+        assert_eq!(cuts.len(), 1);
+        let end = secs(cuts[0].samples.len());
+        assert!((9.8..10.6).contains(&end), "cut at {end}");
+    }
+
     #[test]
     fn cuts_in_the_middle_of_the_first_pause_after_min_segment() {
-        let mut seg = Segmenter::new(SegmenterConfig::default());
+        let mut seg = Segmenter::new(short());
         // 1 s pause too early to cut, then speech past 3 s, then a pause.
         let cuts = feed(
             &mut seg,
@@ -416,7 +457,7 @@ mod tests {
     fn short_pauses_do_not_cut_without_grading() {
         let config = SegmenterConfig {
             min_pause: 0.35,
-            ..SegmenterConfig::default()
+            ..short()
         };
         let mut seg = Segmenter::new(config);
         let mut parts = Vec::new();
@@ -431,7 +472,7 @@ mod tests {
 
     #[test]
     fn the_pause_needed_shrinks_as_the_buffer_grows() {
-        let c = SegmenterConfig::default();
+        let c = short();
         assert_eq!(c.pause_needed(1.0), 0.35);
         assert_eq!(c.pause_needed(3.0), 0.35);
         assert!((c.pause_needed(5.0) - 0.19).abs() < 1e-6);
@@ -451,7 +492,7 @@ mod tests {
 
     #[test]
     fn speculation_covers_the_tail_until_speech_resumes() {
-        let mut seg = Segmenter::new(SegmenterConfig::default());
+        let mut seg = Segmenter::new(short());
         seg.push(&tone(1.0));
         assert!(seg.speculate(0.2).is_none(), "still talking");
         seg.push(&hush(0.1));
@@ -474,7 +515,7 @@ mod tests {
         assert!(tail.samples.len() > spec.len);
 
         // Speech after the snapshot invalidates it.
-        let mut seg = Segmenter::new(SegmenterConfig::default());
+        let mut seg = Segmenter::new(short());
         seg.push(&[tone(1.0), hush(0.25)].concat());
         let (spec, _) = seg.speculate(0.2).unwrap();
         seg.push(&tone(0.3));
@@ -487,10 +528,10 @@ mod tests {
 
     #[test]
     fn speculation_needs_speech_and_is_cleared_by_a_cut() {
-        let mut seg = Segmenter::new(SegmenterConfig::default());
+        let mut seg = Segmenter::new(short());
         seg.push(&hush(1.0));
         assert!(seg.speculate(0.2).is_none(), "nothing said");
-        let mut seg = Segmenter::new(SegmenterConfig::default());
+        let mut seg = Segmenter::new(short());
         seg.push(&[tone(3.2), hush(0.2)].concat());
         assert!(seg.speculate(0.2).is_some());
         let cuts = seg.push(&hush(0.3));
@@ -501,7 +542,7 @@ mod tests {
 
     #[test]
     fn a_word_starting_right_at_release_invalidates_it() {
-        let mut seg = Segmenter::new(SegmenterConfig::default());
+        let mut seg = Segmenter::new(short());
         seg.push(&[tone(1.0), hush(0.25)].concat());
         seg.speculate(0.2).unwrap();
         seg.push(&tone(0.01));
@@ -514,7 +555,7 @@ mod tests {
         let config = SegmenterConfig {
             max_segment: 5.0,
             min_pause: 0.35,
-            ..SegmenterConfig::default()
+            ..short()
         };
         let mut seg = Segmenter::new(config);
         // Continuous speech with one soft (not silent) 100 ms dip at 4.0 s.
@@ -530,7 +571,7 @@ mod tests {
     fn forced_cut_without_any_dip_still_cuts_by_max() {
         let config = SegmenterConfig {
             max_segment: 4.0,
-            ..SegmenterConfig::default()
+            ..short()
         };
         let mut seg = Segmenter::new(config);
         let cuts = feed(&mut seg, &[tone(9.0)], 1000);
@@ -541,7 +582,7 @@ mod tests {
 
     #[test]
     fn silent_segments_are_dropped_but_keep_the_timeline() {
-        let mut seg = Segmenter::new(SegmenterConfig::default());
+        let mut seg = Segmenter::new(short());
         let cuts = feed(&mut seg, &[hush(4.0), tone(3.5), hush(0.5)], 320);
         // The first 3+ s of hush is committed at a "pause" and dropped.
         assert_eq!(cuts.len(), 1);
@@ -553,7 +594,7 @@ mod tests {
 
     #[test]
     fn all_silence_tail_is_not_speech() {
-        let mut seg = Segmenter::new(SegmenterConfig::default());
+        let mut seg = Segmenter::new(short());
         assert!(seg.push(&hush(1.0)).is_empty());
         let tail = seg.finish().unwrap();
         assert!(!tail.has_speech);
@@ -569,7 +610,7 @@ mod tests {
             min_segment: 1.0,
             pause: 0.2,
             min_pause: 0.2,
-            ..SegmenterConfig::default()
+            ..short()
         };
         let mut seg = Segmenter::new(config);
         let mut s_sound = tone(0.12);
@@ -594,7 +635,7 @@ mod tests {
         let mut seg = Segmenter::new(SegmenterConfig {
             min_segment: 60.0,
             max_segment: 120.0,
-            ..SegmenterConfig::default()
+            ..short()
         });
         for _ in 0..10 {
             seg.push(&tone(0.7));
@@ -609,7 +650,7 @@ mod tests {
 
     #[test]
     fn a_click_is_not_speech() {
-        let mut seg = Segmenter::new(SegmenterConfig::default());
+        let mut seg = Segmenter::new(short());
         let mut x = hush(1.0);
         x[8000..8100].iter_mut().for_each(|s| *s = 0.5);
         seg.push(&x);
@@ -618,9 +659,9 @@ mod tests {
 
     #[test]
     fn empty_and_partial_frames() {
-        let seg = Segmenter::new(SegmenterConfig::default());
+        let seg = Segmenter::new(short());
         assert!(seg.finish().is_none());
-        let mut seg = Segmenter::new(SegmenterConfig::default());
+        let mut seg = Segmenter::new(short());
         seg.push(&tone(0.105));
         let tail = seg.finish().unwrap();
         assert_eq!(tail.samples.len(), 1680);
@@ -631,7 +672,7 @@ mod tests {
     fn loud_room_raises_the_threshold_over_time() {
         // Steady noise well above min_speech_rms: after the floor adapts,
         // the noise stops counting as speech and pauses in it cut again.
-        let mut seg = Segmenter::new(SegmenterConfig::default());
+        let mut seg = Segmenter::new(short());
         let noise: Vec<f32> = hush(30.0).iter().map(|s| s * 10.0).collect();
         let cuts = seg.push(&noise);
         assert!(
@@ -645,7 +686,7 @@ mod tests {
     fn cuts_tile_the_stream_exactly() {
         let config = SegmenterConfig {
             max_segment: 3.5,
-            ..SegmenterConfig::default()
+            ..short()
         };
         let mut seg = Segmenter::new(config);
         let parts = [tone(2.0), hush(0.5), tone(4.0), hush(0.4), tone(5.0)];

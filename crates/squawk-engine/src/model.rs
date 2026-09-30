@@ -393,12 +393,13 @@ impl LoadedModel {
     }
 
     /// Transcribe 16 kHz mono samples with segment timestamps (seconds from
-    /// the start of `samples`).
+    /// the start of `samples`). The clip is [`dither`]ed first.
     pub fn transcribe(&mut self, samples: &[f32]) -> Result<Recognized, EngineError> {
         let pad = TRAIL_PAD_MS * SAMPLE_RATE as usize / 1000;
         let mut padded = Vec::with_capacity(samples.len() + pad);
         padded.extend_from_slice(samples);
         padded.resize(samples.len() + pad, 0.0);
+        dither(&mut padded);
         let params = ParakeetParams {
             timestamp_granularity: Some(TimestampGranularity::Segment),
             ..ParakeetParams::default()
@@ -420,6 +421,28 @@ impl LoadedModel {
             segments: respace_segments(&text, segments),
             text,
         })
+    }
+}
+
+/// How loud [`dither`]'s noise is: ±0.001, about −60 dBFS, far under speech.
+const DITHER: f32 = 0.001;
+
+/// Add uniform noise of ±[`DITHER`] to every sample. Some Bluetooth
+/// headsets (a SoundCore 2, for one) send stretches of exact digital
+/// silence between words, and Parakeet drops the speech that follows a
+/// run of zeros or hallucinates a word ("Okay.") after one; with a faint
+/// noise floor it hears the clip as a real mic would sound. The trailing
+/// pad gets it too. Deterministic (a fixed-seed xorshift), so the same clip
+/// always transcribes the same.
+fn dither(samples: &mut [f32]) {
+    let mut state: u32 = 0x9E37_79B9;
+    for s in samples {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        // Top 24 bits → [0, 1), then → [-DITHER, DITHER).
+        let unit = (state >> 8) as f32 / (1u32 << 24) as f32;
+        *s += (unit * 2.0 - 1.0) * DITHER;
     }
 }
 
@@ -741,5 +764,22 @@ mod tests {
         }
         drop(held);
         assert_eq!(waiter.join().unwrap().unwrap(), dir);
+    }
+
+    #[test]
+    fn dither_leaves_no_digital_silence_and_stays_faint() {
+        let mut clip = vec![0.0f32; 16_000];
+        clip.extend(vec![0.5f32; 100]);
+        dither(&mut clip);
+        assert!(clip[..16_000].iter().all(|&s| s != 0.0));
+        assert!(clip[..16_000].iter().all(|s| s.abs() <= DITHER));
+        assert!(clip[16_000..].iter().all(|s| (s - 0.5).abs() <= DITHER));
+        // Centred: no DC offset to speak of.
+        let mean = clip[..16_000].iter().sum::<f32>() / 16_000.0;
+        assert!(mean.abs() < DITHER / 20.0, "mean {mean}");
+        // Deterministic.
+        let mut again = vec![0.0f32; 16_000];
+        dither(&mut again);
+        assert_eq!(&again[..], &clip[..16_000]);
     }
 }

@@ -617,7 +617,7 @@ mod tests {
 
     #[test]
     fn segments_are_transcribed_while_talking_and_joined() {
-        let audio = [tone(3.5), silence(0.5), tone(3.2), silence(0.5), tone(1.0)].concat();
+        let audio = [tone(8.5), silence(0.7), tone(8.2), silence(0.7), tone(1.0)].concat();
         let n = audio.len();
         let (s, _) = session(audio, Duration::from_secs(600));
         wait_for_replay(n as f32 / 16_000.0);
