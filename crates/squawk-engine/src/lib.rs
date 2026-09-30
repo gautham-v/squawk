@@ -1,7 +1,6 @@
 //! squawk-engine: audio in, text out.
 //!
-//! OWNED BY THE ENGINE AGENT. The public API below is the contract in
-//! SPEC.md ("squawk-engine"); bodies are stubs until implemented.
+//! The public API is the contract in SPEC.md ("squawk-engine").
 //!
 //! Threads (none of them the caller's):
 //! - one **recognizer** thread owns the single Parakeet model and serves a
@@ -33,3 +32,21 @@ pub use meeting::{MeetingHandle, MeetingOptions, MeetingResult};
 
 /// What the model eats: 16 kHz mono f32 in [-1, 1].
 pub const SAMPLE_RATE: u32 = 16_000;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn send<T: Send>() {}
+    fn send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn public_types_cross_threads() {
+        send_sync::<Engine>();
+        send::<DictationSession>();
+        send::<MeetingHandle>();
+        send::<audio::MicCapture>();
+        send::<system_audio::SystemAudioCapture>();
+        send_sync::<recognizer::Recognizer>();
+    }
+}
