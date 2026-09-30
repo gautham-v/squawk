@@ -218,7 +218,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# squawk settings. Every key is optiona
 # A fn press shorter than this is a tap (two taps = hands-free, one = nothing).
 # tap_max_ms = 300
 # How long after the first tap the second one may come.
-# double_tap_ms = 350
+# double_tap_ms = 400
 
 [dictation]
 # remove_fillers = true

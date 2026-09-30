@@ -24,11 +24,14 @@
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_TAP_MAX_MS: u64 = 300;
-pub const DEFAULT_DOUBLE_TAP_MS: u64 = 350;
+pub const DEFAULT_DOUBLE_TAP_MS: u64 = 400;
 
 /// macOS virtual keycodes the machine cares about (kVK_* in HIToolbox).
 pub mod keycode {
     pub const FN: u16 = 63;
+    /// Apple keyboards with a 🌐 key also send a keyDown with this code when
+    /// it is pressed. It is fn itself, never "another key".
+    pub const GLOBE: u16 = 179;
     pub const ESCAPE: u16 = 53;
     pub const ANSI_C: u16 = 8;
     pub const ANSI_V: u16 = 9;

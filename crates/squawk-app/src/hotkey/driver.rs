@@ -6,6 +6,9 @@
 //! - fn state comes only from flagsChanged on keycode 63. Arrow and F-key
 //!   keyDowns carry the fn bit without fn being held, so the bit on a keyDown
 //!   says nothing.
+//! - The 🌐 key also sends a keyDown (keycode 179, sometimes 63) alongside
+//!   its flagsChanged. Treated as "another key", it would cancel the gesture
+//!   between the two taps of a double tap, so it is ignored.
 //! - flagsChanged is never swallowed: dropping a modifier change leaves the
 //!   system believing the key is still down.
 //! - When macOS disables the tap (a slow callback, or secure input) events
@@ -90,8 +93,19 @@ pub fn translate(event: &RawEvent) -> Option<Input> {
     }
 }
 
+/// A keyDown from the fn/🌐 key itself.
+pub fn is_fn_key_down(event: &RawEvent) -> bool {
+    event.kind == RawKind::KeyDown && matches!(event.keycode, keycode::FN | keycode::GLOBE)
+}
+
 /// Feed one raw event to the machine.
 pub fn drive(machine: &mut Machine, event: RawEvent, now: Instant) -> Outcome {
+    if is_fn_key_down(&event) {
+        return Outcome {
+            actions: Vec::new(),
+            swallow: false,
+        };
+    }
     match translate(&event) {
         Some(input) => {
             let mut outcome = machine.handle(input, now);
@@ -166,6 +180,20 @@ mod tests {
     }
 
     #[test]
+    fn globe_key_down_between_taps_keeps_the_double_tap() {
+        let mut r = Replay::new();
+        assert_eq!(r.acts(0, fn_down()), [Action::StartRecording]);
+        assert!(r.acts(5, key(keycode::GLOBE)).is_empty());
+        assert!(r.acts(90, fn_up()).is_empty());
+        assert!(r.acts(200, key(keycode::GLOBE)).is_empty());
+        assert_eq!(r.acts(205, fn_down()), [Action::EnterHandsFree]);
+        assert!(r.acts(290, fn_up()).is_empty());
+        assert_eq!(r.m.state(), State::HandsFree);
+        assert!(r.acts(3000, key(keycode::FN)).is_empty());
+        assert_eq!(r.m.state(), State::HandsFree);
+    }
+
+    #[test]
     fn fn_flags_changed_becomes_fn_down_and_up() {
         assert_eq!(
             translate(&fn_down()),
@@ -230,9 +258,9 @@ mod tests {
         r.acts(0, fn_down());
         assert!(r.acts(90, fn_up()).is_empty());
         let deadline = r.m.deadline().expect("a double-tap window is pending");
-        assert_eq!(deadline, r.t0 + Duration::from_millis(90 + 350));
-        assert!(r.tick(439).is_empty());
-        assert_eq!(r.tick(440), [Action::Cancel(CancelReason::Tap)]);
+        assert_eq!(deadline, r.t0 + Duration::from_millis(90 + 400));
+        assert!(r.tick(489).is_empty());
+        assert_eq!(r.tick(490), [Action::Cancel(CancelReason::Tap)]);
         assert_eq!(r.m.state(), State::Idle);
     }
 

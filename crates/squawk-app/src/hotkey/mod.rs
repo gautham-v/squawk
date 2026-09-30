@@ -31,9 +31,9 @@ use objc2_core_graphics::{
     CGEvent, CGEventField, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType,
 };
-use squawk_core::hotkey::{Action, Input, Machine, Timings};
+use squawk_core::hotkey::{flag, keycode, Action, CancelReason, Input, Machine, Outcome, Timings};
 
-use driver::{drive, RawEvent};
+use driver::{drive, RawEvent, RawKind};
 
 /// The machine, shared by the tap thread (which must decide swallowing inside
 /// the callback), the ticker, and the controller (which forces it idle when a
@@ -131,6 +131,8 @@ struct TapState {
     ticker: Arc<Ticker>,
     /// The tap's own port, to re-enable it from inside the callback.
     port: AtomicPtr<CFMachPort>,
+    /// When fn last came up, to log the gap when a double tap misses.
+    last_fn_up: Mutex<Option<Instant>>,
 }
 
 fn run_tap(
@@ -144,6 +146,7 @@ fn run_tap(
         on_action,
         ticker,
         port: AtomicPtr::new(ptr::null_mut()),
+        last_fn_up: Mutex::new(None),
     }));
     let mask: u64 = (1 << CGEventType::KeyDown.0) | (1 << CGEventType::FlagsChanged.0);
     // SAFETY: `callback` matches CGEventTapCallBack, and `state` stays alive
@@ -228,12 +231,14 @@ unsafe extern "C-unwind" fn callback(
             ),
             _ => return false,
         };
+        let now = Instant::now();
         let outcome = {
             let mut machine = state.machine.lock();
-            let outcome = drive(&mut machine, raw, Instant::now());
+            let outcome = drive(&mut machine, raw, now);
             state.ticker.arm(machine.deadline());
             outcome
         };
+        log_gesture(state, &raw, &outcome, now);
         for action in outcome.actions {
             (state.on_action)(action);
         }
@@ -242,6 +247,30 @@ unsafe extern "C-unwind" fn callback(
     match result {
         Ok(true) => ptr::null_mut(),
         _ => pass,
+    }
+}
+
+/// One line per missed or caught double tap, so a gesture that feels wrong
+/// can be diagnosed from squawk.log.
+fn log_gesture(state: &TapState, raw: &RawEvent, outcome: &Outcome, now: Instant) {
+    let fn_edge = raw.kind == RawKind::FlagsChanged && raw.keycode == keycode::FN;
+    let mut last_up = state.last_fn_up.lock().unwrap_or_else(|e| e.into_inner());
+    if fn_edge && raw.flags & flag::FUNCTION == 0 {
+        *last_up = Some(now);
+        return;
+    }
+    let gap = last_up.map(|t| now.duration_since(t).as_millis());
+    if outcome.actions.contains(&Action::EnterHandsFree) {
+        log::info!(
+            "hands-free: second fn press {} ms after release",
+            gap.unwrap_or(0)
+        );
+    } else if fn_edge {
+        if let Some(ms) = gap.filter(|ms| *ms < 1500) {
+            log::info!("fn pressed {ms} ms after the last release: too late for a double tap");
+        }
+    } else if outcome.actions.contains(&Action::Cancel(CancelReason::Tap)) {
+        log::info!("fn tap discarded by key {} ({:?})", raw.keycode, raw.kind);
     }
 }
 

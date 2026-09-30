@@ -134,7 +134,7 @@ defaults plus a human note (`Config::load -> (Config, Option<String>)`) that the
 | `data_dir` | `~/squawk` | root for dictations, meetings, dictionary |
 | `keep_audio` | `false` | keep WAVs under support/audio |
 | `[hotkey] tap_max_ms` | `300` (100–1000) | fn press shorter than this is a tap |
-| `[hotkey] double_tap_ms` | `350` (150–1000) | window after a tap's release for the second tap |
+| `[hotkey] double_tap_ms` | `400` (150–1000) | window after a tap's release for the second tap |
 | `[dictation] remove_fillers` | `true` | filler removal in cleanup |
 | `[dictation] claude_code_mode` | `true` | @mentions + repo vocab in terminals running claude/codex |
 | `[dictation] trailing_space` | `true` | paste one space after the text (never a newline) |
