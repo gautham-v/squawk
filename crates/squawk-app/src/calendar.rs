@@ -1,6 +1,9 @@
-//! The meeting title: the calendar event happening now (EventKit, as in
-//! daybar's `calendar/eventkit.rs`).
+//! The calendar, through EventKit (as in daybar's `calendar/eventkit.rs`):
+//! the meeting title (the event happening now) and the events around now for
+//! the notetaker's heads-up ([`upcoming_events`]; which of them qualify is
+//! `squawk_core::notetaker::heads_up`).
 //!
+//! Title:
 //! Among non-all-day events whose span contains now, prefer the one that
 //! started most recently; ties → the shortest. Needs full calendar access
 //! (and NSCalendarsFullAccessUsageDescription in Info.plist). The first time,
@@ -13,8 +16,11 @@ use chrono::{DateTime, Duration, Local, TimeZone};
 use objc2::rc::autoreleasepool;
 use objc2::runtime::{Bool, NSObjectProtocol};
 use objc2::sel;
-use objc2_event_kit::{EKAuthorizationStatus, EKEntityType, EKEventStore};
+use objc2_event_kit::{
+    EKAuthorizationStatus, EKEntityType, EKEvent, EKEventStatus, EKEventStore, EKParticipantStatus,
+};
 use objc2_foundation::{NSDate, NSError};
+use squawk_core::notetaker::heads_up::{self, UpcomingEvent};
 
 /// One event, reduced to what the pick needs.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,13 +86,95 @@ pub fn pick_current(events: &[Candidate], now: DateTime<Local>) -> Option<String
         .map(|e| e.title.trim().to_string())
 }
 
+/// Whether squawk may read the calendar: `Some(true)` with full access,
+/// `Some(false)` when refused, `None` while macOS has not asked yet.
+pub fn access() -> Option<bool> {
+    // SAFETY: a class method with no preconditions.
+    let status = unsafe { EKEventStore::authorizationStatusForEntityType(EKEntityType::Event) };
+    match status {
+        EKAuthorizationStatus::FullAccess => Some(true),
+        EKAuthorizationStatus::NotDetermined => None,
+        _ => Some(false),
+    }
+}
+
+/// Timed and all-day events from 10 minutes ago to an hour ahead, for the
+/// heads-up. `None` without calendar access.
+pub fn upcoming_events() -> Option<Vec<UpcomingEvent>> {
+    if access() != Some(true) {
+        return None;
+    }
+    let now = Local::now();
+    Some(autoreleasepool(|_| {
+        // SAFETY: a fresh store used on this thread only.
+        let store = unsafe { EKEventStore::new() };
+        let start = ns_date(now - Duration::minutes(10));
+        let end = ns_date(now + Duration::hours(1));
+        // SAFETY: valid dates; `None` = all calendars.
+        let events = unsafe {
+            let predicate =
+                store.predicateForEventsWithStartDate_endDate_calendars(&start, &end, None);
+            store.eventsMatchingPredicate(&predicate)
+        };
+        events.iter().filter_map(|ev| upcoming(&ev)).collect()
+    }))
+}
+
+fn upcoming(ev: &EKEvent) -> Option<UpcomingEvent> {
+    // SAFETY: reads of a live event's properties.
+    unsafe {
+        let start = from_ns_date(&ev.startDate())?;
+        let id = ev
+            .eventIdentifier()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let mut other_attendees = false;
+        let mut declined = false;
+        for person in ev.attendees().iter().flat_map(|a| a.iter()) {
+            if person.isCurrentUser() {
+                declined |= person.participantStatus() == EKParticipantStatus::Declined;
+            } else {
+                other_attendees = true;
+            }
+        }
+        let url = ev
+            .URL()
+            .and_then(|u| u.absoluteString())
+            .map(|s| s.to_string());
+        let location = ev.location().map(|s| s.to_string());
+        let notes = ev.notes().map(|s| s.to_string());
+        let texts = [url, location, notes];
+        Some(UpcomingEvent {
+            key: format!("{id}@{}", start.timestamp()),
+            title: ev.title().to_string(),
+            start,
+            end: from_ns_date(&ev.endDate())?,
+            all_day: ev.isAllDay(),
+            other_attendees,
+            video_link: heads_up::has_video_link(texts.iter().flatten().map(String::as_str)),
+            declined,
+            cancelled: ev.status() == EKEventStatus::Canceled,
+        })
+    }
+}
+
 fn request_access_in_background() {
-    std::thread::spawn(|| {
+    request_access(|_| {});
+}
+
+/// Ask for full calendar access (the system prompt) on a helper thread;
+/// `done(granted)` runs when it is answered.
+pub fn request_access(done: impl FnOnce(bool) + Send + 'static) {
+    std::thread::spawn(move || {
         autoreleasepool(|_| {
-            // SAFETY: a fresh store; the completion only logs.
+            // SAFETY: a fresh store; the completion logs and reports.
             let store = unsafe { EKEventStore::new() };
-            let handler = RcBlock::new(|granted: Bool, _err: *mut NSError| {
+            let done = std::sync::Mutex::new(Some(done));
+            let handler = RcBlock::new(move |granted: Bool, _err: *mut NSError| {
                 log::info!("calendar access granted: {}", granted.as_bool());
+                if let Some(done) = done.lock().ok().and_then(|mut d| d.take()) {
+                    done(granted.as_bool());
+                }
             });
             let modern = store.respondsToSelector(sel!(requestFullAccessToEventsWithCompletion:));
             unsafe {

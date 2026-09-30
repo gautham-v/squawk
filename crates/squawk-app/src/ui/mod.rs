@@ -4,5 +4,6 @@
 //! the recording/meeting state line). No literals in the views.
 
 pub mod format;
+pub mod panel;
 pub mod popover;
 pub mod theme;

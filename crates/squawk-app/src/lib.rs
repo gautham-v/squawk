@@ -20,6 +20,7 @@ pub mod ipc_server;
 pub mod launch_at_login;
 pub mod logger;
 pub mod menu_bar_icon;
+pub mod mic_watch;
 pub mod paste;
 pub mod permissions;
 pub mod status_item;

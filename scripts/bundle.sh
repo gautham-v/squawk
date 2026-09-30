@@ -62,9 +62,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>Squawk records the other side of a meeting you start, and transcribes it on this Mac.</string>
 	<key>NSCalendarsFullAccessUsageDescription</key>
-	<string>Squawk names meeting notes after the calendar event happening now.</string>
+	<string>Squawk offers to take notes just before a meeting starts and names the notes after the event.</string>
 	<key>NSCalendarsUsageDescription</key>
-	<string>Squawk names meeting notes after the calendar event happening now.</string>
+	<string>Squawk offers to take notes just before a meeting starts and names the notes after the event.</string>
 </dict>
 </plist>
 PLIST

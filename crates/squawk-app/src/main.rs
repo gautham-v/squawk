@@ -4,6 +4,8 @@
 //! policy, the status item, the popover window anchored under it (toggled by
 //! a click, closed on Esc, an outside click or focus loss), and the wiring
 //! between the controller's snapshots and the views. See docs/design.md, "Startup".
+//! Also the notetaker's prompt panel: a second PopUp window hung under the
+//! item while the snapshot has a prompt and the popover is closed.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -22,6 +24,7 @@ use squawk_engine::{Engine, EngineConfig};
 use squawk_app::controller::{Command, Controller, Snapshot};
 use squawk_app::hotkey::{HotkeyTap, SharedMachine};
 use squawk_app::status_item::{Anchor, MenuBarState, ScreenRect, StatusItem, StatusItemEvent};
+use squawk_app::ui::panel::{self, PanelReply, PromptPanel};
 use squawk_app::ui::popover::{self, Popover, PopoverEvent};
 use squawk_app::ui::theme;
 use squawk_app::{ipc_server, logger, permissions};
@@ -43,6 +46,7 @@ const TAP_RETRY: Duration = Duration::from_secs(2);
 const QUIT_WAIT: Duration = Duration::from_secs(30);
 
 type WindowSlot = Rc<RefCell<Option<WindowHandle<Popover>>>>;
+type PanelSlot = Rc<RefCell<Option<WindowHandle<PromptPanel>>>>;
 
 /// Where the popover goes: the left and top edges it is pinned to, and the
 /// bottom of the display it is on.
@@ -121,18 +125,40 @@ fn main() {
         let current = Rc::new(RefCell::new(initial.clone()));
         let popover = cx.new(|cx| Popover::new(initial, cx));
         let window: WindowSlot = Rc::new(RefCell::new(None));
+        let prompt_panel = cx.new(|_| PromptPanel::new(None));
+        let panel_window: PanelSlot = Rc::new(RefCell::new(None));
 
-        // Snapshots from the controller: redraw the item and the popover.
+        cx.subscribe(&prompt_panel, {
+            let controller = controller.clone();
+            move |_panel, PanelReply(reply), _cx| controller.send(Command::Prompt(*reply))
+        })
+        .detach();
+
+        // Snapshots from the controller: redraw the item, the popover and
+        // the prompt panel.
         {
             let item = item.clone();
             let popover = popover.clone();
             let current = current.clone();
+            let window = window.clone();
+            let prompt_panel = prompt_panel.clone();
+            let panel_window = panel_window.clone();
             cx.spawn(async move |cx| {
                 while let Some(snapshot) = snaps.next().await {
                     item.set_state(mtm, MenuBarState::from_snapshot(&snapshot, Instant::now()));
                     *current.borrow_mut() = snapshot.clone();
+                    let prompt = snapshot.prompt.clone();
                     let updated = cx.update(|cx| {
                         popover.update(cx, |p, cx| p.set_snapshot(snapshot, cx));
+                        let popover_open = window.borrow().is_some();
+                        sync_panel(
+                            cx,
+                            prompt,
+                            popover_open,
+                            &prompt_panel,
+                            &panel_window,
+                            item.anchor(mtm),
+                        );
                     });
                     if updated.is_err() {
                         break;
@@ -143,14 +169,36 @@ fn main() {
         }
 
         // The timers: the item redraws only when its text changes, and an
-        // open popover repaints its header clock.
+        // open popover repaints its header clock. The prompt panel steps
+        // aside while the popover is open and comes back when it closes.
         {
             let item = item.clone();
             let popover = popover.clone();
             let current = current.clone();
             let window = window.clone();
+            let prompt_panel = prompt_panel.clone();
+            let panel_window = panel_window.clone();
             cx.spawn(async move |cx| loop {
                 cx.background_executor().timer(REDRAW_EVERY).await;
+                let prompt = current.borrow().prompt.clone();
+                let popover_open = window.borrow().is_some();
+                let shown = panel_window.borrow().is_some();
+                if shown != (prompt.is_some() && !popover_open)
+                    && cx
+                        .update(|cx| {
+                            sync_panel(
+                                cx,
+                                prompt,
+                                popover_open,
+                                &prompt_panel,
+                                &panel_window,
+                                item.anchor(mtm),
+                            )
+                        })
+                        .is_err()
+                {
+                    break;
+                }
                 let state = MenuBarState::from_snapshot(&current.borrow(), Instant::now());
                 if !state.ticks() {
                     continue;
@@ -207,8 +255,9 @@ fn main() {
                             return;
                         }
                         controller.send(Command::RecheckPermissions);
+                        close_panel(&panel_window, cx);
                         popover.update(cx, |p, cx| p.reset(cx));
-                        let placed = placement_for(cx, anchor);
+                        let placed = placement_for(cx, anchor, theme::POPOVER_WIDTH_PX);
                         match open_popover(
                             cx,
                             placed,
@@ -265,6 +314,63 @@ fn start_hotkeys(cx: &mut App, machine: SharedMachine, controller: Controller) {
         }
     })
     .detach();
+}
+
+/// Show the prompt panel when there is a prompt and the popover is closed;
+/// otherwise take it down. An open panel just gets the new prompt.
+fn sync_panel(
+    cx: &mut App,
+    prompt: Option<squawk_core::notetaker::Prompt>,
+    popover_open: bool,
+    panel: &Entity<PromptPanel>,
+    slot: &PanelSlot,
+    anchor: Option<Anchor>,
+) {
+    if prompt.is_none() || popover_open {
+        close_panel(slot, cx);
+        return;
+    }
+    panel.update(cx, |p, cx| p.set_prompt(prompt, cx));
+    if slot.borrow().is_some() {
+        return;
+    }
+    let placed = placement_for(cx, anchor, panel::PANEL_WIDTH_PX);
+    let bounds = Bounds {
+        origin: point(px(placed.x), px(placed.top)),
+        size: size(panel::PANEL_WIDTH, px(panel::PANEL_HEIGHT_PX)),
+    };
+    let panel = panel.clone();
+    let opened = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: None,
+            // Never take focus from the call.
+            focus: false,
+            show: true,
+            // A non-activating panel that also shows over full-screen apps.
+            kind: WindowKind::PopUp,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            window_background: WindowBackgroundAppearance::Blurred,
+            window_min_size: None,
+            display_id: None,
+            app_id: None,
+            window_decorations: None,
+            tabbing_identifier: None,
+        },
+        |_, _| panel,
+    );
+    match opened {
+        Ok(handle) => *slot.borrow_mut() = Some(handle),
+        Err(err) => log::warn!("could not open the prompt panel: {err}"),
+    }
+}
+
+fn close_panel(slot: &PanelSlot, cx: &mut App) {
+    if let Some(handle) = slot.borrow_mut().take() {
+        let _ = handle.update(cx, |_, w, _| w.remove_window());
+    }
 }
 
 /// Close the popover if one is open. Returns whether it closed something.
@@ -331,7 +437,7 @@ fn open_popover(
     Ok(handle)
 }
 
-fn placement_for(cx: &App, anchor: Option<Anchor>) -> Placement {
+fn placement_for(cx: &App, anchor: Option<Anchor>, width: f32) -> Placement {
     let b = cx.primary_display().map(|d| d.bounds()).unwrap_or(Bounds {
         origin: point(px(0.), px(0.)),
         size: size(px(1440.), px(900.)),
@@ -342,13 +448,12 @@ fn placement_for(cx: &App, anchor: Option<Anchor>) -> Placement {
         width: b.size.width.into(),
         height: b.size.height.into(),
     };
-    placement(anchor, primary)
+    placement(anchor, primary, width)
 }
 
 /// Centred under the item, top edge under the menu bar, kept inside the
 /// display the item is on. Pure, so the arithmetic is testable.
-fn placement(anchor: Option<Anchor>, primary: ScreenRect) -> Placement {
-    let width = theme::POPOVER_WIDTH_PX;
+fn placement(anchor: Option<Anchor>, primary: ScreenRect, width: f32) -> Placement {
     let gap: f32 = theme::POPOVER_TOP_GAP.into();
     let screen = anchor.map_or(primary, |a| a.screen);
     let left = screen.x + SCREEN_MARGIN;
@@ -409,7 +514,7 @@ mod tests {
     #[test]
     fn centred_under_the_item() {
         let primary = screen(0.0, 0.0, 1440.0, 900.0);
-        let placed = placement(anchor_on(primary, 1000.0), primary);
+        let placed = placement(anchor_on(primary, 1000.0), primary, theme::POPOVER_WIDTH_PX);
         assert_eq!(placed.x, 1000.0 + 20.0 - theme::POPOVER_WIDTH_PX / 2.0);
         assert_eq!(placed.top, 24.0);
     }
@@ -417,17 +522,31 @@ mod tests {
     #[test]
     fn clamped_to_the_right_edge() {
         let primary = screen(0.0, 0.0, 1440.0, 900.0);
-        let placed = placement(anchor_on(primary, 1420.0), primary);
+        let placed = placement(anchor_on(primary, 1420.0), primary, theme::POPOVER_WIDTH_PX);
         assert_eq!(placed.x, 1440.0 - theme::POPOVER_WIDTH_PX - SCREEN_MARGIN);
     }
 
     #[test]
     fn an_item_on_a_second_display_stays_under_the_item() {
         let second = screen(-561.0, -1440.0, 2560.0, 1440.0);
-        let placed = placement(anchor_on(second, 1600.0), screen(0.0, 0.0, 1512.0, 982.0));
+        let placed = placement(
+            anchor_on(second, 1600.0),
+            screen(0.0, 0.0, 1512.0, 982.0),
+            theme::POPOVER_WIDTH_PX,
+        );
         assert_eq!(placed.x, 1600.0 + 20.0 - theme::POPOVER_WIDTH_PX / 2.0);
         assert_eq!(placed.top, second.y + 24.0);
         assert_eq!(placed.screen_bottom, 0.0);
+    }
+
+    #[test]
+    fn the_prompt_panel_hangs_centred_under_the_item_too() {
+        let primary = screen(0.0, 0.0, 1440.0, 900.0);
+        let placed = placement(anchor_on(primary, 1000.0), primary, panel::PANEL_WIDTH_PX);
+        assert_eq!(placed.x, 1000.0 + 20.0 - panel::PANEL_WIDTH_PX / 2.0);
+        assert_eq!(placed.top, 24.0);
+        let placed = placement(anchor_on(primary, 1420.0), primary, panel::PANEL_WIDTH_PX);
+        assert_eq!(placed.x, 1440.0 - panel::PANEL_WIDTH_PX - SCREEN_MARGIN);
     }
 
     #[test]
