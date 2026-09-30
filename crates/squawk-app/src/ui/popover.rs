@@ -19,6 +19,9 @@
 //!   (`ui::settings`);
 //! - footer: Record meeting ⌥M, Launch at login, Quit.
 //!
+//! Keys (`ui::nav`): ← → switch tabs, ↑ ↓ select a row, Enter copies the
+//! dictation / opens the meeting / opens dictionary.txt, Esc closes.
+//!
 //! The data comes from the files through [`PopoverData::load`], re-read when
 //! the popover opens and, while it is open, whenever the snapshot's
 //! `revision` moves; the preview example feeds fixture data instead.
@@ -42,6 +45,7 @@ use crate::controller::Snapshot;
 use crate::launch_at_login;
 use crate::permissions::{self, Pane};
 use crate::ui::format::{self, Tone};
+use crate::ui::nav::{self, Enter, Step};
 use crate::ui::settings::{self, Menu};
 use crate::ui::theme::{self, Theme};
 
@@ -84,14 +88,24 @@ pub enum PopoverEvent {
     SetSetting(Setting),
 }
 
-actions!(squawk, [Dismiss]);
+actions!(
+    squawk,
+    [Dismiss, SelectUp, SelectDown, TabLeft, TabRight, Activate]
+);
 
 /// Key context for the popover.
 pub const KEY_CONTEXT: &str = "Squawk";
 
 /// Install the popover's key bindings. Call once at app start.
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("escape", Dismiss, Some(KEY_CONTEXT))]);
+    cx.bind_keys([
+        KeyBinding::new("escape", Dismiss, Some(KEY_CONTEXT)),
+        KeyBinding::new("up", SelectUp, Some(KEY_CONTEXT)),
+        KeyBinding::new("down", SelectDown, Some(KEY_CONTEXT)),
+        KeyBinding::new("left", TabLeft, Some(KEY_CONTEXT)),
+        KeyBinding::new("right", TabRight, Some(KEY_CONTEXT)),
+        KeyBinding::new("enter", Activate, Some(KEY_CONTEXT)),
+    ]);
 }
 
 /// What the three tabs list.
@@ -142,6 +156,8 @@ pub struct Popover {
     stale: bool,
     /// The History row showing "Copied", and when it was clicked.
     copied: Option<(usize, Instant)>,
+    /// The row ↑/↓ selected in the current tab's list.
+    selected: Option<usize>,
     /// The Settings tab's open pop-up menu.
     open_menu: Option<Menu>,
     /// Whether the fn key is set to something that fights squawk.
@@ -165,6 +181,7 @@ impl Popover {
             live_files: true,
             stale: true,
             copied: None,
+            selected: None,
             open_menu: None,
             fn_hint: false,
             login_error: None,
@@ -198,6 +215,7 @@ impl Popover {
     /// fn-key setting (in the background; `defaults` takes a few ms).
     pub fn reset(&mut self, cx: &mut Context<Self>) {
         self.copied = None;
+        self.selected = None;
         self.open_menu = None;
         self.login_error = None;
         self.scroll_to_top();
@@ -253,10 +271,57 @@ impl Popover {
     fn select(&mut self, tab: Tab, cx: &mut Context<Self>) {
         if tab != self.tab {
             self.scroll_to_top();
+            self.selected = None;
             self.open_menu = None;
         }
         self.tab = tab;
         cx.notify();
+    }
+
+    /// How many rows ↑/↓ move through on this tab.
+    fn row_count(&self) -> usize {
+        match self.tab {
+            Tab::History => self.data.history.len(),
+            Tab::Meetings => self.data.meetings.len(),
+            Tab::Dictionary => self.data.dictionary.len(),
+            Tab::Settings => 0,
+        }
+    }
+
+    fn step_selection(&mut self, step: Step, cx: &mut Context<Self>) {
+        if !self.tab.has_rows() {
+            return;
+        }
+        self.selected = nav::step(self.selected, self.row_count(), step);
+        if let Some(index) = self.selected {
+            self.list_scroll.scroll_to_item(index);
+        }
+        cx.notify();
+    }
+
+    fn on_select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_selection(Step::Up, cx);
+    }
+
+    fn on_select_down(&mut self, _: &SelectDown, _: &mut Window, cx: &mut Context<Self>) {
+        self.step_selection(Step::Down, cx);
+    }
+
+    fn on_tab_left(&mut self, _: &TabLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.select(self.tab.prev(), cx);
+    }
+
+    fn on_tab_right(&mut self, _: &TabRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.select(self.tab.next(), cx);
+    }
+
+    fn on_activate(&mut self, _: &Activate, _: &mut Window, cx: &mut Context<Self>) {
+        match nav::enter(self.tab, self.selected) {
+            Some(Enter::CopyDictation(index)) => self.copy_row(index, cx),
+            Some(Enter::OpenMeeting(index)) => self.open_meeting(index, cx),
+            Some(Enter::EditDictionary) => self.edit_dictionary(cx),
+            None => {}
+        }
     }
 
     /// Open or close a Settings pop-up.
@@ -579,6 +644,7 @@ impl Popover {
                     format::row_time(entry.at, today)
                 };
                 list_row(theme, SharedString::from(format!("history-{index}")))
+                    .when(self.selected == Some(index), |el| el.bg(theme.hover))
                     .on_click(cx.listener(move |this, _, _, cx| this.copy_row(index, cx)))
                     .child(
                         div()
@@ -620,6 +686,7 @@ impl Popover {
             .enumerate()
             .map(|(index, meeting)| {
                 list_row(theme, SharedString::from(format!("meeting-{index}")))
+                    .when(self.selected == Some(index), |el| el.bg(theme.hover))
                     .on_click(cx.listener(move |this, _, _, cx| this.open_meeting(index, cx)))
                     .child(
                         div()
@@ -690,11 +757,14 @@ impl Popover {
         self.data
             .dictionary
             .iter()
-            .map(|entry| {
+            .enumerate()
+            .map(|(index, entry)| {
                 let row = div()
                     .flex()
                     .flex_row()
                     .flex_shrink_0()
+                    .rounded(theme::ROW_RADIUS)
+                    .when(self.selected == Some(index), |el| el.bg(theme.hover))
                     .items_center()
                     .gap(theme::ARROW_GAP)
                     .px(theme::ROW_PAD_X)
@@ -894,6 +964,11 @@ impl Render for Popover {
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_dismiss))
+            .on_action(cx.listener(Self::on_select_up))
+            .on_action(cx.listener(Self::on_select_down))
+            .on_action(cx.listener(Self::on_tab_left))
+            .on_action(cx.listener(Self::on_tab_right))
+            .on_action(cx.listener(Self::on_activate))
             .flex()
             .flex_col()
             .w(theme::POPOVER_WIDTH)
