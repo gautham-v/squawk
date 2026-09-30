@@ -62,15 +62,21 @@ pub enum EngineEvent {
     /// second).
     Model(ModelStatus),
     /// A running dictation hit `max_dictation`; the session finishes itself
-    /// and the app should call `finish` as if fn were released.
-    DictationTooLong,
+    /// and the app should call `finish` as if fn were released. `session`
+    /// is [`DictationSession::id`]: ignore it unless it is the live one.
+    DictationTooLong { session: u64 },
     /// The meeting file was rewritten with new transcript.
     MeetingProgress { path: PathBuf, elapsed_secs: u64 },
     /// Something went wrong in a meeting that does not stop it (e.g. system
     /// audio unavailable: the meeting continues mic-only).
     MeetingWarning(String),
-    /// The input device disappeared mid-recording (or could not be opened).
-    MicLost(String),
+    /// A dictation's mic could not be opened, or disappeared and could not
+    /// be reopened. What was captured before is still there: `finish` the
+    /// session (if it is the live one) rather than cancelling it.
+    MicLost { session: u64, message: String },
+    /// A meeting's mic disappeared and could not be reopened: the meeting
+    /// goes on, but "You" is no longer recorded.
+    MeetingMicLost(String),
 }
 
 type Sink = Arc<dyn Fn(EngineEvent) + Send + Sync>;

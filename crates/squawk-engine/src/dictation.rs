@@ -7,7 +7,7 @@
 //! utterance on an M4.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -29,6 +29,7 @@ const SPECULATE_AFTER_SECS: f32 = 0.2;
 /// A dictation in progress. `Send`, so it can be started on the hotkey
 /// thread and finished on a worker. Dropping it cancels.
 pub struct DictationSession {
+    id: u64,
     started_at: Instant,
     shared: Arc<Shared>,
     starter: Option<JoinHandle<Result<Box<dyn Source>, EngineError>>>,
@@ -82,7 +83,11 @@ impl Source for Replay {
     }
 }
 
+/// Session ids, unique for the life of the process.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 struct Shared {
+    id: u64,
     state: Mutex<Capture>,
     /// f32 bits: RMS of the latest block.
     level: AtomicU32,
@@ -121,7 +126,7 @@ impl Shared {
         if room == 0 {
             if !st.too_long {
                 st.too_long = true;
-                (st.emit)(EngineEvent::DictationTooLong);
+                (st.emit)(EngineEvent::DictationTooLong { session: self.id });
             }
             return;
         }
@@ -191,7 +196,9 @@ impl DictationSession {
         emit: Emit,
         busy: BusyGuard,
     ) -> DictationSession {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::new(Shared {
+            id,
             state: Mutex::new(Capture {
                 segmenter: Some(Segmenter::new(SegmenterConfig::default())),
                 jobs: Vec::new(),
@@ -221,12 +228,19 @@ impl DictationSession {
             }
         };
         DictationSession {
+            id,
             started_at: Instant::now(),
             shared,
             starter,
             audio_dir,
             _busy: Some(busy),
         }
+    }
+
+    /// Tags this session's [`EngineEvent`]s, so a late event from an
+    /// earlier session is not taken for the live one's.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     pub fn started_at(&self) -> Instant {
@@ -375,17 +389,21 @@ impl Drop for DictationSession {
 fn open(input: Input, shared: Arc<Shared>, emit: Emit) -> Result<Box<dyn Source>, EngineError> {
     match input {
         Input::Mic(device) => {
+            let session = shared.id;
             let feeder = shared.clone();
             let lost = emit.clone();
             let mic = MicCapture::start_with_errors(
                 device.as_deref(),
                 move |b| feeder.feed(b),
-                move |msg| lost(EngineEvent::MicLost(msg)),
+                move |message| lost(EngineEvent::MicLost { session, message }),
             );
             match mic {
                 Ok(m) => Ok(Box::new(m)),
                 Err(e) => {
-                    emit(EngineEvent::MicLost(e.to_string()));
+                    emit(EngineEvent::MicLost {
+                        session,
+                        message: e.to_string(),
+                    });
                     Err(e)
                 }
             }
@@ -587,12 +605,13 @@ mod tests {
     fn max_length_stops_listening_and_says_so() {
         let (s, events) = session(tone(3.0), Duration::from_secs(1));
         wait_for_replay(3.0);
+        let id = s.id();
         let t = s.finish().unwrap();
         assert!((t.audio_secs - 1.0).abs() < 1e-3);
         let evs = events.lock().unwrap();
         assert_eq!(
             evs.iter()
-                .filter(|e| **e == EngineEvent::DictationTooLong)
+                .filter(|e| **e == EngineEvent::DictationTooLong { session: id })
                 .count(),
             1
         );

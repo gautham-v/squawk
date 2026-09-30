@@ -124,12 +124,16 @@ impl MeetingHandle {
             writer_tx.clone(),
         );
 
+        // MicCapture reopens a device that drops out (AirPods disconnecting,
+        // or flipping to their headset profile when a call app opens their
+        // mic) and fills the gap with silence, so "You" stays on the meeting
+        // clock. Only a mic that cannot be reopened ends up here.
         let feeder = you.clone();
-        let warn = emit.clone();
+        let lost = emit.clone();
         let mic = MicCapture::start_with_errors(
             config.input_device.as_deref(),
             move |b| feeder.feed(b),
-            move |msg| warn(EngineEvent::MeetingWarning(format!("microphone: {msg}"))),
+            move |msg| lost(EngineEvent::MeetingMicLost(msg)),
         );
         let mic = match mic {
             Ok(m) => m,

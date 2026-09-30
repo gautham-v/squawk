@@ -3,7 +3,7 @@
 //! Plumbing only, like claudebar/daybar's main.rs: accessory activation
 //! policy, the status item, the popover window anchored under it (toggled by
 //! a click, closed on Esc, an outside click or focus loss), and the wiring
-//! between the controller's snapshots and the views. See SPEC.md, "Startup".
+//! between the controller's snapshots and the views. See docs/design.md, "Startup".
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

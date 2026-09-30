@@ -1,6 +1,6 @@
 //! squawk-engine: audio in, text out.
 //!
-//! The public API is the contract in SPEC.md ("squawk-engine").
+//! The public API is described in docs/design.md ("squawk-engine").
 //!
 //! Threads (none of them the caller's):
 //! - one **recognizer** thread owns the single Parakeet model and serves a

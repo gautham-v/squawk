@@ -52,6 +52,9 @@ pub struct MeetingSnap {
     pub path: PathBuf,
     pub since: Instant,
     pub started_at: DateTime<Local>,
+    /// The mic dropped out and could not be reopened: "You" is no longer
+    /// being recorded. Stays until the meeting ends.
+    pub mic_lost: bool,
 }
 
 /// Everything the views need, published by the controller after every
@@ -255,6 +258,7 @@ impl Worker {
                 Command::RecheckPermissions => {
                     self.reload_if_config_changed();
                     self.recheck_permissions();
+                    self.retry_model_if_needed();
                 }
                 Command::TapInstalled(ok) => {
                     self.tap_ok = Some(ok);
@@ -338,6 +342,10 @@ impl Worker {
         let session = match self.engine.start_dictation() {
             Ok(session) => session,
             Err(e) => {
+                // A failed first-run download would otherwise never retry.
+                if matches!(e, squawk_engine::EngineError::ModelMissing) {
+                    self.engine.ensure_model();
+                }
                 self.hotkeys.force_idle();
                 self.snap.dictation = DictationPhase::Idle;
                 self.fail(e.to_string());
@@ -536,6 +544,7 @@ impl Worker {
             path,
             since: Instant::now() - handle.elapsed(),
             started_at,
+            mic_lost: false,
         });
         self.snap.revision += 1;
         self.meeting = Some(handle);
@@ -651,27 +660,56 @@ impl Worker {
         }
     }
 
+    /// Opening the popover retries a model that is missing or failed (a
+    /// download that died offline, say). `ensure_model` does nothing while
+    /// one is already in flight and resumes a partial download.
+    fn retry_model_if_needed(&mut self) {
+        if matches!(
+            self.engine.model_status(),
+            ModelStatus::Missing | ModelStatus::Failed { .. }
+        ) {
+            self.engine.ensure_model();
+        }
+    }
+
+    /// Whether an engine event about dictation `session` is about the live
+    /// one (a late event from a cancelled session must not touch a newer).
+    fn is_live(&self, session: u64) -> bool {
+        self.live.as_ref().map(|l| l.session.id()) == Some(session)
+    }
+
     fn on_engine(&mut self, event: EngineEvent) {
         match event {
             EngineEvent::Model(status) => {
                 self.snap.model = status;
                 self.publish();
             }
-            EngineEvent::DictationTooLong => {
-                self.hotkeys.force_idle();
-                self.stop_and_paste(Instant::now());
+            EngineEvent::DictationTooLong { session } => {
+                if self.is_live(session) {
+                    self.hotkeys.force_idle();
+                    self.stop_and_paste(Instant::now());
+                }
             }
             EngineEvent::MeetingProgress { .. } => {
                 self.snap.revision += 1;
                 self.publish();
             }
             EngineEvent::MeetingWarning(message) => self.fail(message),
-            EngineEvent::MicLost(message) => {
-                if let Some(live) = self.live.take() {
-                    live.session.cancel();
-                    self.hotkeys.force_idle();
+            EngineEvent::MicLost { session, message } => {
+                if !self.is_live(session) {
+                    log::info!("mic lost for an old dictation: {message}");
+                    return;
                 }
-                self.snap.dictation = DictationPhase::Idle;
+                // Keep what was said before the mic went: paste it as if fn
+                // came up now.
+                self.hotkeys.force_idle();
+                self.stop_and_paste(Instant::now());
+                self.fail(format!("microphone lost: {message}"));
+            }
+            EngineEvent::MeetingMicLost(message) => {
+                if let Some(meeting) = self.snap.meeting.as_mut() {
+                    meeting.mic_lost = true;
+                }
                 self.fail(format!("microphone lost: {message}"));
             }
         }
@@ -934,6 +972,7 @@ pub(crate) mod tests {
             path: "/tmp/m.md".into(),
             since: now - Duration::from_secs(724),
             started_at: Local::now(),
+            mic_lost: false,
         });
         let meeting = status_info(&s, now).meeting.unwrap();
         assert_eq!(meeting.title, "Weekly sync");

@@ -1,5 +1,5 @@
 //! Squawk.app as a library, so the examples can build the popover and the
-//! menu bar item without the full app. See SPEC.md, "squawk-app".
+//! menu bar item without the full app. See docs/design.md, "squawk-app".
 //!
 //! Threads:
 //! - **main** (gpui + AppKit): status item and popover.

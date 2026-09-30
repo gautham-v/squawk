@@ -8,6 +8,7 @@
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
@@ -35,20 +36,24 @@ impl MicCapture {
         MicCapture::start_with_errors(device, sink, |_| {})
     }
 
-    /// [`MicCapture::start`], plus `on_error` for stream errors after it
-    /// started (the device was unplugged, the route changed). Called on a
-    /// CoreAudio thread; must not block.
+    /// [`MicCapture::start`], plus `on_lost` for a mic that is gone for
+    /// good. When the device disappears or changes its sample rate (AirPods
+    /// switching to their headset profile does this the moment their mic
+    /// opens), the stream is reopened on the same (or the default) device and
+    /// keeps feeding `sink`, with silence standing in for the gap so time
+    /// stays on the wall clock. `on_lost` is called only when reopening
+    /// fails; the sink then gets nothing more. Called on the capture thread.
     pub fn start_with_errors(
         device: Option<&str>,
         sink: impl FnMut(&[f32]) + Send + 'static,
-        on_error: impl Fn(String) + Send + 'static,
+        on_lost: impl FnOnce(String) + Send + 'static,
     ) -> Result<MicCapture, EngineError> {
         let wanted = device.map(str::to_string);
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
         let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
         let thread = std::thread::Builder::new()
             .name("squawk-mic".into())
-            .spawn(move || capture_thread(wanted, sink, on_error, ready_tx, stop_rx))?;
+            .spawn(move || capture_thread(wanted, sink, on_lost, ready_tx, stop_rx))?;
         match ready_rx.recv() {
             Ok(Ok(name)) => Ok(MicCapture {
                 name,
@@ -94,58 +99,177 @@ impl Drop for MicCapture {
 
 type Ready = Sender<Result<String, EngineError>>;
 
+/// Waits before each attempt to reopen a lost mic. CoreAudio needs a
+/// moment after a route change before the new format is readable.
+const REOPEN_DELAYS_MS: [u64; 5] = [100, 250, 500, 1000, 2000];
+/// A device that keeps dropping out is given up on after this many reopens
+/// in one capture, rather than looping forever.
+const MAX_REOPENS: u32 = 20;
+/// Cap on the silence inserted for a reopen gap.
+const MAX_GAP: Duration = Duration::from_secs(10);
+
+/// One opened stream and what its buffers need to become 16 kHz mono.
+struct Opened {
+    stream: cpal::Stream,
+    name: String,
+    channels: usize,
+    resampler: Resampler,
+}
+
+impl Opened {
+    fn deliver(&mut self, raw: &[f32], sink: &mut impl FnMut(&[f32])) {
+        let mono = downmix(raw, self.channels);
+        let out = self.resampler.process(&mono);
+        if !out.is_empty() {
+            sink(&out);
+        }
+    }
+
+    /// Stop the device, then pass on every buffer it had already sent and
+    /// whatever the resampler held back. Nothing of this stream is left in
+    /// `raw_rx` afterwards.
+    fn close(self, raw_rx: &Receiver<Vec<f32>>, sink: &mut impl FnMut(&[f32])) {
+        let Opened {
+            stream,
+            channels,
+            mut resampler,
+            ..
+        } = self;
+        drop(stream);
+        for raw in raw_rx.try_iter() {
+            let out = resampler.process(&downmix(&raw, channels));
+            if !out.is_empty() {
+                sink(&out);
+            }
+        }
+        let tail = resampler.flush();
+        if !tail.is_empty() {
+            sink(&tail);
+        }
+    }
+}
+
 fn capture_thread(
     wanted: Option<String>,
     mut sink: impl FnMut(&[f32]),
-    on_error: impl Fn(String) + Send + 'static,
+    on_lost: impl FnOnce(String),
     ready: Ready,
     stop: Receiver<()>,
 ) {
     let (raw_tx, raw_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
-    let opened = open_stream(wanted.as_deref(), raw_tx, on_error);
-    let (stream, name, rate, channels) = match opened {
-        Ok(v) => v,
+    // Loss reports carry the generation of the stream that raised them, so
+    // a late report from a stream already replaced is ignored.
+    let (lost_tx, lost_rx) = crossbeam_channel::unbounded::<(u32, String)>();
+    let mut generation = 0u32;
+    let first = match open_stream(wanted.as_deref(), &raw_tx, &lost_tx, generation) {
+        Ok(opened) => opened,
         Err(e) => {
             let _ = ready.send(Err(e));
             return;
         }
     };
-    log::info!("mic: {name} at {rate} Hz, {channels} ch");
-    let _ = ready.send(Ok(name));
+    let _ = ready.send(Ok(first.name.clone()));
+    let mut current = Some(first);
+    let mut on_lost = Some(on_lost);
 
-    let mut resampler = Resampler::new(rate);
-    let mut deliver = |raw: Vec<f32>, resampler: &mut Resampler| {
-        let mono = downmix(&raw, channels);
-        let out = resampler.process(&mono);
-        if !out.is_empty() {
-            sink(&out);
-        }
-    };
     loop {
         select! {
-            recv(raw_rx) -> msg => match msg {
-                Ok(raw) => deliver(raw, &mut resampler),
-                Err(_) => break,
-            },
+            recv(raw_rx) -> msg => {
+                if let (Ok(raw), Some(mic)) = (msg, current.as_mut()) {
+                    mic.deliver(&raw, &mut sink);
+                }
+            }
+            recv(lost_rx) -> msg => {
+                let Ok((gen, why)) = msg else { continue };
+                if gen != generation {
+                    continue;
+                }
+                let Some(old) = current.take() else { continue };
+                let lost_at = Instant::now();
+                let name = old.name.clone();
+                old.close(&raw_rx, &mut sink);
+                log::warn!("mic: {name}: {why}; reopening");
+                generation += 1;
+                let reopened = if generation > MAX_REOPENS {
+                    Reopen::Failed("it keeps dropping out".into())
+                } else {
+                    reopen(wanted.as_deref(), &raw_tx, &lost_tx, generation, &stop)
+                };
+                match reopened {
+                    Reopen::Opened(mic) => {
+                        let gap = silence_for(lost_at.elapsed());
+                        log::info!(
+                            "mic: reopened {} after {} ms",
+                            mic.name,
+                            lost_at.elapsed().as_millis()
+                        );
+                        for block in gap.chunks(SAMPLE_RATE as usize / 10) {
+                            sink(block);
+                        }
+                        current = Some(mic);
+                    }
+                    Reopen::Failed(e) => {
+                        log::error!("mic: could not reopen: {e}");
+                        if let Some(f) = on_lost.take() {
+                            f(format!("{why}; reopening failed: {e}"));
+                        }
+                    }
+                    // Stopped while waiting to retry; the old stream is
+                    // already closed and flushed.
+                    Reopen::Stopped => return,
+                }
+            }
             recv(stop) -> _ => break,
         }
     }
-    // Stop the device first so no buffer arrives after the drain.
-    drop(stream);
-    for raw in raw_rx.try_iter() {
-        deliver(raw, &mut resampler);
+    if let Some(mic) = current {
+        mic.close(&raw_rx, &mut sink);
     }
-    let tail = resampler.flush();
-    if !tail.is_empty() {
-        sink(&tail);
+}
+
+enum Reopen {
+    Opened(Opened),
+    Failed(String),
+    Stopped,
+}
+
+/// Try to open the mic again, waiting a little longer before each attempt.
+/// A stop request during a wait ends it.
+fn reopen(
+    wanted: Option<&str>,
+    raw_tx: &Sender<Vec<f32>>,
+    lost_tx: &Sender<(u32, String)>,
+    generation: u32,
+    stop: &Receiver<()>,
+) -> Reopen {
+    let mut last = String::from("no attempt");
+    for delay in REOPEN_DELAYS_MS {
+        if stop.recv_timeout(Duration::from_millis(delay)).is_ok() {
+            return Reopen::Stopped;
+        }
+        match open_stream(wanted, raw_tx, lost_tx, generation) {
+            Ok(mic) => return Reopen::Opened(mic),
+            Err(e) => {
+                log::debug!("mic: reopen attempt failed: {e}");
+                last = e.to_string();
+            }
+        }
     }
+    Reopen::Failed(last)
+}
+
+/// Zeros covering a reopen gap of `gap`, capped at [`MAX_GAP`].
+fn silence_for(gap: Duration) -> Vec<f32> {
+    let secs = gap.min(MAX_GAP).as_secs_f64();
+    vec![0.0; (secs * SAMPLE_RATE as f64) as usize]
 }
 
 fn open_stream(
     wanted: Option<&str>,
-    raw_tx: Sender<Vec<f32>>,
-    on_error: impl Fn(String) + Send + 'static,
-) -> Result<(cpal::Stream, String, u32, usize), EngineError> {
+    raw_tx: &Sender<Vec<f32>>,
+    lost_tx: &Sender<(u32, String)>,
+    generation: u32,
+) -> Result<Opened, EngineError> {
     let host = cpal::default_host();
     let device = find_device(&host, wanted)?;
     let name = device_name(&device);
@@ -156,14 +280,18 @@ fn open_stream(
     let channels = config.channels() as usize;
     let format = config.sample_format();
     let stream_config = config.config();
-    // Xruns (a late callback) are noise, not a lost mic.
-    let err_fn = move |e: cpal::Error| {
-        if e.kind() == cpal::ErrorKind::Xrun {
-            log::debug!("mic: {e}");
-        } else {
-            on_error(e.to_string());
+    let lost_tx = lost_tx.clone();
+    // cpal pauses the stream itself on DeviceNotAvailable and
+    // StreamInvalidated; those need a reopen. Xruns (a late callback) and
+    // the rest leave the stream running and are only logged.
+    let err_fn = move |e: cpal::Error| match e.kind() {
+        cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated => {
+            let _ = lost_tx.send((generation, e.to_string()));
         }
+        cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged => log::debug!("mic: {e}"),
+        _ => log::warn!("mic: {e}"),
     };
+    let raw_tx = raw_tx.clone();
     let stream = match format {
         SampleFormat::F32 => build::<f32>(&device, stream_config, raw_tx, err_fn),
         SampleFormat::I16 => build::<i16>(&device, stream_config, raw_tx, err_fn),
@@ -182,7 +310,13 @@ fn open_stream(
     stream
         .play()
         .map_err(|e| EngineError::Mic(format!("{name}: {e}")))?;
-    Ok((stream, name, rate, channels))
+    log::info!("mic: {name} at {rate} Hz, {channels} ch");
+    Ok(Opened {
+        stream,
+        name,
+        channels,
+        resampler: Resampler::new(rate),
+    })
 }
 
 fn build<T>(
@@ -602,6 +736,18 @@ mod tests {
         let x = sine(300.0, 16_000, 0.1);
         let out = stream(&mut Resampler::new(16_000), &x, 100);
         assert_eq!(out, x);
+    }
+
+    #[test]
+    fn a_reopen_gap_becomes_capped_silence() {
+        assert_eq!(silence_for(Duration::from_millis(250)).len(), 4_000);
+        assert!(silence_for(Duration::from_millis(250))
+            .iter()
+            .all(|&s| s == 0.0));
+        assert_eq!(
+            silence_for(Duration::from_secs(60)).len(),
+            MAX_GAP.as_secs() as usize * SAMPLE_RATE as usize
+        );
     }
 
     #[test]

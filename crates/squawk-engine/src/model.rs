@@ -64,6 +64,14 @@ pub fn download(
         return Ok(final_dir);
     }
     std::fs::create_dir_all(models_dir)?;
+    // The app (on first launch) and `squawk model download` may both get
+    // here; they share the .part file and the staging dir, so one waits for
+    // the other and then finds the model installed.
+    let lock = File::create(models_dir.join(format!("{dir_name}.lock")))?;
+    lock.lock()?;
+    if is_installed(&final_dir) {
+        return Ok(final_dir);
+    }
     let part = models_dir.join(format!("{dir_name}.tar.gz.part"));
     let is_default = url == squawk_core::config::DEFAULT_MODEL_URL;
     fetch(
@@ -118,14 +126,55 @@ pub fn install_tarball(
     Ok(final_dir)
 }
 
-/// Stream `url` into `part`, resuming from its current length.
+/// Each request may spend at most this long reading the body. ureq has no
+/// idle-read timeout, and without a limit a connection that goes silent
+/// (sleep/wake, a Wi-Fi roam) blocks the read forever. When the window runs
+/// out, the download resumes with a new Range request, so a slow link only
+/// costs an extra request per window.
+const BODY_WINDOW: Duration = Duration::from_secs(60);
+
+/// Stream `url` into `part`, resuming from its current length, and keep
+/// resuming as long as each attempt makes progress. An attempt that adds
+/// nothing (a stall, an HTTP error) ends it with that attempt's error.
 fn fetch(
     url: &str,
     part: &Path,
     expected: Option<u64>,
     progress: &mut dyn FnMut(ModelStatus),
 ) -> Result<(), EngineError> {
-    let mut have = std::fs::metadata(part).map(|m| m.len()).unwrap_or(0);
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(20)))
+        .timeout_recv_response(Some(Duration::from_secs(30)))
+        .timeout_recv_body(Some(BODY_WINDOW))
+        .user_agent(concat!("squawk/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into();
+    loop {
+        let before = part_len(part);
+        match fetch_once(&agent, url, part, expected, progress) {
+            Ok(()) => return Ok(()),
+            Err(e) if part_len(part) > before => {
+                log::info!("model: download interrupted ({e}); resuming");
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn part_len(part: &Path) -> u64 {
+    std::fs::metadata(part).map(|m| m.len()).unwrap_or(0)
+}
+
+/// One request: stream `url` into `part`, resuming from its current length.
+fn fetch_once(
+    agent: &ureq::Agent,
+    url: &str,
+    part: &Path,
+    expected: Option<u64>,
+    progress: &mut dyn FnMut(ModelStatus),
+) -> Result<(), EngineError> {
+    let mut have = part_len(part);
     if expected.is_some_and(|e| have == e) {
         return Ok(());
     }
@@ -133,13 +182,6 @@ fn fetch(
         std::fs::remove_file(part)?;
         have = 0;
     }
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(20)))
-        .timeout_recv_response(Some(Duration::from_secs(30)))
-        .user_agent(concat!("squawk/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into();
     let mut req = agent.get(url);
     if have > 0 {
         req = req.header("Range", &format!("bytes={have}-"));
@@ -602,5 +644,102 @@ mod tests {
         )
         .unwrap();
         assert!(verify_sha256(&p, "00").is_err());
+    }
+
+    /// A one-file HTTP server: the first response is cut off after `cut`
+    /// bytes (a dropped connection); later ones honour `Range`.
+    fn flaky_server(data: Vec<u8>, cut: usize) -> String {
+        use std::io::{BufRead, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for (i, conn) in listener.incoming().enumerate() {
+                let Ok(mut conn) = conn else { return };
+                let mut from = 0usize;
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(r) = lower.strip_prefix("range: bytes=") {
+                        from = r.trim().trim_end_matches('-').parse().unwrap();
+                    }
+                }
+                let body = &data[from..];
+                let head = if from > 0 {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {from}-{}/{}\r\nConnection: close\r\n\r\n",
+                        body.len(),
+                        data.len() - 1,
+                        data.len()
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                };
+                let _ = conn.write_all(head.as_bytes());
+                let body = if i == 0 { &body[..cut] } else { body };
+                let _ = conn.write_all(body);
+            }
+        });
+        format!("http://{addr}/model.tar.gz")
+    }
+
+    #[test]
+    fn an_interrupted_download_resumes_by_itself() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let url = flaky_server(data.clone(), 70_000);
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("m.tar.gz.part");
+        let mut last = None;
+        fetch(&url, &part, Some(data.len() as u64), &mut |s| {
+            last = Some(s)
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), data);
+        assert_eq!(
+            last,
+            Some(ModelStatus::Downloading {
+                downloaded: 200_000,
+                total: Some(200_000)
+            })
+        );
+    }
+
+    #[test]
+    fn a_download_that_makes_no_progress_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let part = tmp.path().join("m.tar.gz.part");
+        // Nothing listens on port 9.
+        assert!(matches!(
+            fetch("http://127.0.0.1:9/nope", &part, None, &mut |_| {}),
+            Err(EngineError::Download(_))
+        ));
+    }
+
+    #[test]
+    fn a_second_downloader_waits_and_finds_the_model() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let held = File::create(root.join("m.lock")).unwrap();
+        held.lock().unwrap();
+        let waiter = {
+            let root = root.clone();
+            std::thread::spawn(move || download("http://127.0.0.1:9/nope", &root, "m", &mut |_| {}))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!waiter.is_finished());
+        // The first downloader finishes installing, then lets go.
+        let dir = root.join("m");
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in REQUIRED_FILES {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        drop(held);
+        assert_eq!(waiter.join().unwrap().unwrap(), dir);
     }
 }

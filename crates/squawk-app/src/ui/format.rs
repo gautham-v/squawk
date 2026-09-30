@@ -73,10 +73,11 @@ pub fn header(snap: &Snapshot, now: Instant) -> Header {
         let elapsed = format_elapsed(now.saturating_duration_since(meeting.since).as_secs());
         let fix =
             (snap.permissions.screen_recording == Some(false)).then_some(Pane::ScreenRecording);
+        let lost = if meeting.mic_lost { " · mic lost" } else { "" };
         return Header {
             fix,
             ..line(
-                format!("Meeting · {} · {elapsed}", meeting.title),
+                format!("Meeting · {} · {elapsed}{lost}", meeting.title),
                 Tone::Accent,
             )
         };
@@ -247,9 +248,15 @@ mod tests {
             path: "/m.md".into(),
             since: now - Duration::from_secs(724),
             started_at: Local::now(),
+            mic_lost: false,
         });
         let h = header(&s, now);
         assert_eq!(h.text, "Meeting · Weekly sync · 12:04");
+        s.meeting.as_mut().unwrap().mic_lost = true;
+        assert_eq!(
+            header(&s, now).text,
+            "Meeting · Weekly sync · 12:04 · mic lost"
+        );
         assert_eq!(h.tone, Tone::Accent);
         assert_eq!(h.fix, None);
 

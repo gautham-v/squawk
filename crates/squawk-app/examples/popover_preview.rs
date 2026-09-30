@@ -123,6 +123,7 @@ fn snapshot(mode: &str) -> Snapshot {
                 path: "/tmp/m.md".into(),
                 since: now - Duration::from_secs(724),
                 started_at: Local::now(),
+                mic_lost: false,
             })
         }
         "downloading" => {
