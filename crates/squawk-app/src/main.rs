@@ -44,8 +44,9 @@ const SCREEN_MARGIN: f32 = 8.0;
 const TOGGLE_GRACE: Duration = Duration::from_millis(250);
 /// The popover never gets shorter than this, however little room there is.
 const MIN_POPOVER_HEIGHT: f32 = 200.0;
-/// How often the menu bar timer is re-checked while it is counting. Under a
-/// second, so the seconds tick over on time rather than up to a second late.
+/// How often an open popover's header clock is re-checked while it is
+/// counting. Under a second, so the seconds tick over on time rather than up
+/// to a second late.
 const REDRAW_EVERY: Duration = Duration::from_millis(250);
 /// How often a refused event tap is retried (Accessibility granted later
 /// takes effect without a relaunch).
@@ -288,8 +289,11 @@ fn main() {
             .detach();
         }
 
+        let level = engine.input_level();
         let (item, mut clicks) =
-            StatusItem::new(mtm, MenuBarState::from_snapshot(&initial, Instant::now()));
+            StatusItem::new(mtm, MenuBarState::from_snapshot(&initial), move || {
+                level.rms()
+            });
         let item = Rc::new(item);
         let current = Rc::new(RefCell::new(initial.clone()));
         let popover = cx.new(|cx| Popover::new(initial, cx));
@@ -323,7 +327,7 @@ fn main() {
             let panel_window = panel_window.clone();
             cx.spawn(async move |cx| {
                 while let Some(snapshot) = snaps.next().await {
-                    item.set_state(mtm, MenuBarState::from_snapshot(&snapshot, Instant::now()));
+                    item.set_state(mtm, MenuBarState::from_snapshot(&snapshot));
                     *current.borrow_mut() = snapshot.clone();
                     let prompt = snapshot.prompt.clone();
                     let updated = cx.update(|cx| {
@@ -346,9 +350,10 @@ fn main() {
             .detach();
         }
 
-        // The timers: the item redraws only when its text changes, and an
-        // open popover repaints its header clock. The prompt panel steps
-        // aside while the popover is open and comes back when it closes.
+        // The timers: an open popover repaints its header clock while a
+        // recording or a meeting is counting (the menu bar item animates on
+        // its own timer), and the prompt panel steps aside while the popover
+        // is open and comes back when it closes.
         {
             let item = item.clone();
             let popover = popover.clone();
@@ -377,11 +382,13 @@ fn main() {
                 {
                     break;
                 }
-                let state = MenuBarState::from_snapshot(&current.borrow(), Instant::now());
-                if !state.ticks() {
+                let counting = matches!(
+                    MenuBarState::from_snapshot(&current.borrow()),
+                    MenuBarState::Recording | MenuBarState::Meeting
+                );
+                if !counting {
                     continue;
                 }
-                item.set_state(mtm, state);
                 if panel.is_shown()
                     && cx
                         .update(|cx| popover.update(cx, |_, cx| cx.notify()))

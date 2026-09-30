@@ -27,7 +27,7 @@ pub mod segmenter;
 pub mod system_audio;
 mod voice_processing;
 
-pub use dictation::{DictationSession, Transcript};
+pub use dictation::{DictationSession, InputLevel, Transcript};
 pub use engine::{Engine, EngineConfig, EngineEvent};
 pub use error::EngineError;
 pub use meeting::{MeetingHandle, MeetingOptions, MeetingResult};

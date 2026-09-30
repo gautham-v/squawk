@@ -392,6 +392,7 @@ impl Engine {
     pub fn ensure_model(&self);                               // background download → extract → load; idempotent
     pub fn load_model_blocking(&self) -> Result<(), EngineError>;   // CLI; never downloads
     pub fn start_dictation(&self) -> Result<DictationSession, EngineError>;
+    pub fn input_level(&self) -> InputLevel;                  // live dictation's mic RMS, 0 when none
     pub fn start_meeting(&self, MeetingOptions) -> Result<MeetingHandle, EngineError>;
     pub fn transcribe(&self, samples: &[f32]) -> Result<String, EngineError>;  // raw text, blocking
     pub fn update_config(&self, EngineConfig);
@@ -570,8 +571,9 @@ pattern; EventKit supplies calendar titles.
    header, and retry `start` every 2 s until it succeeds (no relaunch needed after granting).
 5. `ipc_server::spawn(&paths.socket, controller.clone())`. If another instance is running
    (`ipc::bind` refuses), log it and quit.
-6. Status item + popover. A 1 s gpui timer redraws the item while
-   `MenuBarState::ticks()`.
+6. Status item (given `engine.input_level()` to poll while recording) + popover. The item
+   animates on its own timer (see Menu bar); a 250 ms gpui timer repaints an open popover's
+   header clock while a recording or meeting is counting.
 
 ### Controller (controller.rs)
 
@@ -628,17 +630,29 @@ newline, ever (squawk never submits). `copy` just sets the string.
 `MenuBarState` (`from_snapshot` precedence: recording > transcribing > meeting >
 needs-attention > idle):
 
-| state | drawing |
-|---|---|
-| `Idle` | template glyph: five vertical rounded bars (6/10/14/10/6 pt tall, 2 pt wide, 1.5 pt gaps) |
-| `NeedsAttention` | same glyph, AppKit disabled rendering (dimmed) |
-| `Recording{elapsed_secs, hands_free}` | glyph + `0:07` (monospaced digits) in copper; hands-free adds a small lock mark after the time |
-| `Transcribing` | dimmed glyph (brief) |
-| `Meeting{elapsed_secs}` | `● 12:04` in copper |
+The item is only the glyph: five vertical rounded bars, 2 pt wide, 1.5 pt gaps, centred in a
+16 × 18 pt template image (AppKit tints it for a light, dark or tinted menu bar). No text, no
+colour; the image never changes size, so the item never changes width.
 
-Copper: `#bb8669` on a dark menu bar, `#a16135` on a light one (read the button's
-`effectiveAppearance`). Everything else monochrome. The item never shows text beyond these
-timers: no meeting titles, no countdowns.
+| state | drawing | timer |
+|---|---|---|
+| `Idle` | resting bars, 6/10/14/10/6 pt | none |
+| `NeedsAttention` | resting bars at 36% opacity | none |
+| `Recording` (push-to-talk and hands-free alike) | bars follow the mic, 3–16 pt | 24 fps |
+| `Transcribing` | from the last live heights back to rest over 250 ms (cubic ease-out), then still | 30 fps, then none |
+| `Meeting` | resting heights × (0.78 + 0.1·sin(2πt / 5 s)) | 8 fps |
+
+Live bars: `DictationSession`'s capture callback stores each block's RMS in the engine's shared
+`InputLevel` atomic; each frame reads it, gates it (−50 dBFS → 0, −18 dBFS → 1), smooths it (40 ms
+attack, 150 ms release), takes the square root so quiet speech still moves the bars, and scales
+per bar by 0.62/0.86/1/0.86/0.62 with a small per-bar jitter. Heights snap to 0.5 pt so an
+unchanged frame is not redrawn. A settle already under way carries on into `Idle`.
+
+The timer is a main-run-loop `NSTimer` (common modes, 10% tolerance) that exists only while the
+state moves and is invalidated as soon as it stops. With `accessibilityDisplayShouldReduceMotion`
+on, every state draws one still frame (recording: a frozen waveform) and no timer runs. The
+maths is pure (`menu_bar_icon::Animator`) and tested; `examples/menu_bar_preview.rs --png DIR`
+renders every state's frames on a light and a dark menu bar.
 
 ### Prompt panel (ui/panel.rs)
 

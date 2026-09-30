@@ -68,8 +68,10 @@ record one. Calendar access is asked for while the meeting heads-up is on (it is
 | ctrl+cmd+C | copy the last dictation |
 | ⌥M | start or stop a meeting |
 
-The menu bar glyph turns copper with a timer while it listens (with a small lock when hands-free),
-dims briefly while it transcribes, and shows `● 12:04` during a meeting.
+The menu bar item is just the five bars, in the menu bar's own colour. While it listens they move
+with your voice, when you let go they settle back, during a meeting they pulse slowly, and they
+go faint when squawk needs a permission or the model. At rest nothing moves and nothing runs.
+With Reduce motion on, each state is a still frame.
 
 Squawk pastes through the clipboard and puts your old clipboard back a moment later. It never
 presses return: in a terminal the text waits for you to send it.
@@ -235,6 +237,7 @@ make test       # cargo test --workspace
 make check      # fmt + clippy
 make preview    # the popover with fixture data (MODE=recording|meeting|settings|panels|…)
 cargo run -p squawk-app --example menu_bar_preview   # every menu bar state at once
+cargo run -p squawk-app --example menu_bar_preview -- --png DIR   # frames as PNGs, light and dark
 cargo run -p squawk-app --example mic_probe          # which processes use the mic, as call detection sees them
 cargo run -p squawk-app --example mic_probe -- watch # the live watcher and notetaker, printing each prompt
 ```

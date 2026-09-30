@@ -9,7 +9,7 @@ use squawk_core::config::{MeetingConfig, ModelConfig};
 use squawk_core::{Config, ModelStatus, Paths};
 
 use crate::audio::MicShare;
-use crate::dictation::{self, DictationSession, Input};
+use crate::dictation::{self, DictationSession, Input, InputLevel};
 use crate::error::EngineError;
 use crate::meeting::{MeetingHandle, MeetingOptions};
 use crate::model;
@@ -123,6 +123,8 @@ struct Inner {
     meeting: Arc<AtomicBool>,
     /// The running meeting's echo-cancelled mic, for dictations.
     meeting_mic: MicShare,
+    /// The live dictation's mic level; every session writes here.
+    level: InputLevel,
 }
 
 impl Inner {
@@ -163,6 +165,7 @@ impl Engine {
                 dictating: Arc::new(AtomicBool::new(false)),
                 meeting: Arc::new(AtomicBool::new(false)),
                 meeting_mic: MicShare::default(),
+                level: InputLevel::default(),
             }),
         }
     }
@@ -313,7 +316,14 @@ impl Engine {
             config.audio_dir(),
             self.emitter(),
             busy,
+            self.inner.level.clone(),
         ))
+    }
+
+    /// The running dictation's mic level (RMS of the latest block, 0 when
+    /// none is running). Poll it from anywhere; it never blocks.
+    pub fn input_level(&self) -> InputLevel {
+        self.inner.level.clone()
     }
 
     /// `ModelMissing` while downloading reads better as "not ready".

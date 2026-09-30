@@ -1,13 +1,19 @@
 //! The `NSStatusItem` and the bridge from its clicks into gpui. Port of
 //! claudebar's `status_item.rs` (same target/action class, same
 //! global-monitor `ClickedOutside`, same `Anchor` maths), with squawk's
-//! [`MenuBarState`].
+//! [`MenuBarState`] and the animated glyph from `menu_bar_icon.rs`.
 //!
 //! The bridge is deliberately dumb: the button's target pushes a
 //! [`StatusItemEvent`] into an unbounded channel that `main.rs` drains from a
 //! gpui task, so nothing AppKit-shaped leaks into the views.
+//!
+//! The glyph animates on a main-run-loop `NSTimer` that exists only while
+//! the state moves (recording, the settle after it, a meeting) and is
+//! invalidated the moment it stops, so idle costs no wakeups at all.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::ptr::NonNull;
+use std::rc::{Rc, Weak};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -17,68 +23,45 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker};
 use objc2_app_kit::{
-    NSAppearanceCustomization, NSApplication, NSApplicationActivationPolicy, NSCellImagePosition,
-    NSControl, NSEvent, NSEventMask, NSScreen, NSStatusBar, NSStatusBarButton, NSStatusItem,
-    NSVariableStatusItemLength, NSView,
+    NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSControl, NSEvent,
+    NSEventMask, NSScreen, NSStatusBar, NSStatusItem, NSVariableStatusItemLength, NSWorkspace,
 };
-use objc2_foundation::{NSPoint, NSRect};
+use objc2_foundation::{NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSTimer};
 
 use crate::controller::{DictationPhase, Snapshot};
-use crate::menu_bar_icon;
+use crate::menu_bar_icon::{self, Animator, Glyph};
 
 /// What the menu bar item shows. Precedence, highest first: a dictation
 /// (recording, then transcribing), a meeting, needs-attention, idle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuBarState {
-    /// Monochrome template glyph (five vertical bars).
+    /// The five bars at rest. No timer.
     Idle,
-    /// Model missing/downloading/failed, or a permission missing: the glyph
-    /// at AppKit's disabled (dimmed) rendering. The popover says why.
+    /// Model missing/downloading/failed, or a permission missing: the
+    /// resting bars, faint. The popover says why.
     NeedsAttention,
-    /// Copper glyph + "0:07". `hands_free` adds a small lock mark.
-    Recording { elapsed_secs: u64, hands_free: bool },
-    /// Dimmed glyph, briefly, between release and paste.
+    /// Push-to-talk or hands-free (drawn the same): the bars follow the mic.
+    Recording,
+    /// Between release and paste: the bars ease back to rest.
     Transcribing,
-    /// "● 12:04" in copper.
-    Meeting { elapsed_secs: u64 },
+    /// A meeting is recording: a slow, small pulse.
+    Meeting,
 }
 
 impl MenuBarState {
-    /// Pure mapping from a snapshot; `now` is passed in so the 1 s timer that
-    /// redraws the elapsed time and tests agree.
-    pub fn from_snapshot(snap: &Snapshot, now: Instant) -> MenuBarState {
+    /// Pure mapping from a snapshot.
+    pub fn from_snapshot(snap: &Snapshot) -> MenuBarState {
         match &snap.dictation {
-            DictationPhase::Recording { since, hands_free } => MenuBarState::Recording {
-                elapsed_secs: now.saturating_duration_since(*since).as_secs(),
-                hands_free: *hands_free,
-            },
+            DictationPhase::Recording { .. } => MenuBarState::Recording,
             DictationPhase::Transcribing => MenuBarState::Transcribing,
             DictationPhase::Idle => match &snap.meeting {
-                Some(m) => MenuBarState::Meeting {
-                    elapsed_secs: now.saturating_duration_since(m.since).as_secs(),
-                },
+                Some(_) => MenuBarState::Meeting,
                 None if !snap.model.is_ready() || !snap.permissions.can_dictate() => {
                     MenuBarState::NeedsAttention
                 }
                 None => MenuBarState::Idle,
             },
         }
-    }
-
-    /// Drawn at AppKit's disabled (dimmed) rendering.
-    pub fn dimmed(&self) -> bool {
-        matches!(
-            self,
-            MenuBarState::NeedsAttention | MenuBarState::Transcribing
-        )
-    }
-
-    /// Whether the menu bar needs a redraw every second.
-    pub fn ticks(&self) -> bool {
-        matches!(
-            self,
-            MenuBarState::Recording { .. } | MenuBarState::Meeting { .. }
-        )
     }
 }
 
@@ -160,24 +143,41 @@ impl StatusItemTarget {
 /// Owns the menu bar item for the lifetime of the app. Dropping it removes
 /// the item, so keep it alive.
 pub struct StatusItem {
-    item: Retained<NSStatusItem>,
+    glyph: Rc<GlyphDriver>,
     // Held so the target outlives the button's unretained `target` pointer.
     _target: Retained<StatusItemTarget>,
     outside_monitor: Option<Retained<AnyObject>>,
-    /// What is drawn now, so the 1 s redraw only rebuilds on a change.
-    shown: RefCell<Option<(MenuBarState, bool)>>,
+}
+
+/// The item's image and the timer that animates it.
+struct GlyphDriver {
+    mtm: MainThreadMarker,
+    item: Retained<NSStatusItem>,
+    anim: RefCell<Animator>,
+    /// The mic's latest RMS (0..1).
+    level: Box<dyn Fn() -> f32>,
+    clock: Instant,
+    /// What is drawn now, so an unchanged frame is not redrawn.
+    shown: Cell<Option<Glyph>>,
+    /// The running timer and its rate.
+    timer: RefCell<Option<(Retained<NSTimer>, f64)>>,
 }
 
 impl StatusItem {
+    /// `level` returns the live dictation's mic RMS; it is polled only while
+    /// recording.
     pub fn new(
         mtm: MainThreadMarker,
         state: MenuBarState,
+        level: impl Fn() -> f32 + 'static,
     ) -> (StatusItem, UnboundedReceiver<StatusItemEvent>) {
         let (tx, rx) = mpsc::unbounded();
         let tx_outside = tx.clone();
         let target = StatusItemTarget::new(tx);
 
         let bar = NSStatusBar::systemStatusBar();
+        // Variable length, but the image is always GLYPH_WIDTH wide, so the
+        // item never changes width.
         let item = bar.statusItemWithLength(NSVariableStatusItemLength);
         if let Some(button) = item.button(mtm) {
             unsafe {
@@ -187,31 +187,33 @@ impl StatusItem {
                 control.setAction(Some(sel!(squawkStatusItemClicked:)));
             }
         }
-        let this = StatusItem {
+        let glyph = Rc::new(GlyphDriver {
+            mtm,
             item,
+            anim: RefCell::new(Animator::new(state.clone(), 0.0, reduce_motion())),
+            level: Box::new(level),
+            clock: Instant::now(),
+            shown: Cell::new(None),
+            timer: RefCell::new(None),
+        });
+        let this = StatusItem {
+            glyph,
             _target: target,
             outside_monitor: install_outside_click_monitor(tx_outside),
-            shown: RefCell::new(None),
         };
         this.set_state(mtm, state);
         (this, rx)
     }
 
-    /// Redraw for a new state. Cheap to call often: nothing is rebuilt
-    /// unless the state (or the menu bar's appearance) changed.
-    pub fn set_state(&self, mtm: MainThreadMarker, state: MenuBarState) {
-        let Some(button) = self.item.button(mtm) else {
-            return;
-        };
-        let dark = is_dark(&button);
-        let key = (state, dark);
-        if self.shown.borrow().as_ref() == Some(&key) {
-            return;
-        }
-        let (image, _) = menu_bar_icon::item_image(&key.0, dark);
-        button.setImage(Some(&image));
-        button.setAppearsDisabled(key.0.dimmed());
-        *self.shown.borrow_mut() = Some(key);
+    /// Switch to a new state. Cheap to call often: an unchanged state does
+    /// nothing, and the timer runs only while the state animates.
+    pub fn set_state(&self, _mtm: MainThreadMarker, state: MenuBarState) {
+        let now = self.glyph.now();
+        self.glyph
+            .anim
+            .borrow_mut()
+            .set_state(state, now, reduce_motion());
+        GlyphDriver::tick(&self.glyph, now);
     }
 
     /// Where the item is and which display it is on, in gpui screen
@@ -219,7 +221,7 @@ impl StatusItem {
     /// flipped through the primary screen's height; the display comes along
     /// because the menu bar moves to whichever display has attention.
     pub fn anchor(&self, mtm: MainThreadMarker) -> Option<Anchor> {
-        let button = self.item.button(mtm)?;
+        let button = self.glyph.item.button(mtm)?;
         let window = button.window()?;
         let frame: NSRect = window.frame();
         let flip_height = primary_screen_height(mtm)?;
@@ -231,23 +233,84 @@ impl StatusItem {
     }
 }
 
+impl GlyphDriver {
+    fn now(&self) -> f64 {
+        self.clock.elapsed().as_secs_f64()
+    }
+
+    /// Draw the frame for `now`, then start, change or stop the timer to
+    /// suit how the glyph moves from here.
+    fn tick(this: &Rc<GlyphDriver>, now: f64) {
+        let (glyph, fps) = {
+            let mut anim = this.anim.borrow_mut();
+            let glyph = anim.frame(now, (this.level)());
+            (glyph, anim.motion(now).fps())
+        };
+        this.draw(glyph);
+        let running = this.timer.borrow().as_ref().map(|(_, f)| *f);
+        if running != fps {
+            this.stop_timer();
+            if let Some(fps) = fps {
+                GlyphDriver::start_timer(this, fps);
+            }
+        }
+    }
+
+    fn draw(&self, glyph: Glyph) {
+        if self.shown.get() == Some(glyph) {
+            return;
+        }
+        let Some(button) = self.item.button(self.mtm) else {
+            return;
+        };
+        button.setImage(Some(&menu_bar_icon::glyph_image(glyph)));
+        self.shown.set(Some(glyph));
+    }
+
+    fn start_timer(this: &Rc<GlyphDriver>, fps: f64) {
+        let weak: Weak<GlyphDriver> = Rc::downgrade(this);
+        let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+            if let Some(this) = weak.upgrade() {
+                let now = this.now();
+                GlyphDriver::tick(&this, now);
+            }
+        });
+        let interval = 1.0 / fps;
+        // SAFETY: the timer goes on the main run loop only, so the block
+        // (which is not Send) is only ever called on the main thread.
+        let timer = unsafe { NSTimer::timerWithTimeInterval_repeats_block(interval, true, &block) };
+        // Let the system coalesce wakeups.
+        timer.setTolerance(interval * 0.1);
+        // Common modes: keep animating while a menu or drag is tracking.
+        // SAFETY: a timer and a run loop mode constant.
+        unsafe { NSRunLoop::mainRunLoop().addTimer_forMode(&timer, NSRunLoopCommonModes) };
+        *this.timer.borrow_mut() = Some((timer, fps));
+    }
+
+    fn stop_timer(&self) {
+        if let Some((timer, _)) = self.timer.borrow_mut().take() {
+            timer.invalidate();
+        }
+    }
+}
+
+impl Drop for GlyphDriver {
+    fn drop(&mut self) {
+        self.stop_timer();
+    }
+}
+
+/// System Settings > Accessibility > Display > Reduce motion.
+fn reduce_motion() -> bool {
+    NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+}
+
 impl Drop for StatusItem {
     fn drop(&mut self) {
         if let Some(monitor) = self.outside_monitor.take() {
             unsafe { NSEvent::removeMonitor(&monitor) };
         }
     }
-}
-
-/// Whether the menu bar is drawing on a dark background, from the button's
-/// own appearance: the menu bar over a pale wallpaper is light even in dark
-/// mode.
-fn is_dark(button: &NSStatusBarButton) -> bool {
-    let view: &NSView = button;
-    view.effectiveAppearance()
-        .name()
-        .to_string()
-        .contains("Dark")
 }
 
 fn flipped(frame: NSRect, flip_height: f64) -> ScreenRect {
@@ -341,16 +404,12 @@ mod tests {
     #[test]
     fn precedence() {
         let now = Instant::now();
-        let t0 = now - Duration::from_secs(7);
-        assert_eq!(
-            MenuBarState::from_snapshot(&snap(), now),
-            MenuBarState::Idle
-        );
+        assert_eq!(MenuBarState::from_snapshot(&snap()), MenuBarState::Idle);
 
         let mut s = snap();
         s.model = ModelStatus::Missing;
         assert_eq!(
-            MenuBarState::from_snapshot(&s, now),
+            MenuBarState::from_snapshot(&s),
             MenuBarState::NeedsAttention
         );
 
@@ -361,27 +420,23 @@ mod tests {
             started_at: chrono::Local::now(),
             mic_lost: false,
         });
-        assert_eq!(
-            MenuBarState::from_snapshot(&s, now),
-            MenuBarState::Meeting { elapsed_secs: 724 }
-        );
+        assert_eq!(MenuBarState::from_snapshot(&s), MenuBarState::Meeting);
 
-        s.dictation = DictationPhase::Recording {
-            since: t0,
-            hands_free: true,
-        };
-        assert_eq!(
-            MenuBarState::from_snapshot(&s, now),
-            MenuBarState::Recording {
-                elapsed_secs: 7,
-                hands_free: true
-            }
-        );
+        // Dictating during a meeting: the recording wins, push-to-talk and
+        // hands-free alike.
+        for hands_free in [false, true] {
+            s.dictation = DictationPhase::Recording {
+                since: now,
+                hands_free,
+            };
+            assert_eq!(MenuBarState::from_snapshot(&s), MenuBarState::Recording);
+        }
 
         s.dictation = DictationPhase::Transcribing;
-        assert_eq!(
-            MenuBarState::from_snapshot(&s, now),
-            MenuBarState::Transcribing
-        );
+        assert_eq!(MenuBarState::from_snapshot(&s), MenuBarState::Transcribing);
+
+        // Back to idle with the meeting still on: the pulse again.
+        s.dictation = DictationPhase::Idle;
+        assert_eq!(MenuBarState::from_snapshot(&s), MenuBarState::Meeting);
     }
 }

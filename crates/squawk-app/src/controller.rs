@@ -3,7 +3,7 @@
 //!
 //! A dictation, end to end:
 //! 1. `StartRecording` → `engine.start_dictation()` immediately and publish
-//!    `Recording` (the menu bar turns copper), then — while the user talks —
+//!    `Recording` (the menu bar glyph follows the mic), then — while the user talks —
 //!    read the front app and, if it is a terminal and `claude_code_mode` is
 //!    on, `context::detect` + `VocabCache::get`.
 //! 2. `EnterHandsFree` → publish `Recording { hands_free: true }`.
