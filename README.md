@@ -52,7 +52,8 @@ every build.
    same key. Quit them, or move their shortcut, before you start Squawk, or both will record.
 
 Screen & System Audio Recording is only needed for meetings, and is asked for the first time you
-record one.
+record one. Calendar access is asked for while the meeting heads-up is on (it is by default; see
+[Notetaker](#notetaker)).
 
 ## Using it
 
@@ -78,7 +79,9 @@ Text is cleaned up without a language model: fillers (um, uh, a comma-wrapped "y
 mean something stay ("I like Rust" keeps its "like").
 
 The popover (click the menu bar item) has your recent dictations (click one to copy it),
-meetings (click to open), and your dictionary.
+meetings (click to open), your dictionary, and the meeting settings. From the keyboard: ← and →
+switch tabs, ↑ and ↓ pick a row, return copies the dictation / opens the meeting / opens
+dictionary.txt, esc closes.
 
 ## Speed
 
@@ -125,7 +128,7 @@ Plain files, so you (and Claude) can read them directly.
 | `~/squawk/dictations/YYYY-MM-DD.md` | every dictation of the day, `## 14:03:12 · Ghostty · squawk` then the text |
 | `~/squawk/meetings/YYYY-MM-DD HHMM <title>.md` | one file per meeting: front matter, then `**You** 00:23:06` / `**Them**` blocks |
 | `~/squawk/dictionary.txt` | your words, one per line: `Kubernetes`, or `cloud code -> Claude Code` |
-| `~/.config/squawk/config.toml` | settings (every key commented with its default; edit a key under its existing `[section]`) |
+| `~/.config/squawk/config.toml` | settings (every key commented with its default; edit a key under its existing `[section]`; the Settings tab writes the `[meeting]` notetaker keys) |
 | `~/Library/Application Support/squawk/` | the model, the socket, `squawk.log` |
 
 The log has one line per dictation with its timings (never its text), e.g. `audio=20.4s
@@ -179,6 +182,45 @@ said at the same moment. Short answers like "Yes." are always kept. While a meet
 audio is ducked a little (about 8 dB, the least macOS allows). With headphones you can turn this
 off: `echo_cancellation = false` under `[meeting]`. Dictation never uses it.
 
+## Notetaker
+
+Squawk can notice meetings for you. The popover's **Settings** tab has four settings; each one
+is a key under `[meeting]` in `~/.config/squawk/config.toml`, and the tab writes the file (your
+comments and other keys stay as they are). Edit the file by hand if you prefer; the tab shows
+what the file says.
+
+| setting | key | default | choices |
+|---|---|---|---|
+| Heads-up before meetings | `heads_up_secs` | `15` | off (`-1`), at start (`0`), 15 s, 1 min, 5 min |
+| Detect calls | `detect_calls` | `true` | |
+| Maximum recording length | `max_minutes` | `120` | 30 min, 1 h, 2 h, 3 h, 4 h |
+| Stop when the call ends | `stop_when_call_ends` | `true` | |
+
+Questions come as a small panel under the menu bar icon, never as notifications, and never take
+focus from the call:
+
+- **Heads-up.** Shortly before a calendar event with other people on it or a call link (Zoom,
+  Meet, Teams, Webex…), not all-day, not declined: the title and time, **Record** or **Not now**.
+  Record starts a meeting named after the event. Needs Calendar access; macOS asks when this is
+  on. Only calendars that Calendar.app syncs are seen.
+- **Detect calls.** When Zoom, Microsoft Teams, FaceTime, Slack, Webex or Discord has used the
+  mic for 3 seconds, or a browser (Chrome, Firefox, Safari, Arc, Edge, Brave) has while one of
+  its windows is on Google Meet, Zoom, Teams, Webex, Whereby, Jitsi, Discord or Slack: "Call
+  detected in Zoom", **Start** or **Not now**. Start names the meeting after the calendar event
+  happening now, else "Zoom call". Not now (or no answer in 20 s) holds for the rest of
+  that call. Squawk itself and short mic uses (dictation apps, Siri) never count. Needs macOS
+  14.2 or later (Core Audio's per-process list); browser tabs are read by window title, which
+  uses the Accessibility access squawk already has.
+- **Maximum recording length.** Two minutes before, "Stopping in 2 min" with **Keep going +30
+  min**; then the meeting stops and saves as if you pressed ⌥M.
+- **Stop when the call ends.** A meeting follows the call it was started from, or the call app
+  that has the mic while it records (so ⌥M during a Zoom call counts). Once that app has let go
+  of the mic for 10 seconds, the meeting stops and saves, and "Saved notes · Weekly sync" offers
+  **Open**. A few seconds without the mic (switching to AirPods) is still the same call. Some
+  apps keep the mic after you leave; the maximum length is the backstop.
+
+The menu bar item stays as it is: no titles or countdowns there.
+
 ## Privacy
 
 - Speech never leaves your Mac. The only network request is the one-time model download.
@@ -191,8 +233,10 @@ off: `echo_cancellation = false` under `[meeting]`. Dictation never uses it.
 make run        # build Squawk.app and launch it
 make test       # cargo test --workspace
 make check      # fmt + clippy
-make preview    # the popover with fixture data (MODE=recording|meeting|downloading|permissions|…)
+make preview    # the popover with fixture data (MODE=recording|meeting|settings|panels|…)
 cargo run -p squawk-app --example menu_bar_preview   # every menu bar state at once
+cargo run -p squawk-app --example mic_probe          # which processes use the mic, as call detection sees them
+cargo run -p squawk-app --example mic_probe -- watch # the live watcher and notetaker, printing each prompt
 ```
 
 The workspace: `squawk-core` (config, files, cleanup, the fn state machine, IPC, Claude Code

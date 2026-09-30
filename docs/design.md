@@ -17,7 +17,7 @@ code is right and this file is stale.
 
 ```
 Cargo.toml                 workspace; shared deps in [workspace.dependencies]
-crates/squawk-core         lib   config, paths, store, dictionary, cleanup, pipeline, hotkey, ipc, status, text, context/
+crates/squawk-core         lib   config, config_edit, paths, store, dictionary, cleanup, pipeline, hotkey, ipc, status, text, context/, notetaker/
 crates/squawk-engine       lib   audio, segmenter, model, recognizer, dictation, meeting, system_audio
 crates/squawk-app          lib+bin "squawk-app", bundled as Squawk.app (LSUIElement)
 crates/squawk-cli          bin "squawk"
@@ -38,7 +38,7 @@ Three roots (`squawk_core::Paths`):
 | `~/squawk/dictations/YYYY-MM-DD.md` | one file per day of dictations | app | popover, CLI, TUI, Claude |
 | `~/squawk/meetings/YYYY-MM-DD HHMM <title>.md` | one file per meeting | engine (via `Store::write_meeting`) | popover, CLI, TUI, Claude |
 | `~/squawk/dictionary.txt` | the user's words | user, `squawk dict add`, Claude | app (every dictation, mtime-cached), CLI |
-| `~/.config/squawk/config.toml` | settings | user (app writes a commented default on first run) | app, CLI |
+| `~/.config/squawk/config.toml` | settings | user (app writes a commented default on first run); the Settings tab writes `[meeting]` notetaker keys | app, CLI |
 | `~/Library/Application Support/squawk/models/<dir>/` | the model | engine / `squawk model download` | engine |
 | `~/Library/Application Support/squawk/squawk.sock` | IPC socket | app | CLI |
 | `~/Library/Application Support/squawk/squawk.log` | log, one latency line per dictation | app, engine (via `log`) | people |
@@ -146,6 +146,10 @@ defaults plus a human note (`Config::load -> (Config, Option<String>)`) that the
 | `[meeting] system_audio` | `true` | record the other side as "Them" |
 | `[meeting] calendar_titles` | `true` | title from the current calendar event |
 | `[meeting] echo_cancellation` | `true` | echo-cancelled mic + drop "You" lines that repeat "Them" (see "Meetings: echo") |
+| `[meeting] heads_up_secs` | `15` (−1–3600; < 0 = off) | heads-up this long before a qualifying calendar event; 0 = at the start |
+| `[meeting] detect_calls` | `true` | offer notes when a call app starts using the mic |
+| `[meeting] max_minutes` | `120` (5–1440) | stop and save after this long, warning 2 min before |
+| `[meeting] stop_when_call_ends` | `true` | stop and save 10 s after the followed call app lets go of the mic |
 | `[model] dir` | `parakeet-tdt-0.6b-v3-int8` | directory under models/ |
 | `[model] url` | `https://blob.handy.computer/parakeet-v3-int8.tar.gz` | where to download it |
 | `[model] threads` | `0` | ORT intra-op threads, 0 = ORT decides |
@@ -167,8 +171,8 @@ optimise. **Never log dictated text** (privacy); lengths only.
 
 ## squawk-core
 
-`pub mod`: `cleanup`, `config`, `context`, `dictionary`, `error`, `hotkey`, `ipc`, `paths`,
-`pipeline`, `status`, `store`, `text`. Re-exports: `Config`, `Dictionary`, `Error`, `Result`,
+`pub mod`: `cleanup`, `config`, `config_edit`, `context`, `dictionary`, `error`, `hotkey`,
+`ipc`, `notetaker`, `paths`, `pipeline`, `status`, `store`, `text`. Re-exports: `Config`, `Dictionary`, `Error`, `Result`,
 `Paths`, `AppState`, `ModelStatus`, `Store`, `VERSION`.
 
 - `error::Error` — `Io`, `Config{path,message}`, `Json`, `NoHome`, `NotRunning(PathBuf)`, `Ipc(String)`.
@@ -195,8 +199,52 @@ optimise. **Never log dictated text** (privacy); lengths only.
 - `pipeline::finish(raw, &Dictionary, Option<&context::Context>, &CleanupOptions) -> String` —
   `strip` → `context::apply` → `Dictionary::apply` → `finalize`. Empty = paste nothing.
 - `store` — see Files.
+- `config_edit` — `set_value(text, table, key, value)` / `set_in_file(path, …)` (atomic temp +
+  rename) with `toml_edit`: comments, blank lines, order and unknown keys survive; a key that is
+  only there as a commented default (`# max_minutes = 120`) is uncommented in place; a missing
+  key is added to its table (created if needed). A file that does not parse is left alone.
 - `hotkey` — the state machine, below.
 - `ipc` — the protocol, below.
+- `notetaker` — the meeting helpers, below.
+
+### squawk-core::notetaker
+
+Pure; every rule is driven by explicit times (`Instant` for timers, `DateTime<Local>` for the
+calendar) so the tests use synthetic timestamps.
+
+- `calls` — `MicUser {pid, bundle_id, name}`; `classify(user, own_pid) -> Option<Source>`:
+  `Source::App(name)` for `CALL_APPS` (bundle id or a dotted prefix, so helpers count: Zoom,
+  Microsoft Teams, FaceTime (and `avconferenced`), Slack, Webex, Discord), `Source::Browser
+  {bundle_id, name}` for `BROWSERS` (Chrome/Arc/Edge/Brave helpers, Firefox, Safari's
+  `com.apple.WebKit.GPU` → Safari); own pid → `None`. `call_site(title)` names the call site in a
+  window title by whole words, case-sensitive ("Meet – abc-defg-hij" → Google Meet, "… |
+  Microsoft Teams", "Zoom Meeting"; "zoom in on photos" is nothing). `CallTracker::update(now,
+  active_apps) -> Vec<CallEvent>`: a call `Started` once an app has held the mic `MIN_USE` (3 s)
+  without a break (a shorter use is forgotten), `Ended` once it has let go for `END_AFTER` (10 s);
+  taking the mic back within that is the same call (`CallId`).
+- `heads_up` — `UpcomingEvent {key, title, start, end, all_day, other_attendees, video_link,
+  declined, cancelled}`; `is_meeting` (timed, not declined/cancelled, titled, other people or a
+  call link), `is_due(now, lead)` from `start − lead` until `start + LATE` (60 s), `due(events,
+  now, lead, done)` the soonest not yet offered; `has_video_link(texts)` (`VIDEO_HOSTS`).
+- `Notetaker` — `new(Settings)`, `set_settings`, `tick(now, wall, mic_apps, events) ->
+  Option<StopReason>`, `prompt() -> Option<&Prompt>`, `reply(Reply::{Accept, Dismiss}) ->
+  Outcome`, `meeting_started(now, title, Option<CallId>)`, `meeting_stopped()`, `saved(..)`,
+  `wants_mic()`, `wants_calendar()`. `Prompt::{HeadsUp, Call, StoppingSoon, Saved}`,
+  `Outcome::{Nothing, StartMeeting{title, fallback, call}, Extended, Open(path)}`,
+  `StopReason::{MaxLength, CallEnded(app)}`, `Setting::{HeadsUpSecs, DetectCalls, MaxMinutes,
+  StopWhenCallEnds}` (`key()`, `value()`, `apply()`). Rules:
+  - a started call with no meeting and `detect_calls` → `Prompt::Call` for 20 s (no answer =
+    Not now); each call is offered once; its end takes its prompt down;
+  - a meeting follows the call it was started from, else the call holding the mic when it
+    started, else the next call to start during it; that call's end → `StopReason::CallEnded`
+    when `stop_when_call_ends`;
+  - `max_length − 2 min` → `Prompt::StoppingSoon` (stays up); Accept adds 30 min and re-arms the
+    warning; `max_length` → `StopReason::MaxLength`; a changed setting applies to the running
+    meeting;
+  - heads-up only with no meeting, once per event, up until 60 s after the start (at least 30 s
+    on screen); Accept → `StartMeeting` with the event's title;
+  - `Saved` (after an automatic stop) for 8 s, Accept → `Open(path)`;
+  - the newest prompt replaces the one showing; starting a meeting clears it.
 
 ### squawk-core::context
 
@@ -498,8 +546,8 @@ do not commit copyrighted audio).
 Bundle: `Squawk.app`, executable `squawk-app`, `CFBundleIdentifier = com.gauthamv.squawk`,
 `LSUIElement = true`, `LSMinimumSystemVersion = 15.0`, `NSMicrophoneUsageDescription` ("Squawk
 listens while you hold fn and turns your speech into text, on this Mac."),
-`NSCalendarsFullAccessUsageDescription` + `NSCalendarsUsageDescription` ("Squawk names meeting
-notes after the calendar event happening now."). `scripts/bundle.sh` and a `Makefile` (`run`,
+`NSCalendarsFullAccessUsageDescription` + `NSCalendarsUsageDescription` ("Squawk offers to take
+notes just before a meeting starts and names the notes after the event."). `scripts/bundle.sh` and a `Makefile` (`run`,
 `install`, `test`, `check`, `bundle`). Signing uses a stable identity from the keychain if there
 is one (Developer ID preferred, `CODESIGN_IDENTITY` overrides), else ad-hoc — sign with hardened runtime **and an entitlements file with
 `com.apple.security.device.audio-input`**, or the mic is silently denied. A stable signature also
@@ -553,6 +601,18 @@ One thread; owns `Engine`, the live `DictationSession`, the live `MeetingHandle`
   tap `set_timings`.
 - Engine `Model(status)` → snapshot. `MicLost` for the live session → finish and paste what was
   captured, then `last_error`. `MeetingMicLost` → "mic lost" on the meeting header line.
+- Notetaker: the loop waits with `recv_timeout(1 s)` and ticks the `Notetaker` at least once a
+  second (and on every `MicCalls`) with the call apps last reported by `mic_watch` and the
+  calendar's events (`calendar::upcoming_events`, re-read every 30 s while the heads-up is on). A
+  `StopReason` → the usual stop path; when the file is saved, `Notetaker::saved` puts up "Saved
+  notes". `Prompt(Reply)` → `Notetaker::reply` → start a meeting (title: the event's, else the
+  current calendar event, else the fallback, e.g. "Zoom call") / open the file. Every meeting
+  start (⌥M, popover, IPC, prompt) calls `meeting_started`, every stop `meeting_stopped`.
+  `SetSetting(Setting)` → `config_edit::set_in_file(config, "meeting", key, value)` then the
+  normal reload. The mic watcher starts once `detect_calls` or `stop_when_call_ends` is on (and
+  then runs for the app's life; samples are ignored while both are off); Calendar access is
+  requested (in the background) the first time the heads-up is on and access is undetermined.
+  `Snapshot` carries `meeting_config`, `prompt` and `calendar_access`.
 
 ### Paste (paste.rs)
 
@@ -577,7 +637,68 @@ needs-attention > idle):
 | `Meeting{elapsed_secs}` | `● 12:04` in copper |
 
 Copper: `#bb8669` on a dark menu bar, `#a16135` on a light one (read the button's
-`effectiveAppearance`). Everything else monochrome.
+`effectiveAppearance`). Everything else monochrome. The item never shows text beyond these
+timers: no meeting titles, no countdowns.
+
+### Prompt panel (ui/panel.rs)
+
+The notetaker's questions, as a 292 × 84 px `WindowKind::PopUp` (a non-activating NSPanel at pop-up
+level, joining all Spaces and shown over full-screen apps), opened with `focus: false` so it never
+takes focus from the call, centred under the item like the popover (`placement(.., width)`).
+main.rs opens it while `snapshot.prompt` is `Some` and the popover is closed (the popover opening
+takes it down; the 250 ms timer brings it back when the popover closes), updates it in place
+when the prompt changes, and sends button presses as `Command::Prompt(Reply)`. Same material
+and ink as the popover: one medium title line, one muted line, one or two small bordered
+buttons (the first semibold). `panel_text(&Prompt)` is the pure wording:
+
+| prompt | title | line | buttons |
+|---|---|---|---|
+| `HeadsUp` | event title | `15:00–15:30` | Record · Not now |
+| `Call` | Call detected in Zoom | Start notes? | Start · Not now |
+| `StoppingSoon` | Stopping in 2 min | Weekly sync · 2 h limit | Keep going +30 min |
+| `Saved` | Saved notes · Weekly sync | 42:10 · the call ended | Open |
+
+### Call detection (mic_watch.rs)
+
+Thin Core Audio bindings (raw FFI; macOS 14.2+): `kAudioHardwarePropertyProcessObjectList`,
+and per process object `kAudioProcessPropertyIsRunningInput`, `…PID`, `…BundleID` (plus
+`proc_name` for daemons without a bundle id). `input_processes()` lists every process with input
+running; `call_apps_among(users, own_pid)` classifies them (`notetaker::calls`), reading a
+browser's window titles through Accessibility (`AXWindows` → `AXTitle` of every window of every
+running instance) only when a browser is the one using the mic. `MicWatcher::start(own_pid,
+on_change)` runs one thread woken by listener blocks on the process list, the device list, each
+process's running-input property and each device's `kAudioDevicePropertyDeviceIsRunningSomewhere`
+(the per-process property alone did not notify when a new process started its input; the
+device one does). While a call app or a browser holds the mic it re-reads every second (a tab
+title can change without the mic changing); otherwise it sleeps until woken (30 s safety poll).
+`on_change` gets the sorted call-app names, only when they change. "Hey Siri" (`corespeechd`)
+holds input much of the time and is never a call.
+
+Measured on this Mac (macOS 15.8) with `examples/mic_probe.rs`: `ffmpeg -f avfoundation -i :0`
+showed up as `pid … bundle "" name "ffmpeg"` within the 0.5 s poll and was gone when it exited; a
+separate Chrome instance on a local page titled "Meet – abc-defg-hij" holding the mic through
+`getUserMedia` showed up as `com.google.Chrome.helper` (Google Chrome Helper) with the window
+title "Meet – abc-defg-hij - Google Chrome" → Google Meet; Firefox Developer Edition used the mic
+from its main process (`org.mozilla.firefoxdeveloperedition`), title "Meet – abc-defg-hij".
+`mic_probe watch` (the watcher and a `Notetaker`) with the page taking the mic for 2 s, letting go
+for 6 s, holding it 20 s, letting go 5 s, holding 8 s: the 2 s use was ignored, the call prompt
+came 3.2 s into the 20 s hold, the 5 s gap stayed the same call, and the stop came 10 s after
+the last release.
+
+### Settings tab (ui/settings.rs)
+
+Rows (`settings::rows(&MeetingConfig, calendar_access)`, pure): a "Meetings" caption, then
+label + muted line + control — Heads-up before meetings (pop-up: Off / At start / 15 s / 1 min /
+5 min), Detect calls (switch), Maximum recording length (pop-up: 30 min / 1 h / 2 h / 3 h / 4 h),
+Stop when the call ends (switch) — a hairline, and "Edit config.toml" (muted, "Dictation, model"
+on the right) which opens the file. A value off the menu (hand-edited `max_minutes = 90`) shows
+as "1 h 30 min" with nothing checked. With the heads-up on and Calendar refused, its line
+becomes "Needs Calendar access · Open Settings" (opens `Pane::Calendars`). Pop-ups are a
+bordered value + ▾ that opens a small opaque menu (`deferred(anchored())`, check on the current
+value; outside click or Esc closes it). Switches are 28 × 16 monochrome pills. A change is shown
+at once (applied to the popover's copy of the snapshot) and emitted as
+`PopoverEvent::SetSetting`; the controller writes the file and reloads, and the next snapshot
+carries what the file says. Nothing here reads files in render.
 
 ### Popover (ui/)
 
@@ -586,20 +707,24 @@ Header: one state line ("Ready · fn to talk"; "Recording 0:07"; "Meeting · Wee
 first-run: "Downloading model 42%" with a hairline progress bar, "Needs Accessibility" / "Needs
 Microphone" with an "Open Settings" button (`permissions::open_pane`); plus the config note or last
 error as a muted line). A one-time hint line until dismissed: "Set Keyboard › Press 🌐 key to › Do
-nothing" (button opens `Pane::Keyboard`). Tabs: **History | Meetings | Dictionary** (text tabs,
-selected in primary ink). History: the 50 most recent dictations; row = "app · project" left, time
+nothing" (button opens `Pane::Keyboard`). Tabs: **History | Meetings | Dictionary | Settings**
+(text tabs, selected in primary ink). History: the 50 most recent dictations; row = "app · project" left, time
 right, then the text clamped to 2 lines; click copies ("Copied" flashes). Meetings: title, "Sep 29
 14:00 · 42:10" (and "recording" for the live one); click opens the file (`open`). Dictionary: the
-entries; "Edit" opens dictionary.txt. Footer: "Record meeting ⌥M" / "Stop meeting ⌥M" and
-"Settings" (opens config.toml). Esc closes. `examples/popover_preview.rs` renders it with fixture
+entries; "Edit" opens dictionary.txt. Settings: see "Settings tab". Footer: "Record meeting ⌥M"
+/ "Stop meeting ⌥M". Keys (`ui::nav`, pure and tested): ← → switch tabs (wrapping), ↑ ↓ move a
+selection (the hover wash) through History, Meetings or Dictionary and scroll it into view,
+Enter copies the dictation / opens the meeting / opens dictionary.txt, Esc closes an open
+pop-up menu, else the popover. No ⌘-number or Tab shortcuts, and no hints on screen. `examples/popover_preview.rs` renders it with fixture
 data (generic names, `you@example.com` if an email is ever needed).
 
 ### Permissions (permissions.rs)
 
 Accessibility (`AXIsProcessTrusted`; the tap failing to create is the real test), Microphone
 (`AVCaptureDevice authorizationStatusForMediaType: AVMediaTypeAudio`), Screen & System Audio
-Recording (`CGPreflightScreenCaptureAccess`, checked only when a meeting with system audio starts).
-Panes: `Pane::url()`.
+Recording (`CGPreflightScreenCaptureAccess`, checked only when a meeting with system audio starts),
+Calendars (`calendar::access()`, EventKit full access; asked only while the heads-up is on, or on
+the first meeting for its title). Panes: `Pane::url()`.
 
 ### Tests
 
@@ -688,7 +813,7 @@ test fixtures use generic names and `you@example.com`. `.gitignore` covers `targ
   in the background and is titled "Meeting" (a prompt must not delay the recording).
 - The popover is a fixed 480 px tall with a scrolling list (tabs never make the window
   jump). The footer also has "Launch at login" and "Quit Squawk". Opening the popover re-reads
-  config.toml if its mtime changed, so edits from "Settings" apply without a relaunch.
+  config.toml if its mtime changed, so edits from "Edit config.toml" apply without a relaunch.
 - `squawk-app/build.rs` adds the `/usr/lib/swift` rpath (see the Swift runtime note above).
 - `RepoVocab` gained a private lookup index (built by `build`, or lazily), so it
   can no longer be written as a struct literal outside core: use `RepoVocab::build(cwd)` or the new
