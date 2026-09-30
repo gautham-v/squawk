@@ -1,14 +1,13 @@
 //! `squawk` — the command line and TUI.
 //!
-//! OWNED BY THE CLI AGENT. The command surface below is the contract in
-//! SPEC.md ("squawk-cli"); handlers are stubs until implemented.
-//!
 //! Commands that read files (`last`, `history`, `meet list`, `dict`) work
 //! without the app running. Commands that need the running app (`status`,
 //! `meet start`, `meet stop`) go through the socket and say so plainly when
 //! it is not running.
 
 mod commands;
+mod format;
+mod system;
 mod tui;
 
 use clap::{Parser, Subcommand};
@@ -50,6 +49,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Make the running app re-read config.toml.
+    Reload,
     /// The dictionary (~/squawk/dictionary.txt).
     Dict {
         #[command(subcommand)]
@@ -107,8 +108,38 @@ enum ModelCommand {
     Download,
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
     let cli = Cli::parse();
+    let code = match run(cli) {
+        Ok(()) => 0,
+        Err(e) => match e.downcast::<commands::Exit>() {
+            Ok(exit) => {
+                eprintln!("{}", exit.message);
+                exit.code
+            }
+            Err(e) => {
+                eprintln!("squawk: {}", message(&e));
+                1
+            }
+        },
+    };
+    std::process::exit(code);
+}
+
+/// The error and its causes, "a: b: c", without the repeats a transparent
+/// wrapper adds (an io error wrapped once shows its text twice otherwise).
+fn message(e: &anyhow::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for cause in e.chain() {
+        let text = cause.to_string();
+        if parts.last().is_none_or(|p| !p.ends_with(&text)) {
+            parts.push(text);
+        }
+    }
+    parts.join(": ")
+}
+
+fn run(cli: Cli) -> anyhow::Result<()> {
     let env = commands::Env::load()?;
     match cli.command {
         None => tui::run(&env),
@@ -120,6 +151,7 @@ fn main() -> anyhow::Result<()> {
             MeetCommand::List { n } => commands::meet_list(&env, n),
         },
         Some(Command::Status { json }) => commands::status(&env, json),
+        Some(Command::Reload) => commands::reload(&env),
         Some(Command::Dict { command }) => match command {
             DictCommand::Add { phrase } => commands::dict_add(&env, &phrase.join(" ")),
             DictCommand::List => commands::dict_list(&env),
@@ -137,6 +169,13 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn error_chain_without_repeats() {
+        let io = std::io::Error::other("disk full");
+        let e = anyhow::Error::new(squawk_core::Error::Io(io)).context("writing the day file");
+        assert_eq!(message(&e), "writing the day file: disk full");
+    }
 
     #[test]
     fn cli_is_well_formed() {
