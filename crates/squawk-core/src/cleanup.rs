@@ -49,6 +49,27 @@ const SET_OFF_FILLERS: &[&[&str]] = &[
 /// Words that open a dictation without meaning anything.
 const LEADING_FILLERS: &[&str] = &["so", "basically"];
 
+/// Words that open a clause. A bare leading "so" is a filler only before
+/// one of these ("So I think…", "So the build…", "So run the tests…");
+/// before anything else it is an adverb or intensifier that carries meaning
+/// ("So far so good", "So many tests", "So much for that"). Pronouns,
+/// determiners, question words, auxiliaries, connectives, and the
+/// imperatives people use to talk to an agent.
+#[rustfmt::skip]
+const CLAUSE_OPENERS: &[&str] = &[
+    "i", "i'm", "i've", "i'd", "i'll", "we", "we're", "we've", "we'd", "we'll", "you", "you're",
+    "you've", "you'd", "you'll", "he", "he's", "she", "she's", "it", "it's", "they", "they're",
+    "they've", "there", "there's", "here", "here's", "this", "these", "those", "that's", "the",
+    "a", "an", "my", "our", "your", "their", "his", "her", "what", "what's", "how", "why", "when",
+    "where", "which", "who", "if", "now", "then", "can", "could", "should", "would", "will", "do",
+    "does", "did", "is", "are", "was", "were", "basically", "anyway", "yeah", "okay", "ok", "well",
+    "actually", "also", "just", "maybe", "please", "first", "next", "once", "after", "before",
+    "in", "for", "with", "let's", "let", "ask", "run", "check", "add", "make", "fix", "try", "go",
+    "look", "use", "write", "read", "update", "change", "remove", "delete", "move", "rename",
+    "create", "build", "test", "open", "find", "show", "tell", "give", "keep", "put", "set",
+    "start", "stop", "commit", "push", "pull", "merge", "refactor", "revert", "clean", "wait",
+];
+
 /// Doubled on purpose often enough that a repeat is not a stutter.
 const DOUBLE_OK: &[&str] = &[
     "that", "had", "is", "do", "very", "really", "no", "yes", "yeah", "bye", "ha", "haha", "so",
@@ -183,9 +204,16 @@ fn remove_leading_fillers(chunks: &mut Vec<Chunk>) {
             return;
         }
         // "So," always goes. A bare "So" goes only when enough follows that
-        // it cannot be the point ("So what?" stays, "So I think we should" loses it).
+        // it cannot be the point ("So what?" stays, "So I think we should"
+        // loses it), and a bare "so" only before a clause opener ("So far
+        // so good" stays).
         let words_after = chunks.len() - 1;
-        let removable = first.trail == "," || (first.trail.is_empty() && words_after >= 3);
+        let opens_clause = first.key() != "so"
+            || chunks
+                .get(1)
+                .is_some_and(|next| CLAUSE_OPENERS.contains(&next.key().as_str()));
+        let removable =
+            first.trail == "," || (first.trail.is_empty() && words_after >= 3 && opens_clause);
         if !removable {
             return;
         }
@@ -375,6 +403,23 @@ mod tests {
         assert_eq!(c("Um, so, basically, it works."), "It works.");
         // Only at the start.
         assert_eq!(c("I did so much."), "I did so much.");
+        assert_eq!(
+            c("So the build is broken again."),
+            "The build is broken again."
+        );
+    }
+
+    #[test]
+    fn a_leading_so_that_means_something_stays() {
+        assert_eq!(
+            c("So far so good, let's ship it"),
+            "So far so good, let's ship it."
+        );
+        assert_eq!(
+            c("So many tests are failing now"),
+            "So many tests are failing now."
+        );
+        assert_eq!(c("so much for that idea"), "So much for that idea.");
         assert_eq!(c("It is basically done."), "It is basically done.");
     }
 
