@@ -121,6 +121,13 @@ pub const ROW_PAD_X: Pixels = px(10.);
 pub const ROW_PAD_Y: Pixels = px(3.0);
 /// Vertical padding inside a list row (two-line History entries).
 pub const LIST_ROW_PAD_Y: Pixels = px(5.0);
+/// Vertical padding inside a one-line Dictionary row.
+pub const DICT_ROW_PAD_Y: Pixels = px(3.0);
+/// Space either side of a replacement's arrow.
+pub const ARROW_GAP: Pixels = px(6.);
+/// How much faster a replacement's spoken side gives up width than its
+/// written side when the line is too long for both.
+pub const SPOKEN_SHRINK: f32 = 3.0;
 /// Corner radius of a row's hover wash.
 pub const ROW_RADIUS: Pixels = px(6.);
 /// The gap between the tabs.

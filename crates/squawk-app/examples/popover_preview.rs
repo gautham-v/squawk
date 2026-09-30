@@ -3,8 +3,12 @@
 //!
 //! ```text
 //! cargo run -p squawk-app --example popover_preview -- \
-//!     ready|meetings|dictionary|recording|meeting|downloading|permissions|empty
+//!     ready|meetings|dictionary|recording|meeting|downloading|permissions|empty \
+//!     [light|dark|system] [end]
 //! ```
+//!
+//! The optional second argument forces the appearance (by default the
+//! window follows the system); `end` scrolls the list to its bottom.
 
 use std::time::{Duration, Instant};
 
@@ -67,7 +71,30 @@ fn fixture_data() -> PopoverData {
             text: "Look at @src/audio.rs and tell me why the first segment is always empty.".into(),
         },
     ];
-    let meetings = vec![
+    // Enough rows that the list has to scroll.
+    let mut history = history;
+    let older = [
+        ("Mail", None, "Sounds good, see you Thursday."),
+        ("Ghostty", Some("demo-app"), "Run the tests again with the verbose flag and paste me the first failure."),
+        ("Notes", None, "Groceries: oat milk, lemons, rice, the good bread."),
+        ("Slack", None, "I pushed the fix, can you take a look when you get a minute? It should unblock the release."),
+        ("Ghostty", Some("squawk"), "Rename the helper to something that says what it does."),
+        ("Safari", None, "How long does a cast iron pan take to season in the oven?"),
+        ("Ghostty", Some("demo-app"), "Add a retry with exponential backoff around the upload, capped at five attempts."),
+        ("Messages", None, "On my way."),
+        ("Mail", None, "Attaching the notes from today's review. The open questions are at the bottom."),
+        ("Ghostty", Some("squawk"), "Why does the popover clip the dictionary rows? Find the root cause first."),
+    ];
+    let two_days_ago = today - chrono::Days::new(2);
+    for (i, (app, project, text)) in older.iter().enumerate() {
+        history.push(DictationEntry {
+            at: at(two_days_ago, 18 - i as u32, 30),
+            app: (*app).into(),
+            project: project.map(Into::into),
+            text: (*text).into(),
+        });
+    }
+    let mut meetings = vec![
         MeetingSummary {
             path: "/tmp/2026-09-29 1400 Weekly sync.md".into(),
             title: "Weekly sync".into(),
@@ -85,14 +112,62 @@ fn fixture_data() -> PopoverData {
             snippet: String::new(),
         },
     ];
-    let dictionary = vec![
-        Entry::Term("Kubernetes".into()),
-        Entry::Term("ChatGPT".into()),
-        Entry::Replace {
-            from: "cloud code".into(),
-            to: "Claude Code".into(),
-        },
-    ];
+    for (i, title) in [
+        "Standup",
+        "Roadmap planning for the next two quarters with the whole team",
+        "1:1",
+        "Customer call",
+        "Retro",
+        "Interview debrief",
+        "Architecture review",
+        "Standup",
+        "Launch readiness",
+    ]
+    .iter()
+    .enumerate()
+    {
+        meetings.push(MeetingSummary {
+            path: format!("/tmp/meeting-{i}.md").into(),
+            title: (*title).into(),
+            started_at: Local
+                .with_ymd_and_hms(2026, 9, 27 - i as u32, 10, 0, 0)
+                .earliest(),
+            length_secs: 900 + 300 * i as u64,
+            in_progress: false,
+            snippet: String::new(),
+        });
+    }
+    let dictionary = [
+        "Kubernetes",
+        "ChatGPT",
+        "cloud code -> Claude Code",
+        "gee pee tee five -> GPT-5",
+        "PostgreSQL",
+        "post gress -> Postgres",
+        "Tailscale",
+        "WezTerm",
+        "Ghostty",
+        "someone dot example at example dot com -> someone.example@example.com",
+        "type script -> TypeScript",
+        "Grafana",
+        "next js -> Next.js",
+        "Anthropic",
+        "the quick brown fox jumps over the lazy dog every single morning -> The quick brown fox jumps over the lazy dog",
+        "Terraform",
+        "rust up -> rustup",
+        "Figma",
+        "open telemetry -> OpenTelemetry",
+        "Supabase",
+        "git hub -> GitHub",
+        "Hugging Face",
+        "llama cpp -> llama.cpp",
+        "Kafka",
+        "a very long plain term that keeps going well past the edge of the popover",
+        "web socket -> WebSocket",
+    ]
+    .iter()
+    .filter_map(|line| Entry::parse(line))
+    .collect();
     PopoverData {
         history,
         meetings,
@@ -143,8 +218,14 @@ fn snapshot(mode: &str) -> Snapshot {
 
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_else(|| "ready".into());
+    let appearance = std::env::args().nth(2);
+    let scroll_to_end = std::env::args().nth(3).as_deref() == Some("end");
 
     Application::new().run(move |cx: &mut App| {
+        match appearance.as_deref() {
+            None | Some("system") => {}
+            Some(name) => force_appearance(name),
+        }
         popover::bind_keys(cx);
         let bounds = Bounds {
             origin: point(px(120.), px(120.)),
@@ -185,10 +266,30 @@ fn main() {
                 })
                 .detach();
                 window.focus(&popover.focus_handle(cx));
+                if scroll_to_end {
+                    popover.update(cx, |popover, cx| popover.scroll_to_end(cx));
+                }
                 cx.new(|_| Preview { popover })
             },
         )
         .expect("open preview window");
         cx.activate(true);
     });
+}
+
+/// Set the whole app's appearance, so a light or dark screenshot does not
+/// need the system setting flipped.
+fn force_appearance(name: &str) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{
+        NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
+    };
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let named = match name {
+        "light" => unsafe { NSAppearanceNameAqua },
+        "dark" => unsafe { NSAppearanceNameDarkAqua },
+        other => panic!("appearance is light or dark, not {other}"),
+    };
+    let appearance = NSAppearance::appearanceNamed(named);
+    NSApplication::sharedApplication(mtm).setAppearance(appearance.as_deref());
 }

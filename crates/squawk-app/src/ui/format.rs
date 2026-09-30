@@ -137,6 +137,17 @@ pub fn meeting_action(recording: bool) -> &'static str {
 /// The meeting shortcut, as the footer shows it.
 pub const MEETING_SHORTCUT: &str = "⌥M";
 
+/// Between the spoken and the written side of a dictionary replacement.
+pub const REPLACE_ARROW: &str = "→";
+
+/// The count beside "Edit dictionary.txt".
+pub fn dictionary_count(entries: usize) -> String {
+    match entries {
+        1 => "1 entry".to_string(),
+        n => format!("{n} entries"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,6 +168,12 @@ mod tests {
             screen_recording: None,
         };
         s
+    }
+
+    #[test]
+    fn dictionary_count_is_singular_for_one() {
+        assert_eq!(dictionary_count(1), "1 entry");
+        assert_eq!(dictionary_count(26), "26 entries");
     }
 
     #[test]

@@ -12,8 +12,9 @@
 //!   primary ink);
 //! - body (scrolls): History = the 50 most recent dictations, "app ·
 //!   project" and time, then the text clamped to 2 lines; click copies.
-//!   Meetings = title, date · length; click opens the file. Dictionary = the
-//!   entries, "Edit dictionary.txt" opens the file;
+//!   Meetings = title, date · length; click opens the file. Dictionary =
+//!   "Edit dictionary.txt" pinned above the list (opens the file), then one
+//!   line per entry, a replacement as "spoken → written";
 //! - footer: Record meeting ⌥M, Settings (config.toml), Launch at login,
 //!   Quit.
 //!
@@ -28,8 +29,8 @@ use chrono::Local;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     actions, div, px, relative, App, Context, Div, EventEmitter, FocusHandle, Focusable,
-    FontWeight, InteractiveElement, IntoElement, KeyBinding, ParentElement, Render, Rgba,
-    SharedString, StatefulInteractiveElement, Styled, Window,
+    FontWeight, InteractiveElement, IntoElement, KeyBinding, ParentElement, Point, Render, Rgba,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window,
 };
 use squawk_core::dictionary::{Dictionary, Entry, DICTIONARY_HEADER};
 use squawk_core::store::{DictationEntry, MeetingSummary};
@@ -137,6 +138,9 @@ pub struct Popover {
     /// Whether the fn key is set to something that fights squawk.
     fn_hint: bool,
     login_error: Option<SharedString>,
+    /// The list's scroll position: back to the top on open and on a tab
+    /// switch, so the newest entries are what shows.
+    list_scroll: ScrollHandle,
     theme: Theme,
     appearance: Option<gpui::Subscription>,
 }
@@ -154,6 +158,7 @@ impl Popover {
             copied: None,
             fn_hint: false,
             login_error: None,
+            list_scroll: ScrollHandle::new(),
             theme: Theme::default(),
             appearance: None,
         }
@@ -184,6 +189,7 @@ impl Popover {
     pub fn reset(&mut self, cx: &mut Context<Self>) {
         self.copied = None;
         self.login_error = None;
+        self.scroll_to_top();
         self.reload(cx);
         if !self.live_files {
             return;
@@ -234,7 +240,21 @@ impl Popover {
     }
 
     fn select(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        if tab != self.tab {
+            self.scroll_to_top();
+        }
         self.tab = tab;
+        cx.notify();
+    }
+
+    fn scroll_to_top(&self) {
+        self.list_scroll.set_offset(Point::default());
+    }
+
+    /// Scroll the list to its end (the preview uses it to show the bottom
+    /// of a long list).
+    pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
+        self.list_scroll.scroll_to_bottom();
         cx.notify();
     }
 
@@ -445,24 +465,37 @@ impl Popover {
             }))
     }
 
+    /// The tab's list. It takes whatever height is left between the tabs
+    /// and the footer and scrolls inside it; a tab may pin a row above the
+    /// scrolling part (Dictionary's "Edit dictionary.txt").
     fn body(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let rows: Vec<gpui::AnyElement> = match self.tab {
-            Tab::History => self.history_rows(cx),
-            Tab::Meetings => self.meeting_rows(cx),
-            Tab::Dictionary => self.dictionary_rows(cx),
+        let (pinned, rows): (Option<gpui::AnyElement>, Vec<gpui::AnyElement>) = match self.tab {
+            Tab::History => (None, self.history_rows(cx)),
+            Tab::Meetings => (None, self.meeting_rows(cx)),
+            Tab::Dictionary => (Some(self.dictionary_edit_row(cx)), self.dictionary_rows()),
         };
         div()
-            .id("list")
             .flex()
             .flex_col()
             .flex_1()
             .min_h(px(0.))
-            .overflow_y_scroll()
-            .children(rows)
+            .children(pinned)
+            .child(
+                div()
+                    .id("list")
+                    .track_scroll(&self.list_scroll)
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .children(rows),
+            )
     }
 
     fn empty(&self, line: &'static str) -> gpui::AnyElement {
         div()
+            .flex_shrink_0()
             .px(theme::ROW_PAD_X)
             .py(theme::LIST_ROW_PAD_Y)
             .text_size(theme::TEXT_SMALL)
@@ -560,30 +593,83 @@ impl Popover {
             .collect()
     }
 
-    fn dictionary_rows(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+    /// "Edit dictionary.txt", with the count on the right. Pinned above
+    /// the list so it stays in reach however long the dictionary gets.
+    fn dictionary_edit_row(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = self.theme;
-        let mut rows = vec![list_row(theme, "dictionary-edit".into())
-            .on_click(cx.listener(|this, _, _, cx| this.edit_dictionary(cx)))
+        let count = self.data.dictionary.len();
+        div()
+            .id("dictionary-edit")
+            .flex()
+            .flex_row()
+            .flex_shrink_0()
+            .justify_between()
+            .items_center()
+            .px(theme::ROW_PAD_X)
+            .py(theme::LIST_ROW_PAD_Y)
+            .rounded(theme::ROW_RADIUS)
             .text_size(theme::TEXT_SMALL)
             .line_height(theme::LINE_SMALL)
             .text_color(theme.secondary)
+            .cursor_pointer()
+            .hover(move |s| s.bg(theme.hover).text_color(theme.text))
+            .on_click(cx.listener(|this, _, _, cx| this.edit_dictionary(cx)))
             .child("Edit dictionary.txt")
-            .into_any_element()];
+            .when(count > 0, |el| {
+                el.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_size(theme::TEXT_TINY)
+                        .line_height(theme::LINE_TINY)
+                        .text_color(theme.tertiary)
+                        .child(format::dictionary_count(count)),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// One line per entry: a term as it is written, a replacement as the
+    /// spoken side (muted), an arrow, and the written side. Either side
+    /// ends in an ellipsis when the line runs out of room.
+    fn dictionary_rows(&self) -> Vec<gpui::AnyElement> {
         if self.data.dictionary.is_empty() {
-            rows.push(self.empty(EMPTY_DICTIONARY));
-            return rows;
+            return vec![self.empty(EMPTY_DICTIONARY)];
         }
-        rows.extend(self.data.dictionary.iter().map(|entry| {
-            div()
-                .px(theme::ROW_PAD_X)
-                .py(px(2.))
-                .text_size(theme::TEXT_SMALL)
-                .line_height(theme::LINE_SMALL)
-                .truncate()
-                .child(entry.to_line())
+        let theme = self.theme;
+        self.data
+            .dictionary
+            .iter()
+            .map(|entry| {
+                let row = div()
+                    .flex()
+                    .flex_row()
+                    .flex_shrink_0()
+                    .items_center()
+                    .gap(theme::ARROW_GAP)
+                    .px(theme::ROW_PAD_X)
+                    .py(theme::DICT_ROW_PAD_Y)
+                    .text_size(theme::TEXT_SMALL)
+                    .line_height(theme::LINE_SMALL);
+                match entry {
+                    Entry::Term(term) => row.child(clipped(term.clone())),
+                    Entry::Replace { from, to } => {
+                        // The written side is the one that matters, so the
+                        // spoken side gives up its width first.
+                        let mut spoken = clipped(from.clone()).text_color(theme.secondary);
+                        spoken.style().flex_shrink = Some(theme::SPOKEN_SHRINK);
+                        row.child(spoken)
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(theme.tertiary)
+                                    .child(format::REPLACE_ARROW),
+                            )
+                            .child(clipped(to.clone()))
+                    }
+                }
                 .into_any_element()
-        }));
-        rows
+            })
+            .collect()
     }
 
     fn footer(&self, cx: &mut Context<Self>) -> Div {
@@ -637,12 +723,15 @@ impl Popover {
     }
 }
 
-/// A clickable two-line row in the scrolling list.
+/// A clickable two-line row in the scrolling list. `flex_shrink_0`: the
+/// list scrolls, so a row keeps its full height instead of being squeezed
+/// to fit.
 fn list_row(theme: Theme, id: SharedString) -> gpui::Stateful<Div> {
     div()
         .id(id)
         .flex()
         .flex_col()
+        .flex_shrink_0()
         .gap(px(1.))
         .px(theme::ROW_PAD_X)
         .py(theme::LIST_ROW_PAD_Y)
@@ -675,6 +764,23 @@ fn menu_row(
             el.cursor_pointer().hover(move |s| s.bg(theme.hover))
         })
         .child(label)
+}
+
+/// One line of text that may give up width to its neighbours in a row and
+/// ends in an ellipsis when it does.
+///
+/// Not `truncate()`: that sets `white-space: nowrap`, and gpui 0.2 caches a
+/// nowrap text's first measurement — taken at max-content while the flex
+/// row sizes its items — so the text never learns its final width and is
+/// clipped mid-letter with no ellipsis. A one-line clamp keeps wrapping on,
+/// which re-measures at the width the row settles on.
+fn clipped(text: String) -> Div {
+    div()
+        .min_w(px(0.))
+        .overflow_hidden()
+        .text_ellipsis()
+        .line_clamp(1)
+        .child(text)
 }
 
 fn note(theme: Theme, message: SharedString) -> impl IntoElement {
