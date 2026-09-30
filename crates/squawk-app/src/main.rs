@@ -33,8 +33,9 @@ const SCREEN_MARGIN: f32 = 8.0;
 const TOGGLE_GRACE: Duration = Duration::from_millis(250);
 /// The popover never gets shorter than this, however little room there is.
 const MIN_POPOVER_HEIGHT: f32 = 200.0;
-/// How often the menu bar timer is re-checked while it is counting. Under a
-/// second, so the seconds tick over on time rather than up to a second late.
+/// How often an open popover's header clock is re-checked while it is
+/// counting. Under a second, so the seconds tick over on time rather than up
+/// to a second late.
 const REDRAW_EVERY: Duration = Duration::from_millis(250);
 /// How often a refused event tap is retried (Accessibility granted later
 /// takes effect without a relaunch).
@@ -115,8 +116,11 @@ fn main() {
             .detach();
         }
 
+        let level = engine.input_level();
         let (item, mut clicks) =
-            StatusItem::new(mtm, MenuBarState::from_snapshot(&initial, Instant::now()));
+            StatusItem::new(mtm, MenuBarState::from_snapshot(&initial), move || {
+                level.rms()
+            });
         let item = Rc::new(item);
         let current = Rc::new(RefCell::new(initial.clone()));
         let popover = cx.new(|cx| Popover::new(initial, cx));
@@ -129,7 +133,7 @@ fn main() {
             let current = current.clone();
             cx.spawn(async move |cx| {
                 while let Some(snapshot) = snaps.next().await {
-                    item.set_state(mtm, MenuBarState::from_snapshot(&snapshot, Instant::now()));
+                    item.set_state(mtm, MenuBarState::from_snapshot(&snapshot));
                     *current.borrow_mut() = snapshot.clone();
                     let updated = cx.update(|cx| {
                         popover.update(cx, |p, cx| p.set_snapshot(snapshot, cx));
@@ -142,20 +146,21 @@ fn main() {
             .detach();
         }
 
-        // The timers: the item redraws only when its text changes, and an
-        // open popover repaints its header clock.
+        // An open popover repaints its header clock while a recording or a
+        // meeting is counting. (The menu bar item animates on its own timer.)
         {
-            let item = item.clone();
             let popover = popover.clone();
             let current = current.clone();
             let window = window.clone();
             cx.spawn(async move |cx| loop {
                 cx.background_executor().timer(REDRAW_EVERY).await;
-                let state = MenuBarState::from_snapshot(&current.borrow(), Instant::now());
-                if !state.ticks() {
+                let counting = matches!(
+                    MenuBarState::from_snapshot(&current.borrow()),
+                    MenuBarState::Recording | MenuBarState::Meeting
+                );
+                if !counting {
                     continue;
                 }
-                item.set_state(mtm, state);
                 if window.borrow().is_some()
                     && cx
                         .update(|cx| popover.update(cx, |_, cx| cx.notify()))

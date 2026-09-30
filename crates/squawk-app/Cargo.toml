@@ -62,6 +62,7 @@ features = [
     "NSBundle",
     "NSAttributedString",
     "NSDictionary",
+    "NSTimer",
 ]
 
 [dependencies.objc2-app-kit]
@@ -92,6 +93,10 @@ features = [
     "NSAttributedString",
     "NSStringDrawing",
     "NSAppearance",
+    "NSAccessibility",
+    "NSBitmapImageRep",
+    "NSGraphics",
+    "NSImageRep",
     "block2",
     "objc2-core-foundation",
     "objc2-core-graphics",

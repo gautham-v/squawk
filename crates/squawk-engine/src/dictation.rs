@@ -95,14 +95,37 @@ impl Source for Replay {
     }
 }
 
+/// The running dictation's mic level, for a meter (the menu bar's bars).
+/// The capture callback stores the RMS of each block; readers poll it.
+/// Cheap to clone; all clones share one atomic. 0 when nothing is running.
+#[derive(Clone, Default)]
+pub struct InputLevel(Arc<AtomicU32>);
+
+impl InputLevel {
+    /// RMS (0..1, linear) of the latest captured block.
+    pub fn rms(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set(&self, rms: f32) {
+        self.0.store(rms.to_bits(), Ordering::Relaxed);
+    }
+}
+
+impl std::fmt::Debug for InputLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "InputLevel({})", self.rms())
+    }
+}
+
 /// Session ids, unique for the life of the process.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 struct Shared {
     id: u64,
     state: Mutex<Capture>,
-    /// f32 bits: RMS of the latest block.
-    level: AtomicU32,
+    /// RMS of the latest block, shared with the engine's meter.
+    level: InputLevel,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -131,8 +154,11 @@ impl Capture {
 impl Shared {
     /// Runs on the capture thread for every 16 kHz block.
     fn feed(&self, block: &[f32]) {
-        self.level
-            .store(audio::rms(block).to_bits(), Ordering::Relaxed);
+        // A cancelled session's mic can run on briefly while it closes; it
+        // must not move the meter under the next one.
+        if !self.cancelled.load(Ordering::Relaxed) {
+            self.level.set(audio::rms(block));
+        }
         let mut st = self.state.lock().expect("dictation lock");
         let room = st.limit.saturating_sub(st.total);
         if room == 0 {
@@ -207,7 +233,9 @@ impl DictationSession {
         audio_dir: Option<PathBuf>,
         emit: Emit,
         busy: BusyGuard,
+        level: InputLevel,
     ) -> DictationSession {
+        level.set(0.0);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let shared = Arc::new(Shared {
             id,
@@ -222,7 +250,7 @@ impl DictationSession {
                 recognizer,
                 emit: emit.clone(),
             }),
-            level: AtomicU32::new(0),
+            level,
             cancelled: Arc::new(AtomicBool::new(false)),
         });
         let feeder = shared.clone();
@@ -265,7 +293,7 @@ impl DictationSession {
 
     /// Input level for a meter: 0 at -60 dBFS or below, 1 at 0 dBFS.
     pub fn level(&self) -> f32 {
-        let rms = f32::from_bits(self.shared.level.load(Ordering::Relaxed));
+        let rms = self.shared.level.rms();
         if rms <= 1e-6 {
             return 0.0;
         }
@@ -372,6 +400,7 @@ impl DictationSession {
             .join()
             .map_err(|_| EngineError::Mic("the capture thread panicked".into()))??;
         source.stop();
+        self.shared.level.set(0.0);
         Ok(())
     }
 }
@@ -382,6 +411,7 @@ impl Drop for DictationSession {
             return;
         };
         self.shared.cancelled.store(true, Ordering::Relaxed);
+        self.shared.level.set(0.0);
         if let Ok(mut st) = self.shared.state.lock() {
             st.segmenter = None;
             st.jobs.clear();
@@ -576,6 +606,7 @@ mod tests {
             None,
             emit,
             busy,
+            InputLevel::default(),
         );
         (s, events)
     }
@@ -649,12 +680,37 @@ mod tests {
             None,
             Arc::new(|_| {}),
             busy,
+            InputLevel::default(),
         );
         assert!(BusyGuard::acquire(&flag, "a dictation").is_err());
         s.cancel();
         assert!(BusyGuard::acquire(&flag, "a dictation").is_ok());
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_meter_follows_the_live_session_and_rests_at_zero() {
+        let (r, _) = recognizer();
+        let level = InputLevel::default();
+        let busy = BusyGuard::acquire(&Arc::new(AtomicBool::new(false)), "x").unwrap();
+        let s = DictationSession::start(
+            r,
+            Input::Replay {
+                samples: tone(5.0),
+                speed: 1.0,
+            },
+            Duration::from_secs(600),
+            None,
+            Arc::new(|_| {}),
+            busy,
+            level.clone(),
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(level.rms() > 0.01, "{level:?}");
+        s.cancel();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(level.rms(), 0.0);
     }
 
     #[test]
@@ -672,6 +728,7 @@ mod tests {
             Some(dir.path().to_path_buf()),
             Arc::new(|_| {}),
             busy,
+            InputLevel::default(),
         );
         wait_for_replay(1.0);
         let t = s.finish().unwrap();
@@ -724,6 +781,7 @@ mod tests {
             None,
             Arc::new(|_| {}),
             busy,
+            InputLevel::default(),
         );
         wait_for_replay(2.1);
         let t = s.finish().unwrap();
@@ -751,6 +809,7 @@ mod tests {
             None,
             Arc::new(|_| {}),
             busy,
+            InputLevel::default(),
         );
         wait_for_replay(5.6);
         let t = s.finish().unwrap();
@@ -774,6 +833,7 @@ mod tests {
             None,
             Arc::new(|_| {}),
             busy,
+            InputLevel::default(),
         );
         wait_for_replay(1.75);
         let t = s.finish().unwrap();

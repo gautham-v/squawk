@@ -1,7 +1,7 @@
 //! Colors and sizes for the popover, ported from claudebar's `ui/theme.rs`:
 //! the system-menu material, black/white ink at the usual alphas, hairline
 //! separators — plus squawk's one accent, copper, used only for the
-//! recording/meeting state line (the same copper as the menu bar item).
+//! recording/meeting state line.
 //! Everything the views need comes from here; no literals in the views.
 
 use gpui::{px, Pixels, Rgba, WindowAppearance};
@@ -169,17 +169,6 @@ mod tests {
         assert_eq!(Theme::for_appearance(WindowAppearance::VibrantLight), LIGHT);
         assert_eq!(Theme::for_appearance(WindowAppearance::Dark), DARK);
         assert_eq!(Theme::for_appearance(WindowAppearance::VibrantDark), DARK);
-    }
-
-    /// The popover's copper is the menu bar's copper.
-    #[test]
-    fn the_accent_is_the_menu_bar_copper() {
-        let (r, g, b) = crate::menu_bar_icon::COPPER_DARK;
-        assert_eq!((DARK.accent.r * 255.0).round() as u8, r);
-        assert_eq!((DARK.accent.g * 255.0).round() as u8, g);
-        assert_eq!((DARK.accent.b * 255.0).round() as u8, b);
-        let (r, _, _) = crate::menu_bar_icon::COPPER_LIGHT;
-        assert_eq!((LIGHT.accent.r * 255.0).round() as u8, r);
     }
 
     #[test]
