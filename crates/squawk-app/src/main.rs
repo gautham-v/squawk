@@ -160,11 +160,13 @@ impl Panel {
     /// Give the popover's view keyboard focus again, so ←/→/↑/↓, Return
     /// and Esc reach it as soon as the window is key. Call before
     /// [`Panel::show`].
-    fn focus(&self, cx: &mut App, popover: &Entity<Popover>) {
+    fn focus(&self, cx: &mut App) {
         let Some(handle) = self.window.borrow().as_ref().map(|w| w.handle) else {
             return;
         };
-        let _ = handle.update(cx, |_, window, cx| {
+        // The window's root view is the popover, leased for this update:
+        // take its focus handle from the closure's view, not the entity.
+        let _ = handle.update(cx, |popover, window, cx| {
             window.focus(&popover.focus_handle(cx));
         });
     }
@@ -581,7 +583,7 @@ fn toggle_popover(
         controller.send(Command::RecheckPermissions);
         close_panel(panel_window, cx);
         popover.update(cx, |p, cx| p.reset(cx));
-        panel.focus(cx, popover);
+        panel.focus(cx);
         let bounds = popover_bounds(
             placement_for(cx, anchor, theme::POPOVER_WIDTH_PX),
             px(theme::POPOVER_HEIGHT_PX),
