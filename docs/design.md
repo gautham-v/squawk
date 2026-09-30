@@ -4,8 +4,9 @@ A fully local macOS dictation app. Hold fn, talk, let go: the words are pasted i
 focus. Built for talking to Claude Code in a terminal, so when the front app is a terminal running
 `claude` (or `codex`) it also turns spoken file names into `@mentions` and spells the repo's jargon
 the way the repo does. Meetings are recorded as two tracks (you / them) and transcribed as they go.
-Everything runs on the device: NVIDIA Parakeet TDT 0.6B v3 (int8 ONNX) through `transcribe-rs`.
-No accounts, no API keys, no telemetry; the network is touched once, to download the model.
+Everything runs on the device: NVIDIA Parakeet TDT 0.6B v3 (int8 ONNX) through `transcribe-rs`
+hears, and "S1-mini" by "Superwhisper" (a 0.6B GGUF through llama.cpp) tidies what it heard.
+No accounts, no API keys, no telemetry; the network is touched once per model, to download it.
 
 MIT, open source. Rust. The target is macOS 15 Sequoia on Apple Silicon. Nothing here uses
 macOS 26 APIs (SpeechAnalyzer and friends are not there on 15).
@@ -17,8 +18,8 @@ code is right and this file is stale.
 
 ```
 Cargo.toml                 workspace; shared deps in [workspace.dependencies]
-crates/squawk-core         lib   config, config_edit, paths, store, dictionary, cleanup, pipeline, hotkey, ipc, status, text, context/, notetaker/
-crates/squawk-engine       lib   audio, segmenter, model, recognizer, dictation, meeting, system_audio
+crates/squawk-core         lib   config, config_edit, paths, store, dictionary, cleanup, normalize, pipeline, hotkey, ipc, status, text, context/, notetaker/
+crates/squawk-engine       lib   audio, segmenter, model, recognizer, normalizer, dictation, meeting, system_audio
 crates/squawk-app          lib+bin "squawk-app", bundled as Squawk.app (LSUIElement)
 crates/squawk-cli          bin "squawk"
 scripts/bundle.sh          builds Squawk.app
@@ -39,7 +40,8 @@ Three roots (`squawk_core::Paths`):
 | `~/squawk/meetings/YYYY-MM-DD HHMM <title>.md` | one file per meeting | engine (via `Store::write_meeting`) | popover, CLI, TUI, Claude |
 | `~/squawk/dictionary.txt` | the user's words | user, `squawk dict add`, Claude | app (every dictation, mtime-cached), CLI |
 | `~/.config/squawk/config.toml` | settings | user (app writes a commented default on first run); the Settings tab writes `[meeting]` notetaker keys | app, CLI |
-| `~/Library/Application Support/squawk/models/<dir>/` | the model | engine / `squawk model download` | engine |
+| `~/Library/Application Support/squawk/models/<dir>/` | the speech model | engine / `squawk model download` | engine |
+| `~/Library/Application Support/squawk/models/s1-mini-q4_k_m.gguf` | the cleanup model (while `cleanup_model` is on) | engine / `squawk model download` | engine |
 | `~/Library/Application Support/squawk/squawk.sock` | IPC socket | app | CLI |
 | `~/Library/Application Support/squawk/squawk.log` | log, one latency line per dictation | app, engine (via `log`) | people |
 | `~/Library/Application Support/squawk/audio/` | WAVs, only with `keep_audio = true` | engine | people |
@@ -142,6 +144,7 @@ defaults plus a human note (`Config::load -> (Config, Option<String>)`) that the
 | `[dictation] paste_restore_ms` | `300` (50–5000) | restore the old clipboard this long after cmd+V |
 | `[dictation] input_device` | `""` | input device name; empty = system default |
 | `[dictation] max_secs` | `600` (10–3600) | a dictation is auto-finished (pasted) after this |
+| `[dictation] cleanup_model` | `true` | clean dictations with S1-mini first (downloads it, 462 MB); the Settings tab writes it |
 | `[meeting] chunk_secs` | `30` (5–300) | transcription chunk length per track |
 | `[meeting] system_audio` | `true` | record the other side as "Them" |
 | `[meeting] calendar_titles` | `true` | title from the current calendar event |
@@ -160,8 +163,12 @@ that writes `<RFC3339> <LEVEL> <target>: <message>`). Per dictation, exactly one
 app's controller:
 
 ```
-2026-09-29T14:03:12-07:00 INFO dictation: audio=20.4s segments=5 tail_ms=182 pipeline_ms=3 paste_ms=12 release_to_paste_ms=197 chars=312 app=Ghostty project=squawk context=claude
+2026-09-29T14:03:12-07:00 INFO dictation: audio=20.4s segments=5 tail_ms=182 pipeline_ms=3 cleanup=s1 cleanup_ms=140 paste_ms=12 release_to_paste_ms=337 chars=312 app=Ghostty project=squawk context=claude
 ```
+
+`cleanup` is `s1` (S1-mini's text was used), `rules` (off, or not downloaded/loaded yet) or
+`fallback:<why>` (`timeout`, `input_too_long`, `error`, `too_long`, `emptied`); `cleanup_ms` is
+the wait on the model, and `pipeline_ms` the rest of the pipeline.
 
 `release_to_paste_ms` is fn-up (the `StopAndPaste` action) to cmd+V posted — the number we
 optimise. **Never log dictated text** (privacy); lengths only.
@@ -171,14 +178,15 @@ optimise. **Never log dictated text** (privacy); lengths only.
 ## squawk-core
 
 `pub mod`: `cleanup`, `config`, `config_edit`, `context`, `dictionary`, `error`, `hotkey`,
-`ipc`, `notetaker`, `paths`, `pipeline`, `status`, `store`, `text`. Re-exports: `Config`, `Dictionary`, `Error`, `Result`,
+`ipc`, `normalize`, `notetaker`, `paths`, `pipeline`, `status`, `store`, `text`. Re-exports: `Config`, `Dictionary`, `Error`, `Result`,
 `Paths`, `AppState`, `ModelStatus`, `Store`, `VERSION`.
 
 - `error::Error` — `Io`, `Config{path,message}`, `Json`, `NoHome`, `NotRunning(PathBuf)`, `Ipc(String)`.
 - `paths::Paths` — `detect()`, `from_home`, `under(root)` (tests), `with_data_dir`,
   `with_support_dir`, `with_config(&Config)`, `ensure_dirs()`; `expand_tilde`.
 - `config` — structs above; `Config::{load, try_load, parse, save, write_default_if_missing,
-  clamped}`; `DEFAULT_MODEL_URL`, `DEFAULT_MODEL_DIR`, `DEFAULT_CONFIG_TOML`.
+  clamped}`; `DEFAULT_MODEL_URL`, `DEFAULT_MODEL_DIR`, `CLEANUP_MODEL_URL` (pinned revision),
+  `CLEANUP_MODEL_FILE`, `DEFAULT_CONFIG_TOML`.
 - `status` — `AppState`, `ModelStatus` (`is_ready`, `progress`, `label`), `Permissions`
   (`can_dictate`), `MeetingInfo`, `StatusInfo`, `format_elapsed` ("0:07", "1:02:05"), `format_hms`
   ("00:23:06"). All serde, snake_case tags.
@@ -197,6 +205,19 @@ optimise. **Never log dictated text** (privacy); lengths only.
   `DictionaryCache`.
 - `pipeline::finish(raw, &Dictionary, Option<&context::Context>, &CleanupOptions) -> String` —
   `strip` → `context::apply` → `Dictionary::apply` → `finalize`. Empty = paste nothing.
+- `pipeline::finish_with(raw, Option<&dyn Normalizer>, &Dictionary, Option<&Context>,
+  &CleanupOptions) -> Finished{text, cleanup: Cleanup, model_time, model_text}` — S1-mini on the
+  **raw** transcript first (it does far better on Parakeet's own words than on stripped text), then
+  `finish` on its answer. Not ready → `Cleanup::Rules`; an error, a timeout, too long an input, or
+  an answer `normalize::accept` rejects → `Cleanup::Fallback(why)` with exactly `finish(raw)`.
+- `normalize` — what S1-mini needs without the model: `SYSTEM_PROMPT` and `CONTROL_LINE`
+  (`[Styling: semi-formal] [Structure: prose] [Context: general]`, byte for byte what it was
+  trained on), `chat_prompt(text)` (ChatML ending in the empty think block: thinking off),
+  `tidy_output`, `accept(input, output)` (rejects an answer with more than 1.5× the input's words
+  + 10, or an empty one when the rules would keep more than two words; filler-only input may come
+  back empty), `max_new_tokens(n) = 2n + 32`, `MAX_INPUT_TOKENS` (600, ~3 minutes of talk),
+  `BUDGET` (4 s), the `Normalizer` trait and `NormalizeError{NotReady, TooLong, Timeout,
+  Failed}`.
 - `store` — see Files.
 - `config_edit` — `set_value(text, table, key, value)` / `set_in_file(path, …)` (atomic temp +
   rename) with `toml_edit`: comments, blank lines, order and unknown keys survive; a key that is
@@ -380,11 +401,13 @@ Sync`.
 pub const SAMPLE_RATE: u32 = 16_000;
 
 pub struct EngineConfig { pub paths: Paths, pub model: ModelConfig, pub input_device: Option<String>,
-                          pub keep_audio: bool, pub meeting: MeetingConfig, pub max_dictation: Duration }
+                          pub keep_audio: bool, pub meeting: MeetingConfig, pub max_dictation: Duration,
+                          pub cleanup_model: bool }
 impl EngineConfig { pub fn from_config(&Paths, &Config) -> Self; pub fn model_dir(&self) -> PathBuf }
 
 pub enum EngineEvent { Model(ModelStatus), DictationTooLong{session}, MeetingProgress{path, elapsed_secs},
-                       MeetingWarning(String), MicLost{session, message}, MeetingMicLost(String) }
+                       MeetingWarning(String), MicLost{session, message}, MeetingMicLost(String),
+                       CleanupModel(ModelStatus) }   // Missing also = turned off
 
 impl Engine {
     pub fn new(EngineConfig) -> Engine;                       // cheap, no model, no mic
@@ -392,6 +415,10 @@ impl Engine {
     pub fn model_status(&self) -> ModelStatus;                // never blocks
     pub fn ensure_model(&self);                               // background download → extract → load; idempotent
     pub fn load_model_blocking(&self) -> Result<(), EngineError>;   // CLI; never downloads
+    pub fn cleanup_status(&self) -> ModelStatus;              // S1-mini; never blocks
+    pub fn ensure_cleanup_model(&self);                       // when on: background download → load; after Parakeet
+    pub fn load_cleanup_model_blocking(&self) -> Result<Normalizer, EngineError>;  // CLI; never downloads
+    pub fn normalizer(&self) -> Option<Normalizer>;           // loaded and on, else None
     pub fn start_dictation(&self) -> Result<DictationSession, EngineError>;
     pub fn input_level(&self) -> InputLevel;                  // live dictation's mic RMS, 0 when none
     pub fn start_meeting(&self, MeetingOptions) -> Result<MeetingHandle, EngineError>;
@@ -422,13 +449,21 @@ Supporting public modules: `audio` (`MicCapture::{start, device_name, stop}`,
 `segmenter` (`SegmenterConfig`, `Segmenter::{new, push, finish}`, `Cut{start, samples,
 has_speech}`), `model` (`REQUIRED_FILES`, `is_installed`, `download`, `LoadedModel::{load,
 transcribe}`, `Recognized{text, segments}`), `recognizer` (`Priority::{Dictation, Meeting}`,
-`Recognizer::{spawn, submit}`), `system_audio` (`SystemAudioCapture::{start, stop}`,
-`has_permission`).
+`Recognizer::{spawn, submit}`), `normalizer` (`MODEL_SIZE`, `MODEL_SHA256`, `model_path`,
+`is_installed`, `download`, `Normalizer::{spawn, spawn_with, state, wait_ready}` implementing
+`normalize::Normalizer`, the `Clean` trait, `S1Mini`), `system_audio`
+(`SystemAudioCapture::{start, stop}`, `has_permission`).
 
 ### Threads
 
 - **Recognizer**: one thread owns the only `ParakeetModel` (~700 MB). Priority queue: every queued
   dictation job before any meeting job; FIFO within a priority. Jobs submitted while loading wait.
+- **Normalizer** (while `cleanup_model` is on): one thread owns S1-mini (llama.cpp, all layers on
+  the GPU via Metal; ~0.7 GB with its 2048-token q8_0 context). A thread of its own so a cleanup
+  never queues behind Parakeet or the other way round. One finished dictation at a time; the
+  caller waits at most `normalize::BUDGET` and then cancels (checked every token). An `atexit`
+  hook stops the thread and waits for it to free the model, because llama.cpp's Metal device
+  aborts in its static destructor if GPU buffers are still live at exit.
 - **Dictation capture**: `start_dictation` spawns a thread that opens the cpal input stream (cpal
   streams are `!Send`) at the device's default config, and returns without waiting for the first
   buffer. The CoreAudio callback only copies into a channel/ring; downmix + resample to 16 kHz +
@@ -461,7 +496,7 @@ transcribe}`, `Recognized{text, segments}`), `recognizer` (`Priority::{Dictation
 - `transcribe_rs::onnx::parakeet::ParakeetModel::load(dir, &Quantization::Int8)`,
   `transcribe_with(&samples, &ParakeetParams{ timestamp_granularity: Some(Segment), .. })` (or the
   `SpeechModel` trait's `transcribe`). Parakeet v3 emits punctuation and capitals itself.
-- Download (the only network access): `config.model.url` (default Handy's mirror,
+- Download (one of two network accesses; the other is the cleanup model): `config.model.url` (default Handy's mirror,
   `https://blob.handy.computer/parakeet-v3-int8.tar.gz`, 478 517 071 bytes) with `ureq`, to
   `<models>/<dir>.tar.gz.part` (resume with Range when a partial exists), then gunzip+untar with
   `flate2`+`tar` into `<models>/<dir>.partial/`, **skipping AppleDouble `._*` and `PaxHeader`
@@ -470,6 +505,22 @@ transcribe}`, `Recognized{text, segments}`), `recognizer` (`Priority::{Dictation
   total}` at most 4×/s, then `Extracting`, `Loading`, `Ready` / `Failed{message}`.
 - `ensure_model` at app start: installed → load; missing → download then load. Retried when the
   popover opens or fn is pressed while the model is missing or failed.
+
+### Cleanup model
+
+- "S1-mini" by "Superwhisper" (Apache 2.0 plus a term that it keep that name; built on
+  Qwen3-0.6B): `superwhisper/s1-mini-GGUF`, `s1-mini-q4_k_m.gguf`, 484 219 808 bytes, fetched
+  from a pinned revision (`CLEANUP_MODEL_URL`) with the same `fetch` as Parakeet (resume, 60 s
+  body windows), SHA-256-checked, renamed into place. The second network access, and only while
+  `cleanup_model` is on. `Extracting` is reported while the checksum runs.
+- Loaded after Parakeet is ready (dictation never waits for it), warmed up with one short answer
+  (Metal compiles its kernels; ~20 s the very first time on a machine, cached after, ~1 s load).
+- Greedy decoding, stop at end-of-generation, at most `min(2n + 32, context left)` tokens.
+  Measured on an M4 on real dictations: 90–160 ms for a sentence, ~1.5 s for 90 s of talk.
+- Built with `llama-cpp-2` (no default features, `metal`): llama.cpp is compiled from source by
+  its build script (needs `cmake`) and linked statically, Metal shaders embedded; nothing to
+  bundle. `.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET = 15.0`, or with a current Xcode the
+  C/C++ targets the SDK's macOS 26 and its availability checks compile away.
 
 ### Meetings: system audio
 
@@ -588,8 +639,9 @@ One thread; owns `Engine`, the live `DictationSession`, the live `MeetingHandle`
   Publish `Recording{since, hands_free: false}`.
 - `Hotkey(EnterHandsFree)`: publish `Recording{hands_free: true}`.
 - `Hotkey(StopAndPaste)` (or `EngineEvent::DictationTooLong`): publish `Transcribing`;
-  `session.finish()`; `pipeline::finish(text, dict_cache.get(), ctx.as_ref(), &CleanupOptions{
-  remove_fillers: config.dictation.remove_fillers, fix_doubles: true })`. If the front app changed
+  `session.finish()`; `pipeline::finish_with(text, engine.normalizer(), dict_cache.get(),
+  ctx.as_ref(), &CleanupOptions{ remove_fillers: config.dictation.remove_fillers, fix_doubles:
+  true })` (S1-mini, when on and loaded, runs on its own thread while this one waits ≤ 4 s). If the front app changed
   since start, re-read it and redo detect. If non-empty: paste `text + (" " if trailing_space)` on
   the main thread (`paste::paste`, restore after `paste_restore_ms`), `store.append_dictation`
   (app = front app name, project = session project), write the log line, bump
@@ -612,7 +664,10 @@ One thread; owns `Engine`, the live `DictationSession`, the live `MeetingHandle`
   current calendar event, else the fallback, e.g. "Zoom call") / open the file. Every meeting
   start (⌥M, popover, IPC, prompt) calls `meeting_started`, every stop `meeting_stopped`.
   `SetSetting(Setting)` → `config_edit::set_in_file(config, "meeting", key, value)` then the
-  normal reload. The mic watcher starts once `detect_calls` is on (and then runs for the app's
+  normal reload. `SetCleanupModel(bool)` → the same for `[dictation] cleanup_model`; the reload
+  hands `engine.update_config` the change, which loads (downloading if needed) or frees S1-mini.
+  Engine `CleanupModel(status)` → `snapshot.cleanup_status`; a failed one is retried when the
+  popover opens. The mic watcher starts once `detect_calls` is on (and then runs for the app's
   life; samples are ignored while it is off); Calendar access is
   requested (in the background) the first time the heads-up is on and access is undetermined.
   `Snapshot` carries `meeting_config`, `prompt` and `calendar_access`.
@@ -701,6 +756,11 @@ came 3.2 s into the 20 s hold, the 5 s gap stayed the same call, and the call en
 the last release.
 
 ### Settings tab (ui/settings.rs)
+
+First a "Dictation" caption and "Clean up with S1-mini" (switch; `[dictation] cleanup_model`;
+muted line "by Superwhisper · fillers, false starts, numbers", or while it is on and not ready
+"462 MB download" / "Downloading 42%" / "Checking the download" / "Loading" / "Failed: …" —
+`settings::cleanup_note`, pure). It emits `PopoverEvent::SetCleanupModel(bool)`.
 
 Rows (`settings::rows(&MeetingConfig, calendar_access)`, pure): a "Meetings" caption, then
 label + muted line + control — Heads-up before meetings (pop-up: Off / At start / 15 s / 1 min /
@@ -792,8 +852,8 @@ errors: message to stderr, exit 1. Never print ANSI colours when stdout is not a
 | `squawk status [--json]` | `squawk 0.1.0 · idle` / `recording 0:07` / `transcribing`, then aligned lines `model`, `mic`, `accessibility`, `screen audio`, `meeting`, `config` (note if any); `--json` prints the `StatusInfo`. Not running → the not-running message + whether the model is installed, exit 2 |
 | `squawk dict add <phrase…>` | `Added: <entry>` / `Already there: <entry>` |
 | `squawk dict list` | one entry per line as written in the file |
-| `squawk model download` | progress on stderr, one updating line `Downloading 42%  201/478 MB`; then `Model ready: <dir>`; already installed → `Model already installed: <dir>` |
-| `squawk transcribe <file> [--raw] [--cwd DIR]` | loads the model (`load_model_blocking`), `audio::load_file`, `engine.transcribe`, `pipeline::finish` with the dictionary (and, with `--cwd`, a `Context` built from `Session{cwd, agent: Claude, pid: 0, tty: None}` + `RepoVocab::build`). Prints the cleaned text. `--raw` also prints `raw:`, `clean:`, and `audio 12.3s · model load 1.4s · transcribe 410ms`. Model missing → "Run `squawk model download` first.", exit 1 |
+| `squawk model download` | progress on stderr, one updating line `Downloading 42%  201/478 MB`; then `Model ready: <dir>`; already installed → `Model already installed: <dir>`. Then the same for S1-mini while `cleanup_model` is on (`S1-mini by Superwhisper ready: <file>`) |
+| `squawk transcribe <file> [--raw] [--cwd DIR]` | loads the model (`load_model_blocking`), `audio::load_file`, `engine.transcribe`, `pipeline::finish_with` (S1-mini when on and downloaded, via `load_cleanup_model_blocking`) with the dictionary (and, with `--cwd`, a `Context` built from `Session{cwd, agent: Claude, pid: 0, tty: None}` + `RepoVocab::build`). Prints the cleaned text. `--raw` also prints `raw:`, `s1:` (S1-mini's answer, when it gave one), `clean:`, and `audio 12.3s · model load 1.4s · transcribe 410ms · cleanup s1 140ms`. Model missing → "Run `squawk model download` first.", exit 1 |
 
 Clipboard: `pbcopy`. Editor: `$VISUAL`, else `$EDITOR`, else `open`.
 
