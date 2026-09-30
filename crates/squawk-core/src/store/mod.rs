@@ -4,9 +4,13 @@
 //! by everyone on the next read.
 
 mod dictation;
+mod echo;
 mod meeting;
 
 pub use dictation::{format_entry, parse_day, DictationEntry};
+pub use echo::{
+    drop_echoes, ECHO_MIN_PHRASE_SHARE, ECHO_MIN_SHARE, ECHO_MIN_WORDS, ECHO_WINDOW_SECS,
+};
 pub use meeting::{
     format_meeting, meeting_file_name, merge_segments, parse_meeting, sanitize_title, Meeting,
     MeetingSummary, Segment, Speaker, Utterance,

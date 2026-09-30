@@ -7,6 +7,7 @@
 
 use std::f64::consts::PI;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -15,12 +16,29 @@ use cpal::{FromSample, SampleFormat, SizedSample};
 use crossbeam_channel::{select, Receiver, Sender};
 
 use crate::error::EngineError;
+use crate::voice_processing::VoiceInput;
 use crate::SAMPLE_RATE;
+
+/// How the mic is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MicMode {
+    /// The device as it is, through cpal: lowest latency, nothing done to
+    /// the sound, other audio left alone. Dictation.
+    #[default]
+    Plain,
+    /// Apple's voice processing on the default input: echo cancellation
+    /// (the other side of a call on speakers is taken out of the mic),
+    /// noise suppression and gain control, at the cost of ducking other
+    /// audio a little. Meetings. Falls back to `Plain` when it cannot start,
+    /// or when a named device other than the default is asked for.
+    EchoCancelled,
+}
 
 /// A running mic stream. The cpal stream lives on its own thread, which also
 /// downmixes and resamples; this handle is `Send`. Dropping it stops capture.
 pub struct MicCapture {
     name: String,
+    echo_cancelled: bool,
     stop_tx: Sender<()>,
     thread: Option<JoinHandle<()>>,
 }
@@ -48,15 +66,27 @@ impl MicCapture {
         sink: impl FnMut(&[f32]) + Send + 'static,
         on_lost: impl FnOnce(String) + Send + 'static,
     ) -> Result<MicCapture, EngineError> {
+        MicCapture::start_with_mode(device, MicMode::Plain, sink, on_lost)
+    }
+
+    /// [`MicCapture::start_with_errors`] in the given [`MicMode`]. A reopen
+    /// after a device change uses the same mode.
+    pub fn start_with_mode(
+        device: Option<&str>,
+        mode: MicMode,
+        sink: impl FnMut(&[f32]) + Send + 'static,
+        on_lost: impl FnOnce(String) + Send + 'static,
+    ) -> Result<MicCapture, EngineError> {
         let wanted = device.map(str::to_string);
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
         let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
         let thread = std::thread::Builder::new()
             .name("squawk-mic".into())
-            .spawn(move || capture_thread(wanted, sink, on_lost, ready_tx, stop_rx))?;
+            .spawn(move || capture_thread(wanted, mode, sink, on_lost, ready_tx, stop_rx))?;
         match ready_rx.recv() {
-            Ok(Ok(name)) => Ok(MicCapture {
+            Ok(Ok((name, echo_cancelled))) => Ok(MicCapture {
                 name,
+                echo_cancelled,
                 stop_tx,
                 thread: Some(thread),
             }),
@@ -74,6 +104,12 @@ impl MicCapture {
     /// The device actually opened.
     pub fn device_name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether the stream opened at start is echo cancelled
+    /// ([`MicMode::EchoCancelled`] that did not fall back).
+    pub fn echo_cancelled(&self) -> bool {
+        self.echo_cancelled
     }
 
     /// Stop and join the capture thread. Samples already delivered stay
@@ -97,7 +133,83 @@ impl Drop for MicCapture {
     }
 }
 
-type Ready = Sender<Result<String, EngineError>>;
+/// The opened device's name and whether it is echo cancelled.
+type Ready = Sender<Result<(String, bool), EngineError>>;
+
+type Listen = Box<dyn FnMut(&[f32]) + Send>;
+
+/// The echo-cancelled meeting mic, lent to a dictation. While voice
+/// processing runs, macOS hands every other client of that mic a signal
+/// ~40 dB down (measured on a MacBook Pro), so a dictation opening its own
+/// stream during such a meeting would hear almost nothing. It listens to
+/// the meeting's stream instead, which also keeps the call out of it.
+#[derive(Clone, Default)]
+pub(crate) struct MicShare(Arc<Mutex<ShareState>>);
+
+#[derive(Default)]
+struct ShareState {
+    live: bool,
+    next_id: u64,
+    listener: Option<(u64, Listen)>,
+}
+
+/// A dictation listening to a [`MicShare`]; dropping it stops listening.
+pub(crate) struct MicListener {
+    share: MicShare,
+    id: u64,
+}
+
+impl MicShare {
+    fn state(&self) -> std::sync::MutexGuard<'_, ShareState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Called by the meeting when its echo-cancelled mic starts (`true`)
+    /// and before it stops or is lost (`false`, which also drops the
+    /// listener).
+    pub(crate) fn set_live(&self, live: bool) {
+        let mut st = self.state();
+        st.live = live;
+        if !live {
+            st.listener = None;
+        }
+    }
+
+    /// Every 16 kHz block of the meeting mic.
+    pub(crate) fn forward(&self, block: &[f32]) {
+        if let Some((_, listen)) = self.state().listener.as_mut() {
+            listen(block);
+        }
+    }
+
+    /// Start sending the meeting mic's blocks to `listen`, replacing any
+    /// earlier listener. `None` when no echo-cancelled meeting mic is live.
+    pub(crate) fn listen(
+        &self,
+        listen: impl FnMut(&[f32]) + Send + 'static,
+    ) -> Option<MicListener> {
+        let mut st = self.state();
+        if !st.live {
+            return None;
+        }
+        st.next_id += 1;
+        let id = st.next_id;
+        st.listener = Some((id, Box::new(listen)));
+        Some(MicListener {
+            share: self.clone(),
+            id,
+        })
+    }
+}
+
+impl Drop for MicListener {
+    fn drop(&mut self) {
+        let mut st = self.share.state();
+        if st.listener.as_ref().is_some_and(|(id, _)| *id == self.id) {
+            st.listener = None;
+        }
+    }
+}
 
 /// Waits before each attempt to reopen a lost mic. CoreAudio needs a
 /// moment after a route change before the new format is readable.
@@ -110,7 +222,7 @@ const MAX_GAP: Duration = Duration::from_secs(10);
 
 /// One opened stream and what its buffers need to become 16 kHz mono.
 struct Opened {
-    stream: cpal::Stream,
+    stream: Stream,
     name: String,
     channels: usize,
     resampler: Resampler,
@@ -149,8 +261,16 @@ impl Opened {
     }
 }
 
+/// Either kind of stream; both stop when dropped, on the thread that opened
+/// them.
+enum Stream {
+    Plain(#[allow(dead_code)] cpal::Stream),
+    Voice(#[allow(dead_code)] VoiceInput),
+}
+
 fn capture_thread(
     wanted: Option<String>,
+    mode: MicMode,
     mut sink: impl FnMut(&[f32]),
     on_lost: impl FnOnce(String),
     ready: Ready,
@@ -161,14 +281,15 @@ fn capture_thread(
     // a late report from a stream already replaced is ignored.
     let (lost_tx, lost_rx) = crossbeam_channel::unbounded::<(u32, String)>();
     let mut generation = 0u32;
-    let first = match open_stream(wanted.as_deref(), &raw_tx, &lost_tx, generation) {
+    let first = match open_stream(wanted.as_deref(), mode, &raw_tx, &lost_tx, generation) {
         Ok(opened) => opened,
         Err(e) => {
             let _ = ready.send(Err(e));
             return;
         }
     };
-    let _ = ready.send(Ok(first.name.clone()));
+    let echo_cancelled = matches!(first.stream, Stream::Voice(_));
+    let _ = ready.send(Ok((first.name.clone(), echo_cancelled)));
     let mut current = Some(first);
     let mut on_lost = Some(on_lost);
 
@@ -193,7 +314,7 @@ fn capture_thread(
                 let reopened = if generation > MAX_REOPENS {
                     Reopen::Failed("it keeps dropping out".into())
                 } else {
-                    reopen(wanted.as_deref(), &raw_tx, &lost_tx, generation, &stop)
+                    reopen(wanted.as_deref(), mode, &raw_tx, &lost_tx, generation, &stop)
                 };
                 match reopened {
                     Reopen::Opened(mic) => {
@@ -237,6 +358,7 @@ enum Reopen {
 /// A stop request during a wait ends it.
 fn reopen(
     wanted: Option<&str>,
+    mode: MicMode,
     raw_tx: &Sender<Vec<f32>>,
     lost_tx: &Sender<(u32, String)>,
     generation: u32,
@@ -247,7 +369,7 @@ fn reopen(
         if stop.recv_timeout(Duration::from_millis(delay)).is_ok() {
             return Reopen::Stopped;
         }
-        match open_stream(wanted, raw_tx, lost_tx, generation) {
+        match open_stream(wanted, mode, raw_tx, lost_tx, generation) {
             Ok(mic) => return Reopen::Opened(mic),
             Err(e) => {
                 log::debug!("mic: reopen attempt failed: {e}");
@@ -266,6 +388,7 @@ fn silence_for(gap: Duration) -> Vec<f32> {
 
 fn open_stream(
     wanted: Option<&str>,
+    mode: MicMode,
     raw_tx: &Sender<Vec<f32>>,
     lost_tx: &Sender<(u32, String)>,
     generation: u32,
@@ -273,6 +396,20 @@ fn open_stream(
     let host = cpal::default_host();
     let device = find_device(&host, wanted)?;
     let name = device_name(&device);
+    if mode == MicMode::EchoCancelled {
+        // Voice processing always uses the default input.
+        let is_default = host
+            .default_input_device()
+            .is_some_and(|d| device_name(&d) == name);
+        if !is_default {
+            log::warn!("mic: echo cancellation needs the default input; {name} is recorded as is");
+        } else {
+            match open_voice(name.clone(), raw_tx, lost_tx, generation) {
+                Ok(opened) => return Ok(opened),
+                Err(e) => log::warn!("mic: {e}; recording without echo cancellation"),
+            }
+        }
+    }
     let config = device
         .default_input_config()
         .map_err(|e| EngineError::Mic(format!("{name}: {e}")))?;
@@ -312,9 +449,35 @@ fn open_stream(
         .map_err(|e| EngineError::Mic(format!("{name}: {e}")))?;
     log::info!("mic: {name} at {rate} Hz, {channels} ch");
     Ok(Opened {
-        stream,
+        stream: Stream::Plain(stream),
         name,
         channels,
+        resampler: Resampler::new(rate),
+    })
+}
+
+/// The default input through voice processing; a hardware change is
+/// reported like a lost cpal stream, so the capture thread reopens it.
+fn open_voice(
+    name: String,
+    raw_tx: &Sender<Vec<f32>>,
+    lost_tx: &Sender<(u32, String)>,
+    generation: u32,
+) -> Result<Opened, EngineError> {
+    let lost_tx = lost_tx.clone();
+    let opening = Instant::now();
+    let voice = VoiceInput::open(raw_tx.clone(), move || {
+        let _ = lost_tx.send((generation, "the audio hardware changed".into()));
+    })?;
+    let rate = voice.rate();
+    log::info!(
+        "mic: {name} at {rate} Hz, echo cancelled (opened in {} ms)",
+        opening.elapsed().as_millis()
+    );
+    Ok(Opened {
+        stream: Stream::Voice(voice),
+        name,
+        channels: 1,
         resampler: Resampler::new(rate),
     })
 }
@@ -656,6 +819,39 @@ pub fn rms(samples: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_mic_reaches_one_listener_while_live() {
+        let share = MicShare::default();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let sink = |got: &Arc<Mutex<Vec<f32>>>| {
+            let got = got.clone();
+            move |b: &[f32]| got.lock().unwrap().extend_from_slice(b)
+        };
+        assert!(share.listen(sink(&got)).is_none(), "nothing to lend yet");
+
+        share.set_live(true);
+        share.forward(&[0.1]);
+        let first = share.listen(sink(&got)).unwrap();
+        share.forward(&[0.2]);
+        // A second listener replaces the first; dropping the stale handle
+        // does not detach the new one.
+        let other = Arc::new(Mutex::new(Vec::new()));
+        let second = share.listen(sink(&other)).unwrap();
+        share.forward(&[0.3]);
+        drop(first);
+        share.forward(&[0.4]);
+        drop(second);
+        share.forward(&[0.5]);
+        assert_eq!(*got.lock().unwrap(), vec![0.2]);
+        assert_eq!(*other.lock().unwrap(), vec![0.3, 0.4]);
+
+        let _third = share.listen(sink(&got)).unwrap();
+        share.set_live(false);
+        share.forward(&[0.6]);
+        assert_eq!(*got.lock().unwrap(), vec![0.2]);
+        assert!(share.listen(sink(&got)).is_none());
+    }
 
     fn sine(freq: f32, rate: u32, secs: f32) -> Vec<f32> {
         let n = (rate as f32 * secs) as usize;

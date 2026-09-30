@@ -8,6 +8,7 @@ use std::time::Duration;
 use squawk_core::config::{MeetingConfig, ModelConfig};
 use squawk_core::{Config, ModelStatus, Paths};
 
+use crate::audio::MicShare;
 use crate::dictation::{self, DictationSession, Input};
 use crate::error::EngineError;
 use crate::meeting::{MeetingHandle, MeetingOptions};
@@ -120,6 +121,8 @@ struct Inner {
     ensuring: AtomicBool,
     dictating: Arc<AtomicBool>,
     meeting: Arc<AtomicBool>,
+    /// The running meeting's echo-cancelled mic, for dictations.
+    meeting_mic: MicShare,
 }
 
 impl Inner {
@@ -159,6 +162,7 @@ impl Engine {
                 ensuring: AtomicBool::new(false),
                 dictating: Arc::new(AtomicBool::new(false)),
                 meeting: Arc::new(AtomicBool::new(false)),
+                meeting_mic: MicShare::default(),
             }),
         }
     }
@@ -282,7 +286,8 @@ impl Engine {
     /// model is not on disk (`ModelNotReady` while it is downloading).
     pub fn start_dictation(&self) -> Result<DictationSession, EngineError> {
         let device = self.config().input_device;
-        self.start_dictation_from(Input::Mic(device))
+        let share = self.inner.meeting_mic.clone();
+        self.start_dictation_from(Input::Mic { device, share })
     }
 
     /// A dictation fed from `samples` (16 kHz mono) instead of the mic,
@@ -327,7 +332,14 @@ impl Engine {
     pub fn start_meeting(&self, opts: MeetingOptions) -> Result<MeetingHandle, EngineError> {
         let busy = BusyGuard::acquire(&self.inner.meeting, "a meeting")?;
         let recognizer = self.recognizer().map_err(|e| self.not_ready(e))?;
-        MeetingHandle::start(opts, self.config(), recognizer, self.emitter(), busy)
+        MeetingHandle::start(
+            opts,
+            self.config(),
+            recognizer,
+            self.emitter(),
+            self.inner.meeting_mic.clone(),
+            busy,
+        )
     }
 
     /// Transcribe 16 kHz mono samples on the recognizer at dictation

@@ -17,10 +17,10 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local, SecondsFormat};
 use crossbeam_channel::{Receiver, Sender};
 use squawk_core::status::MeetingInfo;
-use squawk_core::store::{merge_segments, Meeting, Segment, Speaker};
+use squawk_core::store::{drop_echoes, merge_segments, Meeting, Segment, Speaker};
 use squawk_core::Store;
 
-use crate::audio::{self, MicCapture};
+use crate::audio::{self, MicCapture, MicMode, MicShare};
 use crate::engine::{BusyGuard, Emit, EngineConfig, EngineEvent};
 use crate::error::EngineError;
 use crate::model::Recognized;
@@ -53,6 +53,7 @@ pub struct MeetingHandle {
 /// Everything that has to be shut down, in order.
 struct Running {
     mic: MicCapture,
+    share: MicShare,
     system: Option<SystemAudioCapture>,
     tracks: Vec<Arc<Track>>,
     writer_tx: Sender<WriterMsg>,
@@ -76,6 +77,7 @@ impl MeetingHandle {
         config: EngineConfig,
         recognizer: Recognizer,
         emit: Emit,
+        share: MicShare,
         busy: BusyGuard,
     ) -> Result<MeetingHandle, EngineError> {
         let started = Instant::now();
@@ -90,12 +92,16 @@ impl MeetingHandle {
         // Written at once so the meeting shows up in lists while it runs.
         store.write_meeting(&opts.path, &head)?;
 
+        let echo_cancellation = config.meeting.echo_cancellation;
         let (writer_tx, writer_rx) = crossbeam_channel::unbounded();
         let writer = {
             let (opts, emit) = (opts.clone(), emit.clone());
+            let filter = echo_cancellation.then_some(drop_echoes as EchoFilter);
             std::thread::Builder::new()
                 .name("squawk-meeting-writer".into())
-                .spawn(move || write_loop(store, opts, started, recognizer, writer_rx, emit))?
+                .spawn(move || {
+                    write_loop(store, opts, started, recognizer, writer_rx, filter, emit)
+                })?
         };
         let seg_config = SegmenterConfig::for_meeting(opts.chunk_secs);
         let wav = |label: &str| {
@@ -127,13 +133,28 @@ impl MeetingHandle {
         // MicCapture reopens a device that drops out (AirPods disconnecting,
         // or flipping to their headset profile when a call app opens their
         // mic) and fills the gap with silence, so "You" stays on the meeting
-        // clock. Only a mic that cannot be reopened ends up here.
+        // clock. Only a mic that cannot be reopened ends up here. With echo
+        // cancellation the call playing on the speakers is taken out of it.
         let feeder = you.clone();
+        let lent = share.clone();
         let lost = emit.clone();
-        let mic = MicCapture::start_with_errors(
+        let unlend = share.clone();
+        let mode = if echo_cancellation {
+            MicMode::EchoCancelled
+        } else {
+            MicMode::Plain
+        };
+        let mic = MicCapture::start_with_mode(
             config.input_device.as_deref(),
-            move |b| feeder.feed(b),
-            move |msg| lost(EngineEvent::MeetingMicLost(msg)),
+            mode,
+            move |b| {
+                feeder.feed(b);
+                lent.forward(b);
+            },
+            move |msg| {
+                unlend.set_live(false);
+                lost(EngineEvent::MeetingMicLost(msg));
+            },
         );
         let mic = match mic {
             Ok(m) => m,
@@ -145,6 +166,9 @@ impl MeetingHandle {
             }
         };
 
+        // A dictation during this meeting listens to this mic rather than
+        // opening its own (see `MicShare`).
+        share.set_live(mic.echo_cancelled());
         let mut tracks = vec![you];
         let mut system = None;
         if opts.system_audio {
@@ -162,9 +186,11 @@ impl MeetingHandle {
                 }
             }
         }
+        let on_off = |b: bool| if b { "on" } else { "off" };
         log::info!(
-            "meeting: started, system audio {}",
-            if system.is_some() { "on" } else { "off" }
+            "meeting: started, system audio {}, echo cancellation {}",
+            on_off(system.is_some()),
+            on_off(mic.echo_cancelled()),
         );
         Ok(MeetingHandle {
             had_system_audio: system.is_some(),
@@ -172,6 +198,7 @@ impl MeetingHandle {
             started,
             running: Some(Running {
                 mic,
+                share,
                 system,
                 tracks,
                 writer_tx,
@@ -236,6 +263,7 @@ impl Running {
     /// Returns the meeting length in seconds.
     fn shutdown(self) -> Result<u64, EngineError> {
         let length_secs = self.started.elapsed().as_secs();
+        self.share.set_live(false);
         self.mic.stop();
         if let Some(s) = self.system {
             s.stop();
@@ -426,22 +454,39 @@ fn chunk_segments(rec: Recognized, speaker: Speaker, start_secs: f64) -> Vec<Seg
         .collect()
 }
 
+/// Takes echo out of the segments before they are merged
+/// (`store::drop_echoes`).
+type EchoFilter = fn(Vec<Segment>) -> Vec<Segment>;
+
 fn write_loop(
     store: Store,
     opts: MeetingOptions,
     started: Instant,
     recognizer: Recognizer,
     rx: Receiver<WriterMsg>,
+    echo_filter: Option<EchoFilter>,
     emit: Emit,
 ) -> Result<(), EngineError> {
     let mut segments: Vec<Segment> = Vec::new();
-    let write = |segments: &[Segment], length_secs: u64, in_progress: bool| {
+    // Every write filters the whole meeting again: a "Them" chunk can land
+    // after the "You" chunk its echo is in.
+    let mut dropped = 0;
+    let mut write = |segments: &[Segment], length_secs: u64, in_progress: bool| {
+        let mut kept = segments.to_vec();
+        if let Some(filter) = echo_filter {
+            kept = filter(kept);
+            let now = segments.len() - kept.len();
+            if now != dropped {
+                log::info!("meeting: {now} echoed segments of \"You\" dropped");
+                dropped = now;
+            }
+        }
         let meeting = Meeting {
             title: opts.title.clone(),
             started_at: opts.started_at,
             length_secs,
             in_progress,
-            utterances: merge_segments(segments.to_vec()),
+            utterances: merge_segments(kept),
         };
         store.write_meeting(&opts.path, &meeting)
     };
@@ -571,7 +616,7 @@ mod tests {
         let emit: Emit = Arc::new(move |e| ev.lock().unwrap().push(e));
         let writer = std::thread::spawn({
             let opts = opts.clone();
-            move || write_loop(store, opts, Instant::now(), r, rx, emit)
+            move || write_loop(store, opts, Instant::now(), r, rx, Some(drop_echoes), emit)
         });
         let chunk = |speaker, start_secs, n| WriterMsg::Chunk {
             speaker,

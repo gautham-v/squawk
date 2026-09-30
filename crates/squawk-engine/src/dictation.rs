@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::audio::{self, MicCapture};
+use crate::audio::{self, MicCapture, MicListener, MicShare};
 use crate::engine::{BusyGuard, Emit, EngineEvent};
 use crate::error::EngineError;
 use crate::recognizer::{Priority, Recognizer, Reply};
@@ -56,8 +56,16 @@ pub struct Transcript {
 /// Where the audio comes from: the mic, or a clip replayed in real time
 /// (benchmarks and tests exercise the exact same path minus CoreAudio).
 pub(crate) enum Input {
-    Mic(Option<String>),
-    Replay { samples: Vec<f32>, speed: f32 },
+    /// The named device (`None` = default); or, while an echo-cancelled
+    /// meeting holds the mic, that meeting's stream.
+    Mic {
+        device: Option<String>,
+        share: MicShare,
+    },
+    Replay {
+        samples: Vec<f32>,
+        speed: f32,
+    },
 }
 
 /// A running audio source that can be stopped (flushing what it holds).
@@ -69,6 +77,10 @@ impl Source for MicCapture {
     fn stop(self: Box<Self>) {
         MicCapture::stop(*self);
     }
+}
+
+impl Source for MicListener {
+    fn stop(self: Box<Self>) {}
 }
 
 struct Replay {
@@ -388,7 +400,12 @@ impl Drop for DictationSession {
 
 fn open(input: Input, shared: Arc<Shared>, emit: Emit) -> Result<Box<dyn Source>, EngineError> {
     match input {
-        Input::Mic(device) => {
+        Input::Mic { device, share } => {
+            let feeder = shared.clone();
+            if let Some(listener) = share.listen(move |b| feeder.feed(b)) {
+                log::info!("dictation: using the meeting's echo-cancelled mic");
+                return Ok(Box::new(listener));
+            }
             let session = shared.id;
             let feeder = shared.clone();
             let lost = emit.clone();

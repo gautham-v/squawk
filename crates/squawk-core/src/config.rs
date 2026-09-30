@@ -70,6 +70,11 @@ pub struct MeetingConfig {
     pub system_audio: bool,
     /// Take the title from the calendar event happening now.
     pub calendar_titles: bool,
+    /// Keep the other side out of "You" when the call plays on speakers:
+    /// the mic goes through Apple's voice processing (echo cancellation),
+    /// and a "You" line that repeats what "Them" said at the same moment is
+    /// dropped. Off records the mic as it is (fine with headphones).
+    pub echo_cancellation: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -111,6 +116,7 @@ impl Default for MeetingConfig {
             chunk_secs: 30,
             system_audio: true,
             calendar_titles: true,
+            echo_cancellation: true,
         }
     }
 }
@@ -232,6 +238,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# squawk settings. Every key is optiona
 # chunk_secs = 30
 # system_audio = true
 # calendar_titles = true
+# Take the other side out of your mic when the call plays on speakers. Other audio is
+# ducked a little while a meeting records; with headphones you can turn this off.
+# echo_cancellation = true
 
 [model]
 # dir = "parakeet-tdt-0.6b-v3-int8"
@@ -264,6 +273,14 @@ mod tests {
         assert!(c.dictation.claude_code_mode);
         assert_eq!(c.meeting.chunk_secs, 30);
         assert_eq!(c.model.url, DEFAULT_MODEL_URL);
+    }
+
+    #[test]
+    fn echo_cancellation_is_on_unless_turned_off() {
+        assert!(Config::default().meeting.echo_cancellation);
+        let c = Config::parse("[meeting]\necho_cancellation = false\n").unwrap();
+        assert!(!c.meeting.echo_cancellation);
+        assert!(c.meeting.system_audio);
     }
 
     #[test]

@@ -101,7 +101,8 @@ Yes, loud and clear.
   (`Store::write_meeting`, temp + rename) after every chunk; the final write drops `status`.
 - Blocks: `**You** HH:MM:SS` / `**Them** HH:MM:SS` (offset from meeting start), then the text.
   Consecutive segments of one speaker fold into one block (`store::merge_segments`: sort by start,
-  ties to You, drop empty, coalesce).
+  ties to You, drop empty, coalesce). With `echo_cancellation`, `store::drop_echoes` runs first
+  (see "Meetings: echo").
 - Parse: `store::parse_meeting` (lenient), `Store::meetings()` → `Vec<MeetingSummary>` newest first
   (hand-written files without front matter still list, titled/dated from the file name).
 
@@ -144,6 +145,7 @@ defaults plus a human note (`Config::load -> (Config, Option<String>)`) that the
 | `[meeting] chunk_secs` | `30` (5–300) | transcription chunk length per track |
 | `[meeting] system_audio` | `true` | record the other side as "Them" |
 | `[meeting] calendar_titles` | `true` | title from the current calendar event |
+| `[meeting] echo_cancellation` | `true` | echo-cancelled mic + drop "You" lines that repeat "Them" (see "Meetings: echo") |
 | `[model] dir` | `parakeet-tdt-0.6b-v3-int8` | directory under models/ |
 | `[model] url` | `https://blob.handy.computer/parakeet-v3-int8.tar.gz` | where to download it |
 | `[model] threads` | `0` | ORT intra-op threads, 0 = ORT decides |
@@ -382,7 +384,8 @@ transcribe}`, `Recognized{text, segments}`), `recognizer` (`Priority::{Dictation
   buffer. The CoreAudio callback only copies into a channel/ring; downmix + resample to 16 kHz +
   segmenting happen on the capture thread. Committed segments are submitted to the recognizer
   immediately (dictation priority); results are collected in order.
-- **Meeting**: two capture threads (mic via cpal, system audio via ScreenCaptureKit) each feeding a
+- **Meeting**: two capture threads (mic via cpal, or voice processing with `echo_cancellation`;
+  system audio via ScreenCaptureKit) each feeding a
   segmenter configured for `chunk_secs` (min = chunk − 5 s, max = chunk + 5 s), and a writer thread
   that offsets each chunk's segments into meeting time, merges with `store::merge_segments`, and
   rewrites the file (`status: recording`) after each chunk, sending `MeetingProgress`.
@@ -425,8 +428,52 @@ ScreenCaptureKit audio-only via the `screencapturekit` crate (v11, feature `maco
 `sample_rate = 16000`, `channel_count = 1`, minimal video (2×2, lowest frame rate), only an Audio
 output handler. Needs "Screen & System Audio Recording". If it fails, the meeting continues
 mic-only (`MeetingWarning`), `had_system_audio = false`. (A Core Audio process tap is the fallback
-design if SCK proves unreliable; same API.) Echo (their voice leaking into your mic on speakers) is
-not handled in v1; README recommends headphones.
+design if SCK proves unreliable; same API.)
+
+### Meetings: echo
+
+On speakers the other side comes back in through the mic and would be transcribed twice, once as
+"Them" and once as "You". Two layers, both behind `[meeting] echo_cancellation` (default on):
+
+1. **Voice processing on the meeting mic** (`voice_processing.rs`, `audio::MicMode::EchoCancelled`).
+   `AVAudioEngine` with `inputNode.setVoiceProcessingEnabled(true)`: Apple's voice processing I/O
+   (echo cancellation, noise suppression, AGC). It cancels whatever the output device plays, from
+   any app, so the call never has to pass through squawk and ScreenCaptureKit is not its
+   reference. Other-audio ducking is set to the minimum (`enableAdvancedDucking = false`,
+   `duckingLevel = .min`). The input node reports 9 channels on a MacBook Pro; channel 0 is the
+   processed voice. The output side (`mainMixerNode`) must exist before voice processing is turned
+   on, or `start` fails with -10875. A hardware change stops the engine and posts
+   `AVAudioEngineConfigurationChangeNotification`; that goes through the same reopen path as a
+   lost cpal stream (reopened, silence for the gap). It always uses the default input: a named
+   `input_device` other than the default, or a failure to start, falls back to plain cpal capture
+   with a log line. Dictation never uses it (no ducking, lowest latency).
+2. **Transcript filter** (`store::drop_echoes`, run by the meeting writer over all segments on
+   every write, since a "Them" chunk can land after the "You" chunk its echo is in). Pool the
+   words of the "Them" segments overlapping a "You" segment (each widened by 3 s). The "You"
+   segment is dropped when it has ≥ 4 words, ≥ 75 % of them appear in the pool in order (LCS),
+   and ≥ 50 % sit in a word pair the pool also has. Echo is their sentence again give or take a
+   misheard word; a reply shares a phrase at most, and the pair test stops a long pool from
+   matching scattered function words. Short answers ("Yes.", "Right, exactly.") are never
+   dropped; a verbatim read-back of 4+ words within 3 s would be.
+
+Measured on a MacBook Pro (M4) with its built-in speakers and mic, `say` at volume 44/100
+(`probe meeting 17 [no-aec]`, two sentences, 25 words): without echo cancellation all 25 words
+came back as "You", verbatim; with it, none (the mic's speech level fell ~46 dB, the transcript
+filter had nothing left to drop). Run on the no-AEC transcripts, the filter alone dropped every
+leaked block and kept every "Them" block.
+
+Costs: other audio (the call itself, music) is ducked ~8 dB while a meeting records, in the
+speakers and in the "Them" track alike (the default ducking level is ~30 dB); transcription of
+"Them" was unaffected. Opening takes ~0.6–0.7 s instead of ~0.1 s, a reopen ~1.4 s. CPU: ~22 % of
+one core in-process plus ~8 % in coreaudiod, against ~3 % for plain capture. Voice processing
+also applies noise suppression and AGC to your own voice; the measurement above had no near-end
+talker, so it says nothing about how that changes transcription of "You".
+
+While voice processing runs, macOS hands every other client of that mic a signal ~40 dB down. A
+dictation during such a meeting therefore does not open its own stream: it listens to the
+meeting's (`audio::MicShare`, held by the engine and lent by the meeting while its mic is echo
+cancelled), which also keeps the call out of the dictation. Its blocks come in ~100 ms pieces
+(the `AVAudioEngine` tap), so a dictation during a meeting can be up to ~100 ms slower to paste.
 
 ### Audio files
 
@@ -668,7 +715,8 @@ test fixtures use generic names and `you@example.com`. `.gitignore` covers `targ
   function word after an unpunctuated segment is lowercased.
 - Additive API: `DictationSession::level()` (0..1 meter), `Engine::
   start_dictation_replay(samples, speed)` (the bench/test path: a clip fed through the real
-  session), `MicCapture::start_with_errors`, `audio::{rms, resample_all}`,
+  session), `MicCapture::{start_with_errors, start_with_mode, echo_cancelled}`, `audio::MicMode`,
+  `audio::{rms, resample_all}`, `store::drop_echoes`,
   `model::{install_tarball, DEFAULT_TARBALL_SIZE, DEFAULT_TARBALL_SHA256}` (the default tarball is
   size- and SHA-256-checked), `recognizer::{Backend, LoadState, parakeet_loader}`,
   `Recognizer::{spawn_with, submit_cancellable, state, wait_ready}`.

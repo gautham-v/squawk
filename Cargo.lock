@@ -4216,6 +4216,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13a380031deed8e99db00065c45937da434ca987c034e13b87e4441f9e4090be"
 dependencies = [
  "bitflags 2.13.2",
+ "block2",
  "objc2",
  "objc2-foundation",
 ]
@@ -6167,12 +6168,16 @@ name = "squawk-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "block2",
  "chrono",
  "cpal",
  "crossbeam-channel",
  "flate2",
  "hound",
  "log",
+ "objc2",
+ "objc2-avf-audio",
+ "objc2-foundation",
  "screencapturekit 11.0.0",
  "sha2 0.10.9",
  "squawk-core",

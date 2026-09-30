@@ -170,8 +170,14 @@ Mac's audio as **Them**, and transcribes both in 30-second chunks as the meeting
 is readable while it grows. The title comes from the calendar event happening now, if Squawk may
 read your calendar, else "Meeting".
 
-System audio needs Screen & System Audio Recording. Use headphones: on speakers the other side
-also leaks into your mic and shows up twice.
+System audio needs Screen & System Audio Recording.
+
+Headphones are not needed. On speakers the other side also reaches your mic, so during a meeting
+Squawk records the mic through Apple's voice processing (the echo cancellation built into
+macOS for calls), which takes out whatever your Mac is playing, and it drops any "You" line that repeats what "Them"
+said at the same moment. Short answers like "Yes." are always kept. While a meeting records, other
+audio is ducked a little (about 8 dB, the least macOS allows). With headphones you can turn this
+off: `echo_cancellation = false` under `[meeting]`. Dictation never uses it.
 
 ## Privacy
 

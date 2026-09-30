@@ -27,6 +27,11 @@ transcribe-rs = { version = "0.3.11", features = ["onnx"] }
 cpal = "0.18"
 hound = "3.5"
 screencapturekit = { version = "11", features = ["macos_15_0"] }
+# echo-cancelled mic for meetings (AVAudioEngine voice processing)
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "block2", "NSNotification", "NSString", "NSOperation", "NSObject", "NSError"] }
+objc2-avf-audio = { version = "0.3.2", default-features = false, features = ["std", "block2", "AVAudioEngine", "AVAudioIONode", "AVAudioNode", "AVAudioFormat", "AVAudioBuffer", "AVAudioTypes", "AVAudioTime", "AVAudioMixerNode"] }
 
 # threads
 crossbeam-channel = "0.5"

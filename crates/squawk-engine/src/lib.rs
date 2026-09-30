@@ -8,7 +8,8 @@
 //! - each [`DictationSession`] owns a **capture** thread holding the cpal
 //!   input stream (cpal streams are `!Send`) and a **segmenter** that cuts
 //!   committed speech at pauses and submits it while the user is talking;
-//! - a meeting owns two capture threads (mic via cpal, system audio via
+//! - a meeting owns two capture threads (mic via cpal, or echo-cancelled
+//!   through voice processing; system audio via
 //!   ScreenCaptureKit) and a **writer** thread that merges finished chunks
 //!   and rewrites the meeting file.
 //!
@@ -24,6 +25,7 @@ pub mod model;
 pub mod recognizer;
 pub mod segmenter;
 pub mod system_audio;
+mod voice_processing;
 
 pub use dictation::{DictationSession, Transcript};
 pub use engine::{Engine, EngineConfig, EngineEvent};
