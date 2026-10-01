@@ -5,7 +5,9 @@
 //! segment timestamps. Segments are offset to meeting time, merged with
 //! `squawk_core::store::merge_segments`, and the whole file is rewritten via
 //! `Store::write_meeting` after every chunk (front matter `status:
-//! recording` until the end), so a crash loses at most one chunk.
+//! recording` until the end), so a crash loses at most one chunk. Each
+//! segment's text goes through `pipeline::meeting_segment` first:
+//! hesitations and stutters out, then the dictionary.
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -16,9 +18,11 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, SecondsFormat};
 use crossbeam_channel::{Receiver, Sender};
+use squawk_core::dictionary::DictionaryCache;
+use squawk_core::pipeline;
 use squawk_core::status::MeetingInfo;
 use squawk_core::store::{drop_echoes, merge_segments, Meeting, Segment, Speaker};
-use squawk_core::Store;
+use squawk_core::{Dictionary, Store};
 
 use crate::audio::{self, MicCapture, MicMode, MicShare};
 use crate::engine::{BusyGuard, Emit, EngineConfig, EngineEvent};
@@ -96,11 +100,14 @@ impl MeetingHandle {
         let (writer_tx, writer_rx) = crossbeam_channel::unbounded();
         let writer = {
             let (opts, emit) = (opts.clone(), emit.clone());
-            let filter = echo_cancellation.then_some(drop_echoes as EchoFilter);
+            let tidy = Tidy {
+                echo_filter: echo_cancellation.then_some(drop_echoes as EchoFilter),
+                dictionary: DictionaryCache::new(config.paths.dictionary_file.clone()),
+            };
             std::thread::Builder::new()
                 .name("squawk-meeting-writer".into())
                 .spawn(move || {
-                    write_loop(store, opts, started, recognizer, writer_rx, filter, emit)
+                    write_loop(store, opts, started, recognizer, writer_rx, tidy, emit)
                 })?
         };
         let seg_config = SegmenterConfig::for_meeting(opts.chunk_secs);
@@ -428,29 +435,30 @@ fn gap_to_fill(origin: f64, now: f64, received: usize, block: usize) -> usize {
 }
 
 /// A chunk's model output as meeting segments: timestamps moved from the
-/// chunk's clock to the meeting's. A result with text but no segments
-/// becomes one segment at the chunk start.
-fn chunk_segments(rec: Recognized, speaker: Speaker, start_secs: f64) -> Vec<Segment> {
-    if rec.segments.is_empty() {
-        let text = rec.text.trim();
-        if text.is_empty() {
-            return Vec::new();
-        }
-        return vec![Segment {
-            speaker,
-            start_secs,
-            end_secs: start_secs,
-            text: text.to_string(),
-        }];
-    }
-    rec.segments
+/// chunk's clock to the meeting's, and each text cleaned
+/// (`pipeline::meeting_segment`); a segment with nothing left is dropped.
+/// A result with text but no segments becomes one segment at the chunk
+/// start.
+fn chunk_segments(
+    rec: Recognized,
+    speaker: Speaker,
+    start_secs: f64,
+    dictionary: &Dictionary,
+) -> Vec<Segment> {
+    let timed = if rec.segments.is_empty() {
+        vec![(0.0, 0.0, rec.text)]
+    } else {
+        rec.segments
+    };
+    timed
         .into_iter()
         .map(|(s, e, text)| Segment {
             speaker,
             start_secs: start_secs + s as f64,
             end_secs: start_secs + e as f64,
-            text,
+            text: pipeline::meeting_segment(&text, dictionary),
         })
+        .filter(|s| !s.text.is_empty())
         .collect()
 }
 
@@ -458,15 +466,26 @@ fn chunk_segments(rec: Recognized, speaker: Speaker, start_secs: f64) -> Vec<Seg
 /// (`store::drop_echoes`).
 type EchoFilter = fn(Vec<Segment>) -> Vec<Segment>;
 
+/// What the writer does to the text besides transcribing it.
+struct Tidy {
+    echo_filter: Option<EchoFilter>,
+    /// The user's words, re-read when dictionary.txt changes.
+    dictionary: DictionaryCache,
+}
+
 fn write_loop(
     store: Store,
     opts: MeetingOptions,
     started: Instant,
     recognizer: Recognizer,
     rx: Receiver<WriterMsg>,
-    echo_filter: Option<EchoFilter>,
+    tidy: Tidy,
     emit: Emit,
 ) -> Result<(), EngineError> {
+    let Tidy {
+        echo_filter,
+        mut dictionary,
+    } = tidy;
     let mut segments: Vec<Segment> = Vec::new();
     // Every write filters the whole meeting again: a "Them" chunk can land
     // after the "You" chunk its echo is in.
@@ -503,7 +522,9 @@ fn write_loop(
                     .map_err(|_| EngineError::Transcribe("the recognizer stopped".into()))
                     .and_then(|r| r);
                 match got {
-                    Ok(rec) => segments.extend(chunk_segments(rec, speaker, start_secs)),
+                    Ok(rec) => {
+                        segments.extend(chunk_segments(rec, speaker, start_secs, dictionary.get()))
+                    }
                     Err(e) => {
                         log::warn!("meeting: chunk failed: {e}");
                         emit(EngineEvent::MeetingWarning(format!(
@@ -547,7 +568,7 @@ mod tests {
                 (2.0, 3.0, "Next point.".into()),
             ],
         };
-        let segs = chunk_segments(rec, Speaker::Them, 60.0);
+        let segs = chunk_segments(rec, Speaker::Them, 60.0, &Dictionary::default());
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[0].speaker, Speaker::Them);
         assert!((segs[0].start_secs - 60.5).abs() < 1e-6);
@@ -561,10 +582,33 @@ mod tests {
             text: " Okay. ".into(),
             segments: vec![],
         };
-        let segs = chunk_segments(rec, Speaker::You, 12.0);
+        let none = Dictionary::default();
+        let segs = chunk_segments(rec, Speaker::You, 12.0, &none);
         assert_eq!(segs.len(), 1);
         assert_eq!((segs[0].start_secs, segs[0].text.as_str()), (12.0, "Okay."));
-        assert!(chunk_segments(Recognized::default(), Speaker::You, 0.0).is_empty());
+        assert!(chunk_segments(Recognized::default(), Speaker::You, 0.0, &none).is_empty());
+    }
+
+    #[test]
+    fn chunk_segments_are_cleaned_and_spelled_by_the_dictionary() {
+        let rec = Recognized {
+            text: "Um, I'm at front word. Uh. The the release agent.".into(),
+            segments: vec![
+                (0.0, 1.5, "Um, I'm at front word.".into()),
+                (2.0, 2.2, "Uh.".into()),
+                (3.0, 4.5, "The the release agent.".into()),
+            ],
+        };
+        let dict = Dictionary::parse("front word -> Frontward\n");
+        let segs = chunk_segments(rec, Speaker::You, 10.0, &dict);
+        let texts: Vec<(f64, &str)> = segs
+            .iter()
+            .map(|s| (s.start_secs, s.text.as_str()))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![(10.0, "I'm at Frontward."), (13.0, "The release agent.")]
+        );
     }
 
     #[test]
@@ -616,7 +660,11 @@ mod tests {
         let emit: Emit = Arc::new(move |e| ev.lock().unwrap().push(e));
         let writer = std::thread::spawn({
             let opts = opts.clone();
-            move || write_loop(store, opts, Instant::now(), r, rx, Some(drop_echoes), emit)
+            let tidy = Tidy {
+                echo_filter: Some(drop_echoes),
+                dictionary: DictionaryCache::new(paths.dictionary_file.clone()),
+            };
+            move || write_loop(store, opts, Instant::now(), r, rx, tidy, emit)
         });
         let chunk = |speaker, start_secs, n| WriterMsg::Chunk {
             speaker,
@@ -652,6 +700,65 @@ mod tests {
             .filter(|e| matches!(e, EngineEvent::MeetingProgress { .. }))
             .count();
         assert_eq!(progress, 3);
+    }
+
+    /// Says the same sentence for every chunk.
+    struct Says(&'static str);
+
+    impl Backend for Says {
+        fn transcribe(&mut self, _: &[f32]) -> Result<Recognized, EngineError> {
+            Ok(Recognized {
+                text: self.0.into(),
+                segments: vec![(0.0, 2.0, self.0.into())],
+            })
+        }
+    }
+
+    #[test]
+    fn writer_cleans_segments_and_reads_the_dictionary_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::under(tmp.path());
+        std::fs::create_dir_all(paths.dictionary_file.parent().unwrap()).unwrap();
+        std::fs::write(&paths.dictionary_file, "front word -> Frontward\n").unwrap();
+        let store = Store::new(&paths);
+        let path = paths.meetings_dir.join("2026-10-01 1000 Interview.md");
+        let opts = MeetingOptions {
+            title: "Interview".into(),
+            path: path.clone(),
+            started_at: Local::now(),
+            chunk_secs: 30,
+            system_audio: true,
+        };
+        let r = Recognizer::spawn_with(
+            PathBuf::from("/fake"),
+            || {
+                Ok(
+                    Box::new(Says("Um, I I work at front word, uh, on the the agents."))
+                        as Box<dyn Backend>,
+                )
+            },
+            |_| {},
+        );
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let tidy = Tidy {
+            echo_filter: None,
+            dictionary: DictionaryCache::new(paths.dictionary_file.clone()),
+        };
+        let emit: Emit = Arc::new(|_| {});
+        let writer =
+            std::thread::spawn(move || write_loop(store, opts, Instant::now(), r, rx, tidy, emit));
+        tx.send(WriterMsg::Chunk {
+            speaker: Speaker::You,
+            start_secs: 0.0,
+            samples: vec![0.0; 10],
+        })
+        .unwrap();
+        tx.send(WriterMsg::Finish { length_secs: 5 }).unwrap();
+        writer.join().unwrap().unwrap();
+
+        let m = Store::new(&paths).read_meeting(&path).unwrap();
+        assert_eq!(m.utterances.len(), 1);
+        assert_eq!(m.utterances[0].text, "I work at Frontward on the agents.");
     }
 
     #[test]

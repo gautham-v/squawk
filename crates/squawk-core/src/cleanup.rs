@@ -93,7 +93,22 @@ pub fn strip(raw: &str, opts: &CleanupOptions) -> String {
     if opts.fix_doubles {
         collapse_doubles(&mut chunks);
     }
-    let out = text::join(&chunks);
+    joined(&chunks)
+}
+
+/// What a meeting segment gets: the sounds that are never words go and
+/// stutters collapse. The fillers that are words ("like", "you know", a
+/// leading "so") stay: a transcript is a record of what was said.
+pub fn strip_hesitations(raw: &str) -> String {
+    let mut chunks = text::chunks(raw);
+    remove_hesitations(&mut chunks);
+    collapse_doubles(&mut chunks);
+    joined(&chunks)
+}
+
+/// The chunks as text, or nothing when no word is left.
+fn joined(chunks: &[Chunk]) -> String {
+    let out = text::join(chunks);
     if out.chars().any(char::is_alphanumeric) {
         out
     } else {
@@ -484,6 +499,25 @@ mod tests {
             fix_doubles: false,
         };
         assert_eq!(clean("um the the thing", &off), "Um the the thing.");
+    }
+
+    #[test]
+    fn meeting_segments_lose_hesitations_and_stutters_only() {
+        let m = strip_hesitations;
+        assert_eq!(
+            m("Um, yeah, I I think the the plan is, uh, fine."),
+            "Yeah, I think the plan is fine."
+        );
+        // The fillers that are words stay, and so do the edges: a segment
+        // is not a sentence.
+        assert_eq!(
+            m("So, like, it works, you know,"),
+            "So, like, it works, you know,"
+        );
+        assert_eq!(m("and then we shipped it"), "and then we shipped it");
+        assert_eq!(m("No no no."), "No no no.");
+        assert_eq!(m("Uh."), "");
+        assert_eq!(m("  "), "");
     }
 
     #[test]

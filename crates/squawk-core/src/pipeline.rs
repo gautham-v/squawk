@@ -12,6 +12,9 @@
 //! 4. `cleanup::finalize` — capital first letter, end punctuation, spacing.
 //!
 //! An empty result means "nothing to paste".
+//!
+//! A meeting segment gets less ([`meeting_segment`]): hesitations and
+//! stutters out, then the dictionary.
 
 use std::time::{Duration, Instant};
 
@@ -111,6 +114,19 @@ pub fn finish(
     cleanup::finalize(&text)
 }
 
+/// One segment of a meeting transcript: hesitations and stutters go
+/// (`cleanup::strip_hesitations`), then the dictionary. No S1-mini (it is
+/// made for a dictation, and a meeting is hours of them), no Claude Code
+/// mode, and no `finalize`: segments are joined into one block, so a
+/// segment's edges are not a sentence's. Empty means "drop the segment".
+pub fn meeting_segment(raw: &str, dictionary: &Dictionary) -> String {
+    let text = cleanup::strip_hesitations(raw);
+    if text.is_empty() {
+        return text;
+    }
+    dictionary.apply(&text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +171,16 @@ mod tests {
             "I need to send the report to Claude Code by Thursday."
         );
         assert_eq!(out.cleanup, Cleanup::Model);
+    }
+
+    #[test]
+    fn a_meeting_segment_gets_the_dictionary_and_keeps_its_edges() {
+        let dict = Dictionary::parse("front word -> Frontward\nGotham -> Gautham\n");
+        assert_eq!(
+            meeting_segment("um, I'm Gotham, I I work at front word and", &dict),
+            "I'm Gautham, I work at Frontward and"
+        );
+        assert_eq!(meeting_segment("Uh, um.", &dict), "");
     }
 
     #[test]
