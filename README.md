@@ -189,6 +189,10 @@ Mac's audio as **Them**, and transcribes both in 30-second chunks as the meeting
 is readable while it grows. The title comes from the calendar event happening now, if Squawk may
 read your calendar, else "Meeting".
 
+Both sides are tidied a little: "um" and "uh" go, a stutter ("the the plan") is written once, and
+your dictionary applies, so names come out spelled your way. Nothing else is changed, and S1-mini
+is not used for meetings.
+
 System audio needs Screen & System Audio Recording.
 
 Headphones are not needed. On speakers the other side also reaches your mic, so during a meeting
@@ -279,7 +283,8 @@ bar app), `squawk-cli` (`squawk`). [docs/design.md](docs/design.md) describes ho
 - [Parakeet TDT 0.6B v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) by NVIDIA.
 - The ONNX export by [istupakov](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx).
 - [transcribe-rs](https://github.com/cjpais/transcribe-rs) and [Handy](https://github.com/cjpais/Handy)
-  by cjpais, which showed the way and host the model download.
+  by cjpais, which showed the way and host the model download. `vendor/transcribe-rs` is 0.3.11
+  with one fix to Parakeet's decoding.
 - [S1-mini](https://huggingface.co/superwhisper/s1-mini-GGUF) by
   [Superwhisper](https://superwhisper.com), the cleanup model (built on Qwen3-0.6B by Alibaba
   Cloud), run through [llama.cpp](https://github.com/ggml-org/llama.cpp) via

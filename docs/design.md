@@ -23,6 +23,7 @@ crates/squawk-engine       lib   audio, segmenter, model, recognizer, normalizer
 crates/squawk-app          lib+bin "squawk-app", bundled as Squawk.app (LSUIElement)
 crates/squawk-cli          bin "squawk"
 scripts/bundle.sh          builds Squawk.app
+vendor/transcribe-rs       transcribe-rs 0.3.11 with one decoding fix; not a workspace member ([patch.crates-io])
 ```
 
 Dependency direction: `core ← engine ← app`, `core ← engine ← cli`. The CLI links the engine for
@@ -105,6 +106,9 @@ Yes, loud and clear.
   Consecutive segments of one speaker fold into one block (`store::merge_segments`: sort by start,
   ties to You, drop empty, coalesce). With `echo_cancellation`, `store::drop_echoes` runs first
   (see "Meetings: echo").
+- Text: each segment goes through `pipeline::meeting_segment` as its chunk is transcribed
+  (hesitations and stutters out, then the dictionary), before the echo filter sees it. A segment
+  with nothing left ("Uh.") is dropped.
 - Parse: `store::parse_meeting` (lenient), `Store::meetings()` → `Vec<MeetingSummary>` newest first
   (hand-written files without front matter still list, titled/dated from the file name).
 
@@ -202,6 +206,8 @@ optimise. **Never log dictated text** (privacy); lengths only.
   before a clause opener: "So I think…" loses it, "So far so good" keeps it).
   Stutters collapse ("the the", "we should we should") except words that are doubled on purpose
   (`that that`, `had had`, `very very`, `no no`…).
+  `strip_hesitations` is the meeting subset: um/uh and stutters only; the fillers that are words
+  stay.
 - `dictionary` — `Entry`, `Dictionary::{parse, load, apply, entries, terms, is_empty}`, `add`,
   `DictionaryCache`.
 - `pipeline::finish(raw, &Dictionary, Option<&context::Context>, &CleanupOptions) -> String` —
@@ -211,6 +217,9 @@ optimise. **Never log dictated text** (privacy); lengths only.
   **raw** transcript first (it does far better on Parakeet's own words than on stripped text), then
   `finish` on its answer. Not ready → `Cleanup::Rules`; an error, a timeout, too long an input, or
   an answer `normalize::accept` rejects → `Cleanup::Fallback(why)` with exactly `finish(raw)`.
+- `pipeline::meeting_segment(raw, &Dictionary) -> String` — one segment of a meeting:
+  `strip_hesitations` → `Dictionary::apply`. No S1-mini, no context, no `finalize` (segments are
+  joined into blocks, so a segment's edges are not a sentence's). Empty = drop the segment.
 - `normalize` — what S1-mini needs without the model: `SYSTEM_PROMPT` and `CONTROL_LINE`
   (`[Styling: semi-formal] [Structure: prose] [Context: general]`, byte for byte what it was
   trained on), `chat_prompt(text)` (ChatML ending in the empty think block: thinking off),
@@ -993,6 +1002,20 @@ test fixtures use generic names and `you@example.com`. `.gitignore` covers `targ
 - `model.threads` is accepted but ignored: `transcribe-rs` builds its ORT sessions
   itself. Model segment texts are re-spaced from the full text (`transcribe-rs` drops the space
   before numbers in segment text: "about700").
+- `vendor/transcribe-rs` is crates.io 0.3.11 (library only) with one change, marked `squawk:`
+  in `src/onnx/parakeet/mod.rs`. Its greedy decode ignores the TDT duration head and visits every
+  frame; on a real stutter the model stays on one frame and emits the same token until
+  `MAX_TOKENS_PER_STEP` (10): "the the the the the the the the the the the tooling", "1111" as
+  twenty-two 1s. A 75-minute meeting had 57 such runs. Dictation hid them (S1-mini and the
+  stutter rule); meetings showed them. The fix: the same token twice on one frame moves to the
+  next frame instead of being emitted. Measured on 170 LibriSpeech test-other clips and 160 AMI
+  meeting utterances of 10+ words (Hugging Face datasets server, int8 model): LibriSpeech WER
+  4.23 % before and after, word for word the same; AMI 18.6 % → 13.7 %, runs of 4+ repeats 16 →
+  0. Decoding with the duration head (upstream PR cjpais/transcribe-rs#90, what NeMo does) also
+  ends the runs and scores the same within noise (4.16 %, 13.9 %), but it changed 39 of the 330
+  transcripts and sometimes skips speech ("Please open the settings" → "Plepen the settings",
+  "Oh, I thought we sort of decided." → "Oh."), so it was not taken. `[workspace] exclude` keeps
+  the copy out of `--workspace` test, clippy and fmt runs. Drop it when a release has a fix.
 - Mic loss: cpal pauses the stream when the input device disappears or changes its nominal
   sample rate (AirPods do the latter the moment their mic opens, switching to the headset
   profile). `MicCapture` reopens the device (the named one, else the default) with a fresh
