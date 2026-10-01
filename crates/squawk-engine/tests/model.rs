@@ -137,3 +137,36 @@ fn meeting_segments_keep_their_spaces_and_times() {
     assert!(r.segments.windows(2).all(|w| w[0].0 <= w[1].0));
     assert!(r.segments.iter().all(|s| s.0 <= s.1 && s.1 <= secs));
 }
+
+/// transcribe-rs 0.3.11 decodes Parakeet TDT frame by frame, and on a real
+/// stutter stays on one frame writing the word until its 10-per-frame cap:
+/// "the the the the the the the the the the the tooling". The vendored copy
+/// moves on when a frame repeats a token.
+#[test]
+#[ignore = "needs the downloaded model"]
+fn a_stutter_is_not_repeated_to_the_token_cap() {
+    let Some(engine) = engine() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let file = say(
+        tmp.path(),
+        "four",
+        "So yeah, I, I, I think the the the tooling to support the releases, and then, uh, \
+         uh, a layer of agents that sits on top. Where, where human handoff might be needed.",
+    );
+    let samples = audio::load_file(&file).unwrap();
+    engine.load_model_blocking().unwrap();
+    let text = engine.transcribe(&samples).unwrap();
+    let w = words(&text);
+    let w: Vec<&str> = w.split_whitespace().collect();
+    let longest = w
+        .chunk_by(|a, b| a == b)
+        .map(|run| run.len())
+        .max()
+        .unwrap_or(0);
+    // Said three times at most.
+    assert!(longest <= 4, "a word {longest} times in a row: {text:?}");
+    assert!(
+        w.join(" ").contains("tooling to support the releases"),
+        "{text:?}"
+    );
+}

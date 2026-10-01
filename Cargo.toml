@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/squawk-core", "crates/squawk-engine", "crates/squawk-app", "crates/squawk-cli"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,6 +22,12 @@ toml_edit = "0.22"
 regex = "1"
 log = "0.4"
 libc = "0.2"
+
+# transcribe-rs 0.3.11 with one fix: on a real stutter its Parakeet decode
+# wrote the word until the 10-per-frame cap ("the the the the the the the
+# the the the"). See vendor/transcribe-rs/Cargo.toml.
+[patch.crates-io]
+transcribe-rs = { path = "vendor/transcribe-rs" }
 
 [profile.release]
 opt-level = 3
