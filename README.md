@@ -2,6 +2,8 @@
 
 Local dictation for macOS. Hold fn, talk, let go: the words land in whatever has focus.
 
+<img src="docs/screenshot.png" width="364" alt="squawk: the menu bar popover while recording hands-free, with recent dictations and the app each one went to">
+
 Built for talking to Claude Code in a terminal. When the front app is a terminal running `claude`
 (or `codex`), spoken file names become `@mentions` ("look at audio dot rs" → `look at
 @src/audio.rs`) and the repo's jargon comes out spelled the way the repo spells it. Meetings are
