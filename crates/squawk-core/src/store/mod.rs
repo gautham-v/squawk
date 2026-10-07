@@ -13,7 +13,7 @@ pub use echo::{
 };
 pub use meeting::{
     format_meeting, meeting_file_name, merge_segments, parse_meeting, sanitize_title, Meeting,
-    MeetingSummary, Segment, Speaker, Utterance,
+    MeetingSummary, Outage, Segment, Speaker, Utterance,
 };
 
 use std::io::Write;
@@ -297,6 +297,7 @@ mod tests {
             started_at: started,
             length_secs: 2530,
             in_progress: false,
+            mic_outages: Vec::new(),
             utterances: vec![
                 Utterance {
                     speaker: Speaker::You,
@@ -323,6 +324,7 @@ mod tests {
                     started_at: later,
                     length_secs: 60,
                     in_progress: true,
+                    mic_outages: Vec::new(),
                     utterances: vec![],
                 },
             )

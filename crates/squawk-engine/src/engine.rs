@@ -81,8 +81,11 @@ pub enum EngineEvent {
     /// session (if it is the live one) rather than cancelling it.
     MicLost { session: u64, message: String },
     /// A meeting's mic disappeared and could not be reopened: the meeting
-    /// goes on, but "You" is no longer recorded.
+    /// goes on, but "You" is no longer recorded. It is tried again every
+    /// half minute (`audio::RETRY_LOST_EVERY`).
     MeetingMicLost(String),
+    /// The lost mic is back; "You" is recorded again.
+    MeetingMicBack,
     /// The cleanup model's status changed (same cadence as `Model`).
     /// `Missing` also stands for "turned off".
     CleanupModel(ModelStatus),

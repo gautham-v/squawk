@@ -572,9 +572,13 @@ On speakers the other side comes back in through the mic and would be transcribe
    processed voice. The output side (`mainMixerNode`) must exist before voice processing is turned
    on, or `start` fails with -10875. A hardware change stops the engine and posts
    `AVAudioEngineConfigurationChangeNotification`; that goes through the same reopen path as a
-   lost cpal stream (reopened, silence for the gap). It always uses the default input: a named
-   `input_device` other than the default, or a failure to start, falls back to plain cpal capture
-   with a log line. Dictation never uses it (no ducking, lowest latency).
+   lost cpal stream (reopened, silence for the gap). Some setups make it fire again within a
+   second of every reopen (seen on a Teams call with Sidecar connected: 22 stops in 28 s, then
+   nothing of "You" for 50 minutes); after `MAX_REOPENS` (10) such drops in a row the mic is
+   reopened plain for the rest of the meeting (`MicEvent::EchoCancellationOff`, a
+   `MeetingWarning`), and the transcript filter below still runs. It always uses the default
+   input: a named `input_device` other than the default, or a failure to start, falls back to
+   plain cpal capture with a log line. Dictation never uses it (no ducking, lowest latency).
 2. **Transcript filter** (`store::drop_echoes`, run by the meeting writer over all segments on
    every write, since a "Them" chunk can land after the "You" chunk its echo is in). Pool the
    words of the "Them" segments overlapping a "You" segment (each widened by 3 s). The "You"
@@ -682,7 +686,8 @@ One thread; owns `Engine`, the live `DictationSession`, the live `MeetingHandle`
 - `Ipc{Status}` → `StatusInfo` from the snapshot. `Reload` → re-read config, `engine.update_config`,
   tap `set_timings`.
 - Engine `Model(status)` → snapshot. `MicLost` for the live session → finish and paste what was
-  captured, then `last_error`. `MeetingMicLost` → "mic lost" on the meeting header line.
+  captured, then `last_error`. `MeetingMicLost` → "mic lost" on the meeting header line, until
+  `MeetingMicBack` clears it.
 - Notetaker: the loop waits with `recv_timeout(1 s)` and ticks the `Notetaker` at least once a
   second (and on every `MicCalls`) with the call apps last reported by `mic_watch` and the
   calendar's events from 10 minutes ago through the end of tomorrow (`calendar::upcoming_events`,
@@ -1020,9 +1025,15 @@ test fixtures use generic names and `you@example.com`. `.gitignore` covers `targ
   sample rate (AirPods do the latter the moment their mic opens, switching to the headset
   profile). `MicCapture` reopens the device (the named one, else the default) with a fresh
   resampler and keeps feeding the same sink, inserting silence for the gap so meeting time stays
-  on the wall clock. Only when reopening fails does it report loss: a dictation then finishes
-  (pastes what it has) via `EngineEvent::MicLost { session, .. }`, and a meeting keeps going with
-  "mic lost" in the header (`EngineEvent::MeetingMicLost`). Dictation events carry the session id
+  on the wall clock. A stream that drops out `MAX_REOPENS` (10) times in a row, each living under
+  `STABLE_AFTER` (60 s), is not reopened the same way again: voice processing gives way to plain
+  capture (`MicEvent::EchoCancellationOff`), and plain capture is given up on. Only then is loss
+  reported: a dictation finishes (pastes what it has) via `EngineEvent::MicLost { session, .. }`,
+  and a meeting keeps going with "mic lost" in the header (`EngineEvent::MeetingMicLost`) while
+  the capture thread tries the mic again every `RETRY_LOST_EVERY` (30 s); when it opens, silence
+  covers the gap (up to 3 h), `MicEvent::Back` → `EngineEvent::MeetingMicBack` clears the header,
+  and the outage is written to the file (`mic_lost: 00:00:28 to 00:05:10` in the front matter,
+  `to end` while it lasts, and an italic note under the title). Dictation events carry the session id
   so a late event from a cancelled session is ignored. `MicLost` is also sent when the mic cannot
   be opened at dictation start; cpal xruns are not reported. A named `input_device` that is
   missing falls back to the default.

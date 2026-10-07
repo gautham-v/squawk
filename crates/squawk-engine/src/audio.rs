@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SampleFormat, SizedSample};
-use crossbeam_channel::{select, Receiver, Sender};
+use crossbeam_channel::{after, never, select, Receiver, Sender};
 
 use crate::error::EngineError;
 use crate::voice_processing::VoiceInput;
@@ -32,6 +32,21 @@ pub enum MicMode {
     /// audio a little. Meetings. Falls back to `Plain` when it cannot start,
     /// or when a named device other than the default is asked for.
     EchoCancelled,
+}
+
+/// What a running mic reports about itself. Delivered on the capture thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MicEvent {
+    /// Voice processing kept stopping (another app renegotiating the same
+    /// device, a display with audio connecting, do this); the mic is now
+    /// recorded as is, without echo cancellation, for the rest of the
+    /// capture.
+    EchoCancellationOff,
+    /// The mic is gone and could not be reopened. The sink gets nothing
+    /// until `Back`; a reopen is tried every [`RETRY_LOST_EVERY`].
+    Lost(String),
+    /// The mic is back after `Lost`, with silence standing in for the gap.
+    Back { echo_cancelled: bool },
 }
 
 /// A running mic stream. The cpal stream lives on its own thread, which also
@@ -54,35 +69,47 @@ impl MicCapture {
         MicCapture::start_with_errors(device, sink, |_| {})
     }
 
-    /// [`MicCapture::start`], plus `on_lost` for a mic that is gone for
-    /// good. When the device disappears or changes its sample rate (AirPods
-    /// switching to their headset profile does this the moment their mic
-    /// opens), the stream is reopened on the same (or the default) device and
-    /// keeps feeding `sink`, with silence standing in for the gap so time
-    /// stays on the wall clock. `on_lost` is called only when reopening
-    /// fails; the sink then gets nothing more. Called on the capture thread.
+    /// [`MicCapture::start`], plus `on_lost` for a mic that is gone. When the
+    /// device disappears or changes its sample rate (AirPods switching to
+    /// their headset profile do this the moment their mic opens), the stream
+    /// is reopened on the same (or the default) device and keeps feeding
+    /// `sink`, with silence standing in for the gap so time stays on the wall
+    /// clock. `on_lost` is called only when reopening fails; the sink then
+    /// gets nothing more until the mic is back (see [`MicEvent`]). Called on
+    /// the capture thread.
     pub fn start_with_errors(
         device: Option<&str>,
         sink: impl FnMut(&[f32]) + Send + 'static,
         on_lost: impl FnOnce(String) + Send + 'static,
     ) -> Result<MicCapture, EngineError> {
-        MicCapture::start_with_mode(device, MicMode::Plain, sink, on_lost)
+        let mut on_lost = Some(on_lost);
+        MicCapture::start_with_mode(device, MicMode::Plain, sink, move |ev| {
+            if let MicEvent::Lost(why) = ev {
+                if let Some(f) = on_lost.take() {
+                    f(why);
+                }
+            }
+        })
     }
 
-    /// [`MicCapture::start_with_errors`] in the given [`MicMode`]. A reopen
-    /// after a device change uses the same mode.
+    /// [`MicCapture::start_with_errors`] in the given [`MicMode`], reporting
+    /// every [`MicEvent`]. A reopen after a device change uses the same mode,
+    /// until voice processing has dropped out [`MAX_REOPENS`] times in a row:
+    /// then the mic is recorded plain (`EchoCancellationOff`). A mic that
+    /// drops out that often even plain is given up on (`Lost`) and tried
+    /// again every [`RETRY_LOST_EVERY`] until it is `Back`.
     pub fn start_with_mode(
         device: Option<&str>,
         mode: MicMode,
         sink: impl FnMut(&[f32]) + Send + 'static,
-        on_lost: impl FnOnce(String) + Send + 'static,
+        on_event: impl FnMut(MicEvent) + Send + 'static,
     ) -> Result<MicCapture, EngineError> {
         let wanted = device.map(str::to_string);
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
         let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
         let thread = std::thread::Builder::new()
             .name("squawk-mic".into())
-            .spawn(move || capture_thread(wanted, mode, sink, on_lost, ready_tx, stop_rx))?;
+            .spawn(move || capture_thread(wanted, mode, sink, on_event, ready_tx, stop_rx))?;
         match ready_rx.recv() {
             Ok(Ok((name, echo_cancelled))) => Ok(MicCapture {
                 name,
@@ -214,11 +241,37 @@ impl Drop for MicListener {
 /// Waits before each attempt to reopen a lost mic. CoreAudio needs a
 /// moment after a route change before the new format is readable.
 const REOPEN_DELAYS_MS: [u64; 5] = [100, 250, 500, 1000, 2000];
-/// A device that keeps dropping out is given up on after this many reopens
-/// in one capture, rather than looping forever.
-const MAX_REOPENS: u32 = 20;
+/// A stream that drops out this many times in a row (each living less than
+/// [`STABLE_AFTER`]) is not reopened the same way again: voice processing
+/// gives way to plain capture, and plain capture is given up on until the
+/// next [`RETRY_LOST_EVERY`] try. On a Teams call with Sidecar connected,
+/// voice processing stopped every ~1.3 s from the moment it opened.
+const MAX_REOPENS: u32 = 10;
+/// A stream that has run this long before dropping out was fine; its drop
+/// starts a new count.
+const STABLE_AFTER: Duration = Duration::from_secs(60);
+/// How often a lost mic is tried again.
+pub const RETRY_LOST_EVERY: Duration = Duration::from_secs(30);
 /// Cap on the silence inserted for a reopen gap.
 const MAX_GAP: Duration = Duration::from_secs(10);
+/// Cap on the silence inserted when a lost mic comes back.
+const MAX_LOST_GAP: Duration = Duration::from_secs(3 * 60 * 60);
+
+/// What to do with a stream in `mode` that has just dropped out for the
+/// `drops`th time in a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Reopen(MicMode),
+    GiveUp,
+}
+
+fn after_drop(mode: MicMode, drops: u32) -> Step {
+    match mode {
+        _ if drops <= MAX_REOPENS => Step::Reopen(mode),
+        MicMode::EchoCancelled => Step::Reopen(MicMode::Plain),
+        MicMode::Plain => Step::GiveUp,
+    }
+}
 
 /// One opened stream and what its buffers need to become 16 kHz mono.
 struct Opened {
@@ -229,6 +282,10 @@ struct Opened {
 }
 
 impl Opened {
+    fn echo_cancelled(&self) -> bool {
+        matches!(self.stream, Stream::Voice(_))
+    }
+
     fn deliver(&mut self, raw: &[f32], sink: &mut impl FnMut(&[f32])) {
         let mono = downmix(raw, self.channels);
         let out = self.resampler.process(&mono);
@@ -272,7 +329,7 @@ fn capture_thread(
     wanted: Option<String>,
     mode: MicMode,
     mut sink: impl FnMut(&[f32]),
-    on_lost: impl FnOnce(String),
+    mut on_event: impl FnMut(MicEvent),
     ready: Ready,
     stop: Receiver<()>,
 ) {
@@ -281,6 +338,7 @@ fn capture_thread(
     // a late report from a stream already replaced is ignored.
     let (lost_tx, lost_rx) = crossbeam_channel::unbounded::<(u32, String)>();
     let mut generation = 0u32;
+    let mut mode = mode;
     let first = match open_stream(wanted.as_deref(), mode, &raw_tx, &lost_tx, generation) {
         Ok(opened) => opened,
         Err(e) => {
@@ -288,12 +346,21 @@ fn capture_thread(
             return;
         }
     };
-    let echo_cancelled = matches!(first.stream, Stream::Voice(_));
+    let echo_cancelled = first.echo_cancelled();
     let _ = ready.send(Ok((first.name.clone(), echo_cancelled)));
     let mut current = Some(first);
-    let mut on_lost = Some(on_lost);
+    let mut opened_at = Instant::now();
+    // Drops in a row, each after less than STABLE_AFTER of audio.
+    let mut drops = 0u32;
+    // When the mic was given up on, for the silence that stands in for
+    // the gap once it is back.
+    let mut lost_since: Option<Instant> = None;
 
     loop {
+        let retry = match lost_since {
+            Some(_) => after(RETRY_LOST_EVERY),
+            None => never(),
+        };
         select! {
             recv(raw_rx) -> msg => {
                 if let (Ok(raw), Some(mic)) = (msg, current.as_mut()) {
@@ -309,35 +376,69 @@ fn capture_thread(
                 let lost_at = Instant::now();
                 let name = old.name.clone();
                 old.close(&raw_rx, &mut sink);
-                log::warn!("mic: {name}: {why}; reopening");
+                if opened_at.elapsed() >= STABLE_AFTER {
+                    drops = 0;
+                }
+                drops += 1;
                 generation += 1;
-                let reopened = if generation > MAX_REOPENS {
-                    Reopen::Failed("it keeps dropping out".into())
-                } else {
-                    reopen(wanted.as_deref(), mode, &raw_tx, &lost_tx, generation, &stop)
+                let reopened = match after_drop(mode, drops) {
+                    Step::Reopen(next) => {
+                        if next != mode {
+                            log::warn!(
+                                "mic: {name}: {why}; voice processing stopped {drops} times in a row, recording without echo cancellation"
+                            );
+                            mode = next;
+                            drops = 0;
+                            on_event(MicEvent::EchoCancellationOff);
+                        } else {
+                            log::warn!("mic: {name}: {why}; reopening");
+                        }
+                        reopen(wanted.as_deref(), mode, &raw_tx, &lost_tx, generation, &stop)
+                    }
+                    Step::GiveUp => {
+                        log::warn!("mic: {name}: {why}; dropped out {drops} times in a row");
+                        Reopen::Failed("it keeps dropping out".into())
+                    }
                 };
                 match reopened {
                     Reopen::Opened(mic) => {
-                        let gap = silence_for(lost_at.elapsed());
                         log::info!(
                             "mic: reopened {} after {} ms",
                             mic.name,
                             lost_at.elapsed().as_millis()
                         );
-                        for block in gap.chunks(SAMPLE_RATE as usize / 10) {
-                            sink(block);
-                        }
+                        feed_silence(lost_at.elapsed().min(MAX_GAP), &mut sink);
                         current = Some(mic);
+                        opened_at = Instant::now();
                     }
                     Reopen::Failed(e) => {
-                        log::error!("mic: could not reopen: {e}");
-                        if let Some(f) = on_lost.take() {
-                            f(format!("{why}; reopening failed: {e}"));
-                        }
+                        log::error!(
+                            "mic: could not reopen: {e}; trying again every {} s",
+                            RETRY_LOST_EVERY.as_secs()
+                        );
+                        lost_since = Some(lost_at);
+                        on_event(MicEvent::Lost(format!("{why}; reopening failed: {e}")));
                     }
                     // Stopped while waiting to retry; the old stream is
                     // already closed and flushed.
                     Reopen::Stopped => return,
+                }
+            }
+            recv(retry) -> _ => {
+                let Some(since) = lost_since else { continue };
+                generation += 1;
+                match open_stream(wanted.as_deref(), mode, &raw_tx, &lost_tx, generation) {
+                    Ok(mic) => {
+                        log::info!("mic: {} back after {} s", mic.name, since.elapsed().as_secs());
+                        feed_silence(since.elapsed().min(MAX_LOST_GAP), &mut sink);
+                        let echo_cancelled = mic.echo_cancelled();
+                        current = Some(mic);
+                        opened_at = Instant::now();
+                        drops = 0;
+                        lost_since = None;
+                        on_event(MicEvent::Back { echo_cancelled });
+                    }
+                    Err(e) => log::debug!("mic: still lost: {e}"),
                 }
             }
             recv(stop) -> _ => break,
@@ -380,10 +481,17 @@ fn reopen(
     Reopen::Failed(last)
 }
 
-/// Zeros covering a reopen gap of `gap`, capped at [`MAX_GAP`].
-fn silence_for(gap: Duration) -> Vec<f32> {
-    let secs = gap.min(MAX_GAP).as_secs_f64();
-    vec![0.0; (secs * SAMPLE_RATE as f64) as usize]
+/// Feed `gap` of zeros to `sink` in 100 ms blocks, so the sink's clock
+/// covers the time the mic was away.
+fn feed_silence(gap: Duration, sink: &mut impl FnMut(&[f32])) {
+    let block = SAMPLE_RATE as usize / 10;
+    let zeros = vec![0.0f32; block];
+    let mut left = (gap.as_secs_f64() * SAMPLE_RATE as f64) as usize;
+    while left > 0 {
+        let n = left.min(block);
+        sink(&zeros[..n]);
+        left -= n;
+    }
 }
 
 fn open_stream(
@@ -821,6 +929,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_burst_of_drops_degrades_then_gives_up() {
+        assert_eq!(
+            after_drop(MicMode::EchoCancelled, 1),
+            Step::Reopen(MicMode::EchoCancelled)
+        );
+        assert_eq!(
+            after_drop(MicMode::EchoCancelled, MAX_REOPENS),
+            Step::Reopen(MicMode::EchoCancelled)
+        );
+        assert_eq!(
+            after_drop(MicMode::EchoCancelled, MAX_REOPENS + 1),
+            Step::Reopen(MicMode::Plain)
+        );
+        assert_eq!(
+            after_drop(MicMode::Plain, MAX_REOPENS),
+            Step::Reopen(MicMode::Plain)
+        );
+        assert_eq!(after_drop(MicMode::Plain, MAX_REOPENS + 1), Step::GiveUp);
+    }
+
+    #[test]
+    fn silence_covers_the_gap_in_blocks() {
+        let mut got = Vec::new();
+        let mut blocks = 0;
+        feed_silence(Duration::from_millis(250), &mut |b: &[f32]| {
+            blocks += 1;
+            got.extend_from_slice(b);
+        });
+        assert_eq!(got.len(), SAMPLE_RATE as usize / 4);
+        assert_eq!(blocks, 3);
+        assert!(got.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
     fn a_shared_mic_reaches_one_listener_while_live() {
         let share = MicShare::default();
         let got = Arc::new(Mutex::new(Vec::new()));
@@ -932,18 +1074,6 @@ mod tests {
         let x = sine(300.0, 16_000, 0.1);
         let out = stream(&mut Resampler::new(16_000), &x, 100);
         assert_eq!(out, x);
-    }
-
-    #[test]
-    fn a_reopen_gap_becomes_capped_silence() {
-        assert_eq!(silence_for(Duration::from_millis(250)).len(), 4_000);
-        assert!(silence_for(Duration::from_millis(250))
-            .iter()
-            .all(|&s| s == 0.0));
-        assert_eq!(
-            silence_for(Duration::from_secs(60)).len(),
-            MAX_GAP.as_secs() as usize * SAMPLE_RATE as usize
-        );
     }
 
     #[test]

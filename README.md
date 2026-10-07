@@ -204,6 +204,12 @@ said at the same moment. Short answers like "Yes." are always kept. While a meet
 audio is ducked a little (about 8 dB, the least macOS allows). With headphones you can turn this
 off: `echo_cancellation = false` under `[meeting]`. Dictation never uses it.
 
+If the mic keeps dropping out (some call apps renegotiate the device the moment they join),
+Squawk reopens it; if voice processing keeps stopping, it records the mic as is for the rest of
+the meeting and says so. A mic it cannot reopen at all shows "mic lost" in the popover, is tried
+again every half minute, and the stretch without your side is noted in the transcript
+(`mic_lost:` in the front matter and a line under the title).
+
 ## Notetaker
 
 Squawk can notice meetings for you. The popover's **Settings** tab has four settings; each one

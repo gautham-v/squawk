@@ -21,10 +21,10 @@ use crossbeam_channel::{Receiver, Sender};
 use squawk_core::dictionary::DictionaryCache;
 use squawk_core::pipeline;
 use squawk_core::status::MeetingInfo;
-use squawk_core::store::{drop_echoes, merge_segments, Meeting, Segment, Speaker};
+use squawk_core::store::{drop_echoes, merge_segments, Meeting, Outage, Segment, Speaker};
 use squawk_core::{Dictionary, Store};
 
-use crate::audio::{self, MicCapture, MicMode, MicShare};
+use crate::audio::{self, MicCapture, MicEvent, MicMode, MicShare};
 use crate::engine::{BusyGuard, Emit, EngineConfig, EngineEvent};
 use crate::error::EngineError;
 use crate::model::Recognized;
@@ -91,6 +91,7 @@ impl MeetingHandle {
             started_at: opts.started_at,
             length_secs: 0,
             in_progress: true,
+            mic_outages: Vec::new(),
             utterances: Vec::new(),
         };
         // Written at once so the meeting shows up in lists while it runs.
@@ -140,12 +141,16 @@ impl MeetingHandle {
         // MicCapture reopens a device that drops out (AirPods disconnecting,
         // or flipping to their headset profile when a call app opens their
         // mic) and fills the gap with silence, so "You" stays on the meeting
-        // clock. Only a mic that cannot be reopened ends up here. With echo
-        // cancellation the call playing on the speakers is taken out of it.
+        // clock. Voice processing that keeps stopping (a Teams call with
+        // Sidecar connected did this every second) gives way to plain
+        // capture; the transcript echo filter still runs. Only a mic that
+        // cannot be reopened at all is reported lost, and it is tried again
+        // every half minute; the outage goes into the file either way.
         let feeder = you.clone();
         let lent = share.clone();
-        let lost = emit.clone();
+        let events = emit.clone();
         let unlend = share.clone();
+        let outages = writer_tx.clone();
         let mode = if echo_cancellation {
             MicMode::EchoCancelled
         } else {
@@ -158,9 +163,26 @@ impl MeetingHandle {
                 feeder.feed(b);
                 lent.forward(b);
             },
-            move |msg| {
-                unlend.set_live(false);
-                lost(EngineEvent::MeetingMicLost(msg));
+            move |ev| {
+                let at_secs = started.elapsed().as_secs();
+                match ev {
+                    MicEvent::EchoCancellationOff => {
+                        unlend.set_live(false);
+                        events(EngineEvent::MeetingWarning(
+                            "echo cancellation kept stopping; your mic is recorded as is".into(),
+                        ));
+                    }
+                    MicEvent::Lost(msg) => {
+                        unlend.set_live(false);
+                        let _ = outages.send(WriterMsg::MicLost { at_secs });
+                        events(EngineEvent::MeetingMicLost(msg));
+                    }
+                    MicEvent::Back { echo_cancelled } => {
+                        unlend.set_live(echo_cancelled);
+                        let _ = outages.send(WriterMsg::MicBack { at_secs });
+                        events(EngineEvent::MeetingMicBack);
+                    }
+                }
             },
         );
         let mic = match mic {
@@ -296,6 +318,14 @@ enum WriterMsg {
     },
     Finish {
         length_secs: u64,
+    },
+    /// The mic was given up on at `at_secs` of the meeting.
+    MicLost {
+        at_secs: u64,
+    },
+    /// The mic came back at `at_secs`.
+    MicBack {
+        at_secs: u64,
     },
     /// The meeting never really started; exit without writing.
     Abandon,
@@ -487,28 +517,31 @@ fn write_loop(
         mut dictionary,
     } = tidy;
     let mut segments: Vec<Segment> = Vec::new();
+    let mut outages: Vec<Outage> = Vec::new();
     // Every write filters the whole meeting again: a "Them" chunk can land
     // after the "You" chunk its echo is in.
     let mut dropped = 0;
-    let mut write = |segments: &[Segment], length_secs: u64, in_progress: bool| {
-        let mut kept = segments.to_vec();
-        if let Some(filter) = echo_filter {
-            kept = filter(kept);
-            let now = segments.len() - kept.len();
-            if now != dropped {
-                log::info!("meeting: {now} echoed segments of \"You\" dropped");
-                dropped = now;
+    let mut write =
+        |segments: &[Segment], outages: &[Outage], length_secs: u64, in_progress: bool| {
+            let mut kept = segments.to_vec();
+            if let Some(filter) = echo_filter {
+                kept = filter(kept);
+                let now = segments.len() - kept.len();
+                if now != dropped {
+                    log::info!("meeting: {now} echoed segments of \"You\" dropped");
+                    dropped = now;
+                }
             }
-        }
-        let meeting = Meeting {
-            title: opts.title.clone(),
-            started_at: opts.started_at,
-            length_secs,
-            in_progress,
-            utterances: merge_segments(kept),
+            let meeting = Meeting {
+                title: opts.title.clone(),
+                started_at: opts.started_at,
+                length_secs,
+                in_progress,
+                mic_outages: outages.to_vec(),
+                utterances: merge_segments(kept),
+            };
+            store.write_meeting(&opts.path, &meeting)
         };
-        store.write_meeting(&opts.path, &meeting)
-    };
     for msg in rx {
         match msg {
             WriterMsg::Chunk {
@@ -533,7 +566,7 @@ fn write_loop(
                     }
                 }
                 let elapsed = started.elapsed().as_secs();
-                match write(&segments, elapsed, true) {
+                match write(&segments, &outages, elapsed, true) {
                     Ok(()) => emit(EngineEvent::MeetingProgress {
                         path: opts.path.clone(),
                         elapsed_secs: elapsed,
@@ -542,14 +575,31 @@ fn write_loop(
                 }
             }
             WriterMsg::Finish { length_secs } => {
-                write(&segments, length_secs, false)?;
+                write(&segments, &outages, length_secs, false)?;
                 return Ok(());
+            }
+            WriterMsg::MicLost { at_secs } => {
+                outages.push(Outage {
+                    from_secs: at_secs,
+                    to_secs: None,
+                });
+                if let Err(e) = write(&segments, &outages, started.elapsed().as_secs(), true) {
+                    log::warn!("meeting: write failed: {e}");
+                }
+            }
+            WriterMsg::MicBack { at_secs } => {
+                if let Some(o) = outages.last_mut().filter(|o| o.to_secs.is_none()) {
+                    o.to_secs = Some(at_secs);
+                }
+                if let Err(e) = write(&segments, &outages, started.elapsed().as_secs(), true) {
+                    log::warn!("meeting: write failed: {e}");
+                }
             }
             WriterMsg::Abandon => return Ok(()),
         }
     }
     // Every sender dropped without a Finish: write what we have as final.
-    write(&segments, started.elapsed().as_secs(), false)?;
+    write(&segments, &outages, started.elapsed().as_secs(), false)?;
     Ok(())
 }
 

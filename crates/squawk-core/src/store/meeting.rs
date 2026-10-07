@@ -69,7 +69,53 @@ pub struct Meeting {
     pub length_secs: u64,
     /// Still recording: the file is partial.
     pub in_progress: bool,
+    /// Stretches with no "You" because the mic was lost, oldest first.
+    pub mic_outages: Vec<Outage>,
     pub utterances: Vec<Utterance>,
+}
+
+/// A stretch of the meeting in which the mic was gone: only "Them" was
+/// recorded. Written to the front matter as `mic_lost: 00:00:28 to
+/// 00:05:10` (`to end` while it lasts) and noted under the title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Outage {
+    /// Seconds from the meeting start.
+    pub from_secs: u64,
+    /// `None` while the mic is still gone.
+    pub to_secs: Option<u64>,
+}
+
+impl Outage {
+    fn front_matter(&self) -> String {
+        match self.to_secs {
+            Some(to) => format!("{} to {}", format_hms(self.from_secs), format_hms(to)),
+            None => format!("{} to end", format_hms(self.from_secs)),
+        }
+    }
+
+    fn parse(value: &str) -> Option<Outage> {
+        let (from, to) = value.split_once(" to ")?;
+        let from_secs = parse_hms(from.trim())?;
+        let to_secs = match to.trim() {
+            "end" => None,
+            t => Some(parse_hms(t)?),
+        };
+        Some(Outage { from_secs, to_secs })
+    }
+
+    fn note(&self) -> String {
+        match self.to_secs {
+            Some(to) => format!(
+                "*Your mic was lost at {}; only the other side was recorded until {}.*",
+                format_hms(self.from_secs),
+                format_hms(to)
+            ),
+            None => format!(
+                "*Your mic was lost at {}; only the other side was recorded after that.*",
+                format_hms(self.from_secs)
+            ),
+        }
+    }
 }
 
 /// What a list of meetings needs, without the transcript.
@@ -151,8 +197,14 @@ pub fn format_meeting(m: &Meeting) -> String {
     if m.in_progress {
         out.push_str("status: recording\n");
     }
+    for o in &m.mic_outages {
+        out.push_str(&format!("mic_lost: {}\n", o.front_matter()));
+    }
     out.push_str("---\n\n");
     out.push_str(&format!("# {}\n", one_line(&m.title)));
+    for o in &m.mic_outages {
+        out.push_str(&format!("\n{}\n", o.note()));
+    }
     for u in &m.utterances {
         out.push_str(&format!(
             "\n**{}** {}\n{}\n",
@@ -201,6 +253,7 @@ pub fn parse_meeting(text: &str) -> Meeting {
             .unwrap_or_else(|| Local.timestamp_opt(0, 0).single().expect("epoch")),
         length_secs: front.length.unwrap_or(0),
         in_progress: front.recording,
+        mic_outages: front.mic_outages,
         utterances,
     }
 }
@@ -242,6 +295,7 @@ struct FrontMatter {
     date: Option<DateTime<Local>>,
     length: Option<u64>,
     recording: bool,
+    mic_outages: Vec<Outage>,
 }
 
 fn front_matter_lines(text: &str) -> Option<Vec<&str>> {
@@ -275,6 +329,7 @@ fn parse_front_matter(text: &str) -> FrontMatter {
             }
             "length" => fm.length = parse_hms(value),
             "status" => fm.recording = value == "recording",
+            "mic_lost" => fm.mic_outages.extend(Outage::parse(value)),
             _ => {}
         }
     }
@@ -431,6 +486,7 @@ mod tests {
             started_at: Local.with_ymd_and_hms(2026, 9, 29, 14, 0, 0).unwrap(),
             length_secs: 2530,
             in_progress: true,
+            mic_outages: Vec::new(),
             utterances: vec![Utterance {
                 speaker: Speaker::You,
                 start_secs: 1386,
@@ -442,6 +498,38 @@ mod tests {
         assert!(text.contains("\nlength: 00:42:10\nstatus: recording\n---\n\n# Weekly \"sync\"\n"));
         assert!(text.ends_with("\n**You** 00:23:06\nHi.\n"));
         assert_eq!(parse_meeting(&text), m);
+    }
+
+    #[test]
+    fn mic_outages_round_trip_and_are_noted() {
+        let m = Meeting {
+            title: "Sync".into(),
+            started_at: Local.with_ymd_and_hms(2026, 10, 7, 12, 58, 0).unwrap(),
+            length_secs: 3084,
+            in_progress: false,
+            mic_outages: vec![
+                Outage {
+                    from_secs: 28,
+                    to_secs: Some(310),
+                },
+                Outage {
+                    from_secs: 900,
+                    to_secs: None,
+                },
+            ],
+            utterances: vec![Utterance {
+                speaker: Speaker::Them,
+                start_secs: 30,
+                text: "Hello?".into(),
+            }],
+        };
+        let text = format_meeting(&m);
+        assert!(text.contains("\nmic_lost: 00:00:28 to 00:05:10\nmic_lost: 00:15:00 to end\n---\n"));
+        assert!(text.contains(
+            "# Sync\n\n*Your mic was lost at 00:00:28; only the other side was recorded until 00:05:10.*\n\n*Your mic was lost at 00:15:00; only the other side was recorded after that.*\n\n**Them** 00:00:30\n"
+        ));
+        assert_eq!(parse_meeting(&text), m);
+        assert_eq!(Outage::parse("garbage"), None);
     }
 
     #[test]

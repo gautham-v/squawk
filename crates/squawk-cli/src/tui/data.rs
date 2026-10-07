@@ -158,6 +158,7 @@ pub(crate) mod tests {
                     started_at: weekly,
                     length_secs: 2530,
                     in_progress: false,
+                    mic_outages: Vec::new(),
                     utterances: vec![
                         Utterance {
                             speaker: Speaker::You,
@@ -182,6 +183,7 @@ pub(crate) mod tests {
                     started_at: standup,
                     length_secs: 185,
                     in_progress: true,
+                    mic_outages: Vec::new(),
                     utterances: vec![Utterance {
                         speaker: Speaker::You,
                         start_secs: 2,

@@ -1057,6 +1057,13 @@ impl Worker {
                 }
                 self.fail(format!("microphone lost: {message}"));
             }
+            EngineEvent::MeetingMicBack => {
+                log::info!("meeting: mic back");
+                if let Some(meeting) = self.snap.meeting.as_mut() {
+                    meeting.mic_lost = false;
+                }
+                self.publish();
+            }
             EngineEvent::CleanupModel(status) => {
                 self.snap.cleanup_status = status;
                 self.publish();
