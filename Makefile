@@ -1,4 +1,4 @@
-.PHONY: run install install-cli test check bundle preview clean
+.PHONY: run install install-cli test check bundle preview agent-init clean
 
 TARGET_DIR := $(shell cargo metadata --no-deps --format-version 1 | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')
 BIN_DIR ?= $(HOME)/.local/bin
@@ -36,6 +36,11 @@ bundle:
 # The popover with fixture data: make preview MODE=recording
 preview:
 	cargo run -p squawk-app --example popover_preview -- $(or $(MODE),ready)
+
+# The agent's directory (~/agent, or [agent] dir): CLAUDE.md and hooks.
+# Never overwrites a file that is already there.
+agent-init:
+	./scripts/agent-init.sh
 
 clean:
 	cargo clean

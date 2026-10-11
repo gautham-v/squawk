@@ -5,6 +5,7 @@
 //! pasted, how fn presses become actions, and what goes over the socket. That
 //! keeps all of it unit-testable without a microphone or a menu bar.
 
+pub mod agent;
 pub mod cleanup;
 pub mod config;
 pub mod config_edit;

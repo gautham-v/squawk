@@ -9,7 +9,16 @@
 //! - **Hold** fn (longer than `tap_max`): push-to-talk. Release pastes.
 //! - **Double tap** fn: hands-free. Recording keeps going after release; the
 //!   next fn press-and-release stops it and pastes.
+//! - **Triple tap** fn (the third press inside `double_tap` of the second
+//!   release): hands-free, and the dictation now goes to the agent. The next
+//!   fn press-and-release stops it and sends it. A later third press is the
+//!   ordinary stop.
 //! - **Single tap** with no second tap within `double_tap`: discarded.
+//! - All of the above with **⌥ held as fn goes down** (and no other
+//!   modifier): the same gestures, but the dictation goes to the agent (a
+//!   Claude Code session in tmux) instead of being pasted, and a single ⌥+fn
+//!   tap shows or hides the agent's terminal window. ⌥ may be let go once
+//!   fn is down; the target is fixed at the first press.
 //! - fn **with another key** (fn+arrow, fn+F5, fn+cmd…): fn is a modifier;
 //!   cancel silently and let the key through.
 //! - **esc** while recording cancels (and is swallowed, so a terminal behind
@@ -68,6 +77,12 @@ impl Mods {
         command: false,
     };
 
+    /// ⌥ alone.
+    pub const OPTION: Mods = Mods {
+        option: true,
+        ..Mods::NONE
+    };
+
     /// From raw CGEventFlags.
     pub fn from_flags(flags: u64) -> Mods {
         Mods {
@@ -114,12 +129,56 @@ pub enum CancelReason {
     Reset,
 }
 
+/// Where a dictation goes when it is finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Target {
+    /// Pasted into the focused app (plain fn).
+    #[default]
+    Paste,
+    /// Sent to the agent's tmux session (⌥ held with fn).
+    Agent,
+}
+
+impl Target {
+    /// The target for a first fn press with `mods` held, or `None` when the
+    /// press is fn used as a modifier (ctrl+fn, cmd+fn, ⌥⇧+fn…).
+    pub fn from_mods(mods: Mods) -> Option<Target> {
+        if !mods.any() {
+            Some(Target::Paste)
+        } else if mods == Mods::OPTION {
+            Some(Target::Agent)
+        } else {
+            None
+        }
+    }
+
+    /// Modifiers that, joining fn, mean fn is being used as a modifier: any
+    /// for a plain dictation; any but ⌥ (which is part of the gesture) for
+    /// the agent.
+    fn foreign(self, mods: Mods) -> bool {
+        match self {
+            Target::Paste => mods.any(),
+            Target::Agent => mods.shift || mods.control || mods.command,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Target::Paste => "paste",
+            Target::Agent => "agent",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Open the mic and start a dictation.
-    StartRecording,
+    /// Open the mic and start a dictation bound for `target`.
+    StartRecording { target: Target },
     /// The dictation is now hands-free (the menu bar shows the lock).
     EnterHandsFree,
+    /// A third quick tap: the hands-free dictation under way now goes to the
+    /// agent. The recording carries on; only its target changes.
+    RetargetAgent,
     /// Stop, transcribe the tail, paste.
     StopAndPaste,
     /// Stop and throw the audio away.
@@ -130,6 +189,9 @@ pub enum Action {
     CopyLast,
     /// Start or stop a meeting (option+M).
     ToggleMeeting,
+    /// A single quick ⌥+fn tap: show the agent's terminal window, or hide it
+    /// if it is in front. Comes right after the tap's `Cancel(Tap)`.
+    ToggleAgentWindow,
 }
 
 /// What the tap does with the event, and what the app should do.
@@ -176,6 +238,9 @@ pub enum State {
     HandsFree,
     /// Hands-free, fn down: stops on release unless another key joins it.
     HandsFreeFnDown,
+    /// The third tap of a triple tap is down: hands-free for the agent, and
+    /// back to `HandsFree` on release.
+    HandsFreeThirdPress,
 }
 
 impl State {
@@ -213,6 +278,15 @@ impl From<&crate::config::HotkeyConfig> for Timings {
 pub struct Machine {
     state: State,
     timings: Timings,
+    /// Where the dictation under way goes, fixed at its first fn press.
+    target: Target,
+    /// ⌥+fn is the agent's. Off (`[agent] enabled = false`), ⌥+fn is fn
+    /// used as a modifier, as it was before the agent existed, and a triple
+    /// tap is a double tap and a stop.
+    agent_enabled: bool,
+    /// In `HandsFree` right after a plain double tap: until this instant a
+    /// third press sends the dictation to the agent instead of stopping it.
+    third_tap_until: Option<Instant>,
 }
 
 impl Machine {
@@ -220,6 +294,9 @@ impl Machine {
         Machine {
             state: State::Idle,
             timings,
+            target: Target::Paste,
+            agent_enabled: true,
+            third_tap_until: None,
         }
     }
 
@@ -227,15 +304,30 @@ impl Machine {
         self.state
     }
 
+    /// The target of the dictation under way (`Paste` when idle).
+    pub fn target(&self) -> Target {
+        self.target
+    }
+
     pub fn set_timings(&mut self, timings: Timings) {
         self.timings = timings;
     }
 
+    pub fn set_agent_enabled(&mut self, enabled: bool) {
+        self.agent_enabled = enabled;
+    }
+
+    /// The target a first fn press with `mods` starts, if it starts one.
+    fn start_target(&self, mods: Mods) -> Option<Target> {
+        Target::from_mods(mods).filter(|t| *t == Target::Paste || self.agent_enabled)
+    }
+
     /// When the app must feed [`Input::Tick`]: the end of the double-tap
-    /// window. `None` when nothing is pending.
+    /// window, or of the triple-tap one. `None` when nothing is pending.
     pub fn deadline(&self) -> Option<Instant> {
         match self.state {
             State::TapReleased { up_at } => Some(up_at + self.timings.double_tap),
+            State::HandsFree => self.third_tap_until,
             _ => None,
         }
     }
@@ -246,6 +338,8 @@ impl Machine {
     pub fn reset(&mut self) -> Option<Action> {
         let was = self.state;
         self.state = State::Idle;
+        self.target = Target::Paste;
+        self.third_tap_until = None;
         was.is_recording()
             .then_some(Action::Cancel(CancelReason::Reset))
     }
@@ -254,6 +348,8 @@ impl Machine {
     /// user clicked stop): forget it without emitting anything.
     pub fn force_idle(&mut self) {
         self.state = State::Idle;
+        self.target = Target::Paste;
+        self.third_tap_until = None;
     }
 
     pub fn handle(&mut self, input: Input, now: Instant) -> Outcome {
@@ -264,7 +360,18 @@ impl Machine {
             if now.duration_since(up_at) >= self.timings.double_tap {
                 self.state = State::Idle;
                 pre.push(Action::Cancel(CancelReason::Tap));
+                if self.target == Target::Agent {
+                    pre.push(Action::ToggleAgentWindow);
+                }
             }
+        }
+        // The triple-tap window closes by the clock too, silently: the
+        // dictation simply stays hands-free for wherever it was going.
+        if self.state != State::HandsFree || self.third_tap_until.is_some_and(|t| now >= t) {
+            self.third_tap_until = None;
+        }
+        if self.state == State::Idle {
+            self.target = Target::Paste;
         }
         let mut out = self.step(input, now);
         if !pre.is_empty() {
@@ -277,14 +384,20 @@ impl Machine {
     fn step(&mut self, input: Input, now: Instant) -> Outcome {
         use State::*;
         let is_escape = |keycode: u16| keycode == keycode::ESCAPE;
+        let target = self.target;
+        let foreign = |mods: Mods| target.foreign(mods);
         match (self.state, input) {
             (_, Input::Tick) => Outcome::none(),
 
             // ---- idle
-            (Idle, Input::FnDown { mods }) if !mods.any() => {
-                self.state = Pressed { down_at: now };
-                Outcome::act(Action::StartRecording)
-            }
+            (Idle, Input::FnDown { mods }) => match self.start_target(mods) {
+                Some(target) => {
+                    self.target = target;
+                    self.state = Pressed { down_at: now };
+                    Outcome::act(Action::StartRecording { target })
+                }
+                None => Outcome::none(),
+            },
             (
                 Idle,
                 Input::KeyDown {
@@ -319,14 +432,14 @@ impl Machine {
                 self.state = Idle;
                 Outcome::act(Action::Cancel(CancelReason::FnAsModifier))
             }
-            (Pressed { .. }, Input::ModsChanged { mods }) if mods.any() => {
+            (Pressed { .. }, Input::ModsChanged { mods }) if foreign(mods) => {
                 self.state = Idle;
                 Outcome::act(Action::Cancel(CancelReason::FnAsModifier))
             }
             (Pressed { .. }, _) => Outcome::none(),
 
             // ---- between the taps
-            (TapReleased { .. }, Input::FnDown { mods }) if !mods.any() => {
+            (TapReleased { .. }, Input::FnDown { mods }) if !foreign(mods) => {
                 self.state = SecondPress;
                 Outcome::act(Action::EnterHandsFree)
             }
@@ -334,8 +447,21 @@ impl Machine {
                 self.state = Idle;
                 Outcome::act(Action::Cancel(CancelReason::Escape)).swallowed()
             }
-            (TapReleased { .. }, Input::KeyDown { .. } | Input::FnDown { .. }) => {
-                // Typing (or fn+modifier) right after a tap: the tap was nothing.
+            (TapReleased { .. }, Input::FnDown { mods }) => {
+                // fn with other modifiers right after a tap: the tap was
+                // nothing. A press that starts a dictation of its own (⌥+fn
+                // after a plain tap) starts it.
+                self.state = Idle;
+                let mut out = Outcome::act(Action::Cancel(CancelReason::Tap));
+                if let Some(target) = self.start_target(mods) {
+                    self.target = target;
+                    self.state = Pressed { down_at: now };
+                    out.actions.push(Action::StartRecording { target });
+                }
+                out
+            }
+            (TapReleased { .. }, Input::KeyDown { .. }) => {
+                // Typing right after a tap: the tap was nothing.
                 self.state = Idle;
                 Outcome::act(Action::Cancel(CancelReason::Tap))
             }
@@ -344,6 +470,10 @@ impl Machine {
             // ---- second press held
             (SecondPress, Input::FnUp) => {
                 self.state = HandsFree;
+                // A plain double tap may still become a triple tap.
+                if self.target == Target::Paste && self.agent_enabled {
+                    self.third_tap_until = Some(now + self.timings.double_tap);
+                }
                 Outcome::none()
             }
             (SecondPress, Input::KeyDown { keycode, .. }) if is_escape(keycode) => {
@@ -354,18 +484,27 @@ impl Machine {
                 self.state = Idle;
                 Outcome::act(Action::Cancel(CancelReason::FnAsModifier))
             }
-            (SecondPress, Input::ModsChanged { mods }) if mods.any() => {
+            (SecondPress, Input::ModsChanged { mods }) if foreign(mods) => {
                 self.state = Idle;
                 Outcome::act(Action::Cancel(CancelReason::FnAsModifier))
             }
             (SecondPress, _) => Outcome::none(),
 
             // ---- hands-free
-            (HandsFree, Input::FnDown { mods }) if !mods.any() => {
-                self.state = HandsFreeFnDown;
-                Outcome::none()
+            (HandsFree, Input::FnDown { mods }) if !foreign(mods) => {
+                if self.third_tap_until.take().is_some() {
+                    // The third tap of a triple tap: keep going, for the agent.
+                    self.target = Target::Agent;
+                    self.state = HandsFreeThirdPress;
+                    Outcome::act(Action::RetargetAgent)
+                } else {
+                    self.state = HandsFreeFnDown;
+                    Outcome::none()
+                }
             }
-            (HandsFree | HandsFreeFnDown, Input::KeyDown { keycode, .. }) if is_escape(keycode) => {
+            (HandsFree | HandsFreeFnDown | HandsFreeThirdPress, Input::KeyDown { keycode, .. })
+                if is_escape(keycode) =>
+            {
                 self.state = Idle;
                 Outcome::act(Action::Cancel(CancelReason::Escape)).swallowed()
             }
@@ -380,11 +519,22 @@ impl Machine {
                 self.state = HandsFree;
                 Outcome::none()
             }
-            (HandsFreeFnDown, Input::ModsChanged { mods }) if mods.any() => {
+            (HandsFreeFnDown, Input::ModsChanged { mods }) if foreign(mods) => {
                 self.state = HandsFree;
                 Outcome::none()
             }
             (HandsFreeFnDown, _) => Outcome::none(),
+
+            // ---- the third tap of a triple tap held
+            (HandsFreeThirdPress, Input::FnUp | Input::KeyDown { .. }) => {
+                self.state = HandsFree;
+                Outcome::none()
+            }
+            (HandsFreeThirdPress, Input::ModsChanged { mods }) if foreign(mods) => {
+                self.state = HandsFree;
+                Outcome::none()
+            }
+            (HandsFreeThirdPress, _) => Outcome::none(),
         }
     }
 }
@@ -435,6 +585,14 @@ mod tests {
 
     const DOWN: Input = Input::FnDown { mods: Mods::NONE };
     const UP: Input = Input::FnUp;
+    /// fn going down with ⌥ already held.
+    const OPT_DOWN: Input = Input::FnDown { mods: Mods::OPTION };
+    const START: Action = Action::StartRecording {
+        target: Target::Paste,
+    };
+    const START_AGENT: Action = Action::StartRecording {
+        target: Target::Agent,
+    };
 
     fn key(keycode: u16) -> Input {
         Input::KeyDown {
@@ -457,7 +615,7 @@ mod tests {
     #[test]
     fn hold_is_push_to_talk() {
         let mut c = Clock::new();
-        assert_eq!(c.acts(0, DOWN), [Action::StartRecording]);
+        assert_eq!(c.acts(0, DOWN), [START]);
         assert_eq!(c.acts(1200, UP), [Action::StopAndPaste]);
         assert_eq!(c.m.state(), State::Idle);
     }
@@ -472,7 +630,7 @@ mod tests {
     #[test]
     fn single_tap_is_discarded_after_window() {
         let mut c = Clock::new();
-        assert_eq!(c.acts(0, DOWN), [Action::StartRecording]);
+        assert_eq!(c.acts(0, DOWN), [START]);
         assert!(c.acts(120, UP).is_empty());
         let deadline = c.m.deadline().unwrap();
         assert_eq!(
@@ -514,7 +672,7 @@ mod tests {
         // No Tick arrived (timer late); the press after the window resolves it.
         assert_eq!(
             c.acts(100 + DEFAULT_DOUBLE_TAP_MS + 50, DOWN),
-            [Action::Cancel(CancelReason::Tap), Action::StartRecording]
+            [Action::Cancel(CancelReason::Tap), START]
         );
         assert!(matches!(c.m.state(), State::Pressed { .. }));
     }
@@ -693,6 +851,296 @@ mod tests {
         c.acts(0, DOWN);
         assert!(c.acts(50, DOWN).is_empty());
         assert_eq!(c.acts(900, UP), [Action::StopAndPaste]);
+    }
+
+    #[test]
+    fn option_fn_hold_records_for_the_agent() {
+        let mut c = Clock::new();
+        assert_eq!(c.acts(0, OPT_DOWN), [START_AGENT]);
+        assert_eq!(c.m.target(), Target::Agent);
+        // Letting go of ⌥ first changes nothing.
+        assert!(c
+            .acts(400, Input::ModsChanged { mods: Mods::NONE })
+            .is_empty());
+        assert_eq!(c.acts(1500, UP), [Action::StopAndPaste]);
+        assert_eq!(c.m.state(), State::Idle);
+        // The next plain hold pastes again.
+        assert_eq!(c.acts(3000, DOWN), [START]);
+        assert_eq!(c.m.target(), Target::Paste);
+        assert_eq!(c.acts(4000, UP), [Action::StopAndPaste]);
+    }
+
+    #[test]
+    fn option_fn_tap_toggles_the_agent_window() {
+        let mut c = Clock::new();
+        assert_eq!(c.acts(0, OPT_DOWN), [START_AGENT]);
+        assert!(c.acts(110, UP).is_empty());
+        assert!(c
+            .acts(110 + DEFAULT_DOUBLE_TAP_MS - 1, Input::Tick)
+            .is_empty());
+        assert_eq!(
+            c.acts(110 + DEFAULT_DOUBLE_TAP_MS, Input::Tick),
+            [Action::Cancel(CancelReason::Tap), Action::ToggleAgentWindow]
+        );
+        assert_eq!(c.m.state(), State::Idle);
+        // A plain tap afterwards is still just discarded.
+        c.acts(2000, DOWN);
+        c.acts(2100, UP);
+        assert_eq!(
+            c.acts(2100 + DEFAULT_DOUBLE_TAP_MS, Input::Tick),
+            [Action::Cancel(CancelReason::Tap)]
+        );
+    }
+
+    #[test]
+    fn option_fn_tap_then_typing_is_nothing() {
+        let mut c = Clock::new();
+        c.acts(0, OPT_DOWN);
+        c.acts(90, UP);
+        assert_eq!(c.acts(150, key(0)), [Action::Cancel(CancelReason::Tap)]);
+        assert!(c.acts(2000, Input::Tick).is_empty());
+    }
+
+    #[test]
+    fn option_fn_double_tap_is_hands_free_for_the_agent() {
+        let mut c = Clock::new();
+        assert_eq!(c.acts(0, OPT_DOWN), [START_AGENT]);
+        c.acts(100, UP);
+        // The second press with or without ⌥.
+        assert_eq!(c.acts(250, DOWN), [Action::EnterHandsFree]);
+        assert!(c.acts(330, UP).is_empty());
+        assert_eq!(c.m.state(), State::HandsFree);
+        assert_eq!(c.m.target(), Target::Agent);
+        // Stopping with ⌥ still held works too.
+        assert!(c.acts(9000, OPT_DOWN).is_empty());
+        assert_eq!(c.acts(9100, UP), [Action::StopAndPaste]);
+        assert_eq!(c.m.state(), State::Idle);
+
+        let mut c = Clock::new();
+        c.acts(0, OPT_DOWN);
+        c.acts(100, UP);
+        assert_eq!(c.acts(250, OPT_DOWN), [Action::EnterHandsFree]);
+        assert!(c.acts(330, UP).is_empty());
+        assert_eq!(c.m.state(), State::HandsFree);
+    }
+
+    #[test]
+    fn option_with_another_modifier_is_not_the_agent() {
+        let mut c = Clock::new();
+        let opt_shift = Mods {
+            option: true,
+            shift: true,
+            ..Mods::NONE
+        };
+        assert!(c.acts(0, Input::FnDown { mods: opt_shift }).is_empty());
+        assert!(c.acts(600, UP).is_empty());
+        assert_eq!(c.m.state(), State::Idle);
+        // cmd joining an agent hold is fn as a modifier: cancel.
+        c.acts(1000, OPT_DOWN);
+        let opt_cmd = Mods {
+            option: true,
+            command: true,
+            ..Mods::NONE
+        };
+        assert_eq!(
+            c.acts(1100, Input::ModsChanged { mods: opt_cmd }),
+            [Action::Cancel(CancelReason::FnAsModifier)]
+        );
+        // And fn+⌥+arrow too.
+        c.acts(2000, OPT_DOWN);
+        assert_eq!(
+            c.acts(2050, key_with(ARROW_LEFT, Mods::OPTION)),
+            [Action::Cancel(CancelReason::FnAsModifier)]
+        );
+    }
+
+    #[test]
+    fn option_pressed_during_a_plain_hold_does_not_switch_to_the_agent() {
+        let mut c = Clock::new();
+        assert_eq!(c.acts(0, DOWN), [START]);
+        assert_eq!(
+            c.acts(200, Input::ModsChanged { mods: Mods::OPTION }),
+            [Action::Cancel(CancelReason::FnAsModifier)]
+        );
+        // Hands-free: ⌥ and the stop press do not change the target.
+        let mut c = Clock::new();
+        c.acts(0, DOWN);
+        c.acts(100, UP);
+        c.acts(200, DOWN);
+        c.acts(280, UP);
+        assert!(c
+            .acts(3000, Input::ModsChanged { mods: Mods::OPTION })
+            .is_empty());
+        assert_eq!(c.m.target(), Target::Paste);
+    }
+
+    #[test]
+    fn option_fn_right_after_a_plain_tap_starts_an_agent_dictation() {
+        let mut c = Clock::new();
+        c.acts(0, DOWN);
+        c.acts(90, UP);
+        assert_eq!(
+            c.acts(200, OPT_DOWN),
+            [Action::Cancel(CancelReason::Tap), START_AGENT]
+        );
+        assert_eq!(c.m.target(), Target::Agent);
+        assert_eq!(c.acts(1500, UP), [Action::StopAndPaste]);
+    }
+
+    #[test]
+    fn option_fn_is_nothing_with_the_agent_off() {
+        let mut c = Clock::new();
+        c.m.set_agent_enabled(false);
+        assert!(c.acts(0, OPT_DOWN).is_empty());
+        assert!(c.acts(90, UP).is_empty());
+        assert!(c.acts(2000, Input::Tick).is_empty());
+        assert_eq!(c.m.state(), State::Idle);
+        // A plain tap then ⌥+fn: just the tap's cancel.
+        c.acts(3000, DOWN);
+        c.acts(3090, UP);
+        assert_eq!(c.acts(3200, OPT_DOWN), [Action::Cancel(CancelReason::Tap)]);
+        assert_eq!(c.m.state(), State::Idle);
+        // Plain fn is untouched.
+        assert_eq!(c.acts(5000, DOWN), [START]);
+    }
+
+    #[test]
+    fn triple_tap_is_hands_free_for_the_agent() {
+        let mut c = Clock::new();
+        assert_eq!(c.acts(0, DOWN), [START]);
+        c.acts(100, UP);
+        assert_eq!(c.acts(220, DOWN), [Action::EnterHandsFree]);
+        assert!(c.acts(300, UP).is_empty());
+        assert_eq!(c.m.state(), State::HandsFree);
+        assert_eq!(
+            c.m.deadline(),
+            Some(c.t0 + Duration::from_millis(300 + DEFAULT_DOUBLE_TAP_MS))
+        );
+        // The third press, just inside the window.
+        assert_eq!(
+            c.acts(300 + DEFAULT_DOUBLE_TAP_MS - 1, DOWN),
+            [Action::RetargetAgent]
+        );
+        assert_eq!(c.m.state(), State::HandsFreeThirdPress);
+        assert_eq!(c.m.target(), Target::Agent);
+        assert!(c.acts(800, UP).is_empty());
+        assert_eq!(c.m.state(), State::HandsFree);
+        assert!(c.m.deadline().is_none());
+        // Talking, a tick, then one press-and-release sends it.
+        assert!(c.acts(5000, Input::Tick).is_empty());
+        assert!(c.acts(20_000, DOWN).is_empty());
+        assert_eq!(c.m.target(), Target::Agent);
+        assert_eq!(c.acts(20_100, UP), [Action::StopAndPaste]);
+        assert_eq!(c.m.state(), State::Idle);
+        // The next plain hold pastes again.
+        assert_eq!(c.acts(30_000, DOWN), [START]);
+        assert_eq!(c.m.target(), Target::Paste);
+    }
+
+    #[test]
+    fn a_late_third_tap_stops_and_pastes() {
+        // At the end of the window, with the tick on time.
+        let mut c = Clock::new();
+        c.acts(0, DOWN);
+        c.acts(100, UP);
+        c.acts(220, DOWN);
+        c.acts(300, UP);
+        assert!(c.acts(300 + DEFAULT_DOUBLE_TAP_MS, Input::Tick).is_empty());
+        assert!(c.m.deadline().is_none());
+        assert!(c.acts(300 + DEFAULT_DOUBLE_TAP_MS, DOWN).is_empty());
+        assert_eq!(c.m.state(), State::HandsFreeFnDown);
+        assert_eq!(c.acts(800, UP), [Action::StopAndPaste]);
+        assert_eq!(c.m.target(), Target::Paste);
+        // No tick at all (timer late): the clock decides, not the order.
+        let mut c = Clock::new();
+        c.acts(0, DOWN);
+        c.acts(100, UP);
+        c.acts(220, DOWN);
+        c.acts(300, UP);
+        assert!(c.acts(300 + DEFAULT_DOUBLE_TAP_MS + 50, DOWN).is_empty());
+        assert_eq!(c.acts(900, UP), [Action::StopAndPaste]);
+        assert_eq!(c.m.target(), Target::Paste);
+    }
+
+    #[test]
+    fn triple_tap_with_the_agent_off_stops_and_pastes() {
+        let mut c = Clock::new();
+        c.m.set_agent_enabled(false);
+        c.acts(0, DOWN);
+        c.acts(100, UP);
+        assert_eq!(c.acts(220, DOWN), [Action::EnterHandsFree]);
+        assert!(c.acts(300, UP).is_empty());
+        assert!(c.m.deadline().is_none());
+        assert!(c.acts(400, DOWN).is_empty());
+        assert_eq!(c.acts(480, UP), [Action::StopAndPaste]);
+        assert_eq!(c.m.target(), Target::Paste);
+    }
+
+    #[test]
+    fn option_fn_triple_tap_is_still_a_stop() {
+        // Already the agent's: the third tap stops it, as before.
+        let mut c = Clock::new();
+        c.acts(0, OPT_DOWN);
+        c.acts(100, UP);
+        assert_eq!(c.acts(220, DOWN), [Action::EnterHandsFree]);
+        c.acts(300, UP);
+        assert!(c.m.deadline().is_none());
+        assert!(c.acts(400, DOWN).is_empty());
+        assert_eq!(c.acts(480, UP), [Action::StopAndPaste]);
+    }
+
+    #[test]
+    fn escape_cancels_a_triple_tap() {
+        let mut c = Clock::new();
+        c.acts(0, DOWN);
+        c.acts(100, UP);
+        c.acts(220, DOWN);
+        c.acts(300, UP);
+        c.acts(400, DOWN);
+        let out = c.at(450, key(keycode::ESCAPE));
+        assert_eq!(out.actions, [Action::Cancel(CancelReason::Escape)]);
+        assert!(out.swallow);
+        assert_eq!(c.m.state(), State::Idle);
+        // And once it is hands-free for the agent.
+        let mut c = Clock::new();
+        c.acts(0, DOWN);
+        c.acts(100, UP);
+        c.acts(220, DOWN);
+        c.acts(300, UP);
+        c.acts(400, DOWN);
+        c.acts(480, UP);
+        let out = c.at(9000, key(keycode::ESCAPE));
+        assert_eq!(out.actions, [Action::Cancel(CancelReason::Escape)]);
+        assert_eq!(c.m.state(), State::Idle);
+    }
+
+    #[test]
+    fn typing_inside_the_triple_tap_window_keeps_it_open() {
+        let mut c = Clock::new();
+        c.acts(0, DOWN);
+        c.acts(100, UP);
+        c.acts(220, DOWN);
+        c.acts(300, UP);
+        assert!(c.acts(350, key(0)).is_empty());
+        assert_eq!(c.acts(500, DOWN), [Action::RetargetAgent]);
+        // fn+arrow on the third press: still the agent's, still recording.
+        assert!(c.acts(550, key(ARROW_LEFT)).is_empty());
+        assert_eq!(c.m.state(), State::HandsFree);
+        assert_eq!(c.m.target(), Target::Agent);
+        c.acts(3000, UP);
+        c.acts(5000, DOWN);
+        assert_eq!(c.acts(5100, UP), [Action::StopAndPaste]);
+    }
+
+    #[test]
+    fn targets_from_modifiers() {
+        assert_eq!(Target::from_mods(Mods::NONE), Some(Target::Paste));
+        assert_eq!(Target::from_mods(Mods::OPTION), Some(Target::Agent));
+        let ctrl = Mods {
+            control: true,
+            ..Mods::NONE
+        };
+        assert_eq!(Target::from_mods(ctrl), None);
     }
 
     #[test]

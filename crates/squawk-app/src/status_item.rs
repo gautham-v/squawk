@@ -32,7 +32,8 @@ use crate::controller::{DictationPhase, Snapshot};
 use crate::menu_bar_icon::{self, Animator, Glyph};
 
 /// What the menu bar item shows. Precedence, highest first: a dictation
-/// (recording, then transcribing), a meeting, needs-attention, idle.
+/// (recording, then transcribing), a meeting, the agent working,
+/// needs-attention, idle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuBarState {
     /// The five bars at rest. No timer.
@@ -46,6 +47,9 @@ pub enum MenuBarState {
     Transcribing,
     /// A meeting is recording: a slow, small pulse.
     Meeting,
+    /// The agent is working on a request: the bars ease into a falling
+    /// ramp and hold it. No timer.
+    AgentWorking,
 }
 
 impl MenuBarState {
@@ -56,6 +60,7 @@ impl MenuBarState {
             DictationPhase::Transcribing => MenuBarState::Transcribing,
             DictationPhase::Idle => match &snap.meeting {
                 Some(_) => MenuBarState::Meeting,
+                None if snap.agent_working.is_some() => MenuBarState::AgentWorking,
                 None if !snap.model.is_ready() || !snap.permissions.can_dictate() => {
                     MenuBarState::NeedsAttention
                 }
@@ -439,5 +444,24 @@ mod tests {
         // Back to idle with the meeting still on: the pulse again.
         s.dictation = DictationPhase::Idle;
         assert_eq!(MenuBarState::from_snapshot(&s), MenuBarState::Meeting);
+    }
+
+    #[test]
+    fn the_agent_working_yields_to_a_dictation_and_comes_back() {
+        let now = Instant::now();
+        let mut s = snap();
+        s.agent_working = Some(now);
+        assert_eq!(MenuBarState::from_snapshot(&s), MenuBarState::AgentWorking);
+        s.dictation = DictationPhase::Recording {
+            since: now,
+            hands_free: false,
+        };
+        assert_eq!(MenuBarState::from_snapshot(&s), MenuBarState::Recording);
+        s.dictation = DictationPhase::Transcribing;
+        assert_eq!(MenuBarState::from_snapshot(&s), MenuBarState::Transcribing);
+        s.dictation = DictationPhase::Idle;
+        assert_eq!(MenuBarState::from_snapshot(&s), MenuBarState::AgentWorking);
+        s.agent_working = None;
+        assert_eq!(MenuBarState::from_snapshot(&s), MenuBarState::Idle);
     }
 }

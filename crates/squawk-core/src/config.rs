@@ -35,6 +35,7 @@ pub struct Config {
     pub dictation: DictationConfig,
     pub meeting: MeetingConfig,
     pub model: ModelConfig,
+    pub agent: AgentConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -143,6 +144,37 @@ impl<'de> Deserialize<'de> for AutoRecord {
     }
 }
 
+/// The agent: a Claude Code session in a tmux session that ⌥+fn dictates
+/// to (`squawk_core::agent`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    /// ⌥+fn sends to the agent. Off, ⌥+fn does nothing.
+    pub enabled: bool,
+    /// The tmux session the text is typed into (`tmux send-keys -t`).
+    pub tmux_session: String,
+    /// Where the session starts when squawk has to launch it. `~` expands.
+    pub dir: String,
+    /// What runs in the session when squawk launches it.
+    pub command: String,
+    /// The terminal app whose window shows the session ("Ghostty",
+    /// "Terminal", "iTerm2", ...).
+    pub terminal: String,
+    /// Saying exactly one of these (case-insensitive, end punctuation
+    /// ignored) sends `/clear` instead of a request.
+    pub clear_phrases: Vec<String>,
+    /// After this many minutes without an agent request, the next one is
+    /// preceded by `/clear`. 0 = never.
+    pub clear_after_idle_mins: u64,
+}
+
+impl AgentConfig {
+    /// `dir` with `~` expanded against `home`.
+    pub fn dir_path(&self, home: &Path) -> std::path::PathBuf {
+        crate::paths::expand_tilde(self.dir.trim(), home)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
@@ -188,6 +220,23 @@ impl Default for MeetingConfig {
             detect_calls: true,
             auto_record: AutoRecord::default(),
             max_minutes: 120,
+        }
+    }
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        AgentConfig {
+            enabled: true,
+            tmux_session: "agent".to_string(),
+            dir: "~/agent".to_string(),
+            command: "claude".to_string(),
+            terminal: "Ghostty".to_string(),
+            clear_phrases: vec![
+                "new conversation".to_string(),
+                "clear conversation".to_string(),
+            ],
+            clear_after_idle_mins: 60,
         }
     }
 }
@@ -282,6 +331,25 @@ impl Config {
         if self.model.url.trim().is_empty() {
             self.model.url = DEFAULT_MODEL_URL.to_string();
         }
+        let a = &mut self.agent;
+        let defaults = AgentConfig::default();
+        if a.tmux_session.trim().is_empty() {
+            a.tmux_session = defaults.tmux_session;
+        }
+        // tmux reads `:` and `.` in a target as window and pane separators,
+        // so a session named with them could never be addressed.
+        if a.tmux_session.contains([':', '.']) {
+            a.tmux_session = a.tmux_session.replace([':', '.'], "_");
+        }
+        if a.dir.trim().is_empty() {
+            a.dir = defaults.dir;
+        }
+        if a.command.trim().is_empty() {
+            a.command = defaults.command;
+        }
+        if a.terminal.trim().is_empty() {
+            a.terminal = defaults.terminal;
+        }
         self
     }
 }
@@ -338,6 +406,22 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# squawk settings. Every key is optiona
 # dir = "parakeet-tdt-0.6b-v3-int8"
 # url = "https://blob.handy.computer/parakeet-v3-int8.tar.gz"
 # threads = 0
+
+[agent]
+# Hold ⌥ with fn to send a dictation to the agent: a Claude Code session in a tmux session.
+# enabled = true
+# tmux session name the text is sent to (tmux send-keys -t <session>).
+# tmux_session = "agent"
+# Directory the session starts in when squawk has to launch it.
+# dir = "~/agent"
+# Command run inside tmux when squawk has to launch it.
+# command = "claude"
+# Terminal app whose window shows the tmux session when squawk raises it ("Ghostty", "Terminal", "iTerm2", ...).
+# terminal = "Ghostty"
+# Saying exactly one of these phrases (case-insensitive, trailing punctuation ignored) sends /clear instead of a request.
+# clear_phrases = ["new conversation", "clear conversation"]
+# After this many minutes with no agent request, the next request is preceded by /clear. 0 disables.
+# clear_after_idle_mins = 60
 "#;
 
 #[cfg(test)]
@@ -418,6 +502,33 @@ mod tests {
             Config::parse("[meeting]\nauto_record = \"sometimes\"\nmax_minutes = 30\n").unwrap();
         assert_eq!(c.meeting.auto_record, AutoRecord::Calendar);
         assert_eq!(c.meeting.max_minutes, 30);
+    }
+
+    #[test]
+    fn agent_defaults_and_overrides() {
+        let a = Config::default().agent;
+        assert!(a.enabled);
+        assert_eq!(a.tmux_session, "agent");
+        assert_eq!(a.command, "claude");
+        assert_eq!(a.terminal, "Ghostty");
+        assert_eq!(a.clear_phrases, ["new conversation", "clear conversation"]);
+        assert_eq!(a.clear_after_idle_mins, 60);
+        assert_eq!(
+            a.dir_path(Path::new("/Users/you")),
+            Path::new("/Users/you/agent")
+        );
+        let c = Config::parse(
+            "[agent]\nenabled = false\ntmux_session = \"\"\ndir = \"/srv/a\"\nclear_after_idle_mins = 0\n",
+        )
+        .unwrap();
+        assert!(!c.agent.enabled);
+        // An empty name would make every tmux call fail: back to the default.
+        assert_eq!(c.agent.tmux_session, "agent");
+        assert_eq!(c.agent.dir_path(Path::new("/h")), Path::new("/srv/a"));
+        assert_eq!(c.agent.clear_after_idle_mins, 0);
+        assert_eq!(c.agent.terminal, "Ghostty");
+        let c = Config::parse("[agent]\ntmux_session = \"my.agent:1\"\n").unwrap();
+        assert_eq!(c.agent.tmux_session, "my_agent_1");
     }
 
     #[test]

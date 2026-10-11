@@ -7,12 +7,23 @@
 //!    read the front app and, if it is a terminal and `claude_code_mode` is
 //!    on, `context::detect` + `VocabCache::get`.
 //! 2. `EnterHandsFree` → publish `Recording { hands_free: true }`.
+//!    `RetargetAgent` (a triple tap) → the live dictation becomes an agent
+//!    one: the mic keeps going, the clipboard prepare is dropped, and the
+//!    context is the agent's.
 //! 3. `StopAndPaste` → publish `Transcribing`; `session.finish()` (if the
 //!    front app changed meanwhile, the context is re-detected while the tail
 //!    transcribes); `pipeline::finish_with` — S1-mini when it is on and
 //!    loaded, then the rules and the dictionary; if non-empty, paste, append
 //!    to the day file, log the latency line; publish `Idle`.
 //! 4. `Cancel(_)` → `session.cancel()`; publish `Idle`. Nothing is written.
+//!
+//! An agent dictation (⌥+fn or a triple tap, `Target::Agent`) runs the same pipeline, with
+//! Claude Code mode resolving @mentions against the agent's directory, then
+//! goes to the agent thread (`agent.rs`) to be typed into its tmux session
+//! instead of pasted: `/clear` for a clear phrase, `/clear` first after a
+//! long idle. It is saved to the day file under the app name `agent`, and
+//! the menu bar holds the agent's ramp until its `Stop` hook says it is done
+//! (`squawk agent stop`), or [`AGENT_TIMEOUT`].
 //!
 //! The notetaker (heads-up, call detection, maximum length) is
 //! `squawk_core::notetaker::Notetaker`, ticked here once a
@@ -27,12 +38,13 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, SecondsFormat};
 use crossbeam_channel::{Receiver, Sender};
+use squawk_core::agent::{self, Setup};
 use squawk_core::cleanup::CleanupOptions;
 use squawk_core::config::MeetingConfig;
-use squawk_core::context::{self, Context, FrontApp, VocabCache};
+use squawk_core::context::{self, Context, FrontApp, Session, VocabCache};
 use squawk_core::dictionary::DictionaryCache;
-use squawk_core::hotkey::{Action, Timings};
-use squawk_core::ipc::{Request, Response};
+use squawk_core::hotkey::{Action, Target, Timings};
+use squawk_core::ipc::{AgentEvent, Request, Response};
 use squawk_core::normalize::Normalizer;
 use squawk_core::notetaker::calls::CallId;
 use squawk_core::notetaker::heads_up::{self, UpcomingEvent};
@@ -47,6 +59,7 @@ use squawk_engine::{
     MeetingResult,
 };
 
+use crate::agent::{AgentWorker, Job};
 use crate::hotkey::SharedMachine;
 use crate::{calendar, frontmost, mic_watch, paste, permissions};
 
@@ -55,6 +68,9 @@ const TICK: Duration = Duration::from_secs(1);
 /// How often the calendar is re-read (heads-ups, automatic recording, the
 /// next meeting).
 const CALENDAR_EVERY: Duration = Duration::from_secs(30);
+/// The agent counts as done this long after its last request, should its
+/// `Stop` hook never arrive (the session was killed, the hook is missing).
+pub const AGENT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// What the dictation side is doing, for the menu bar and the popover.
 #[derive(Debug, Clone, PartialEq)]
@@ -112,6 +128,9 @@ pub struct Snapshot {
     /// The next meeting on the calendar through tomorrow (one under way
     /// counts), for the Meetings tab.
     pub next_meeting: Option<UpcomingEvent>,
+    /// The agent is working on a request, since then: the menu bar holds
+    /// its ramp.
+    pub agent_working: Option<Instant>,
 }
 
 impl Snapshot {
@@ -133,6 +152,7 @@ impl Snapshot {
             cleanup_model: false,
             cleanup_status: ModelStatus::Missing,
             next_meeting: None,
+            agent_working: None,
         }
     }
 }
@@ -168,6 +188,11 @@ pub enum Command {
     CalendarAccess(bool),
     /// The calendar around now (read on a helper thread).
     CalendarEvents(Vec<UpcomingEvent>),
+    /// The agent thread could not deliver (`delivery`) or show (sent by it).
+    AgentFailed {
+        message: String,
+        delivery: bool,
+    },
     /// Finish a running meeting, then answer on `done`.
     Quit {
         done: Sender<()>,
@@ -239,6 +264,9 @@ impl Controller {
 /// The dictation being recorded.
 struct Live {
     session: DictationSession,
+    target: Target,
+    /// The front app at the start (`None` for the agent, which does not
+    /// care what is in front).
     front: Option<FrontApp>,
     context: Option<Context>,
 }
@@ -278,6 +306,10 @@ struct Worker {
     events_pending: bool,
     /// Quit was handled; the loop ends.
     stopping: bool,
+    agent: AgentWorker,
+    /// When the agent was last given a request (by voice, or typed in its
+    /// terminal), for `clear_after_idle_mins`.
+    last_agent_request: Option<Instant>,
 }
 
 impl Worker {
@@ -297,6 +329,10 @@ impl Worker {
         snap.cleanup_model = config.dictation.cleanup_model;
         snap.cleanup_status = engine.cleanup_status();
         let notetaker = Notetaker::new(Settings::from(&config.meeting));
+        let agent_tx = tx.clone();
+        let agent = AgentWorker::spawn(move |message, delivery| {
+            let _ = agent_tx.send(Command::AgentFailed { message, delivery });
+        });
         Worker {
             store: Store::new(&paths),
             dictionary: DictionaryCache::new(paths.dictionary_file.clone()),
@@ -325,6 +361,8 @@ impl Worker {
             stopped_because: None,
             events_pending: false,
             stopping: false,
+            agent,
+            last_agent_request: None,
         }
     }
 
@@ -410,6 +448,14 @@ impl Worker {
                     self.publish();
                 }
             }
+            Command::AgentFailed { message, delivery } => {
+                // A window that would not open says nothing about a request
+                // the agent may be working on.
+                if delivery {
+                    self.snap.agent_working = None;
+                }
+                self.fail(message);
+            }
             Command::CalendarAccess(granted) => {
                 self.snap.calendar_access = Some(granted);
                 self.events_read = None;
@@ -439,13 +485,21 @@ impl Worker {
 
     fn on_hotkey(&mut self, action: Action) {
         match action {
-            Action::StartRecording => self.start_recording(),
+            Action::StartRecording { target } => {
+                if target == Target::Agent && !self.config.agent.enabled {
+                    // ⌥+fn is nothing while the agent is off.
+                    self.hotkeys.force_idle();
+                    return;
+                }
+                self.start_recording(target)
+            }
             Action::EnterHandsFree => {
                 if let DictationPhase::Recording { hands_free, .. } = &mut self.snap.dictation {
                     *hands_free = true;
                     self.publish();
                 }
             }
+            Action::RetargetAgent => self.retarget_agent(),
             Action::StopAndPaste => self.stop_and_paste(Instant::now()),
             Action::Cancel(reason) => {
                 if let Some(live) = self.live.take() {
@@ -473,10 +527,15 @@ impl Worker {
                 Err(e) => self.fail(format!("could not read the last dictation: {e}")),
             },
             Action::ToggleMeeting => self.toggle_meeting(),
+            Action::ToggleAgentWindow => {
+                if self.config.agent.enabled {
+                    self.agent.send(Job::Toggle(self.agent_setup()));
+                }
+            }
         }
     }
 
-    fn start_recording(&mut self) {
+    fn start_recording(&mut self, target: Target) {
         if let Some(stale) = self.live.take() {
             stale.session.cancel();
         }
@@ -507,14 +566,68 @@ impl Worker {
             });
         }
 
-        let front = frontmost::front_app();
-        let context = front.as_ref().and_then(|f| self.context_for(f));
-        paste::prepare();
+        let (front, context) = match target {
+            Target::Paste => {
+                let front = frontmost::front_app();
+                let context = front.as_ref().and_then(|f| self.context_for(f));
+                paste::prepare();
+                (front, context)
+            }
+            Target::Agent => (None, self.agent_context()),
+        };
         self.live = Some(Live {
             session,
+            target,
             front,
             context,
         });
+    }
+
+    /// A triple tap: the dictation under way goes to the agent instead of
+    /// being pasted. Only the target changes; the session keeps recording.
+    fn retarget_agent(&mut self) {
+        if !self.config.agent.enabled
+            || !self
+                .live
+                .as_ref()
+                .is_some_and(|l| l.target == Target::Paste)
+        {
+            return;
+        }
+        let context = self.agent_context();
+        if let Some(live) = self.live.as_mut() {
+            live.target = Target::Agent;
+            live.front = None;
+            live.context = context;
+        }
+        paste::discard_prepared();
+        log::info!("dictation retargeted to the agent");
+    }
+
+    /// Claude Code mode for the agent: @mentions and vocabulary from its
+    /// directory, as if the front app were its terminal.
+    fn agent_context(&mut self) -> Option<Context> {
+        if !self.config.dictation.claude_code_mode {
+            return None;
+        }
+        let cwd = self.config.agent.dir_path(&self.paths.home);
+        if !cwd.is_dir() {
+            return None;
+        }
+        let vocab = self.vocab.get(&cwd);
+        Some(Context {
+            session: Session {
+                agent: context::Agent::Claude,
+                pid: 0,
+                cwd,
+                tty: None,
+            },
+            vocab,
+        })
+    }
+
+    fn agent_setup(&self) -> Setup {
+        Setup::new(&self.config.agent, &self.paths.home)
     }
 
     /// The Claude Code / Codex session behind `front`, when there is one and
@@ -537,7 +650,11 @@ impl Worker {
         self.snap.dictation = DictationPhase::Transcribing;
         self.publish();
 
-        let front_now = frontmost::front_app();
+        let target = live.target;
+        let front_now = match target {
+            Target::Paste => frontmost::front_app(),
+            Target::Agent => None,
+        };
         let moved = front_now.as_ref().map(|f| f.pid) != live.front.as_ref().map(|f| f.pid);
         let session = live.session;
         let (transcript, front, context) = if moved {
@@ -583,11 +700,16 @@ impl Worker {
             .saturating_sub(finished.model_time)
             .as_millis();
 
-        let app = front
-            .as_ref()
-            .map(|f| f.name.clone())
-            .unwrap_or_else(|| "Unknown".into());
-        let project = context.as_ref().map(|c| c.session.project());
+        let (app, project) = match target {
+            Target::Paste => (
+                front
+                    .as_ref()
+                    .map(|f| f.name.clone())
+                    .unwrap_or_else(|| "Unknown".into()),
+                context.as_ref().map(|c| c.session.project()),
+            ),
+            Target::Agent => (AGENT_APP.to_string(), None),
+        };
         let mut metrics = Metrics {
             audio_secs: transcript.audio_secs,
             segments: transcript.segments,
@@ -601,6 +723,7 @@ impl Worker {
             app: app.clone(),
             project: project.clone(),
             context: context.as_ref().map(|c| agent_name(c.session.agent)),
+            target,
         };
 
         if text.is_empty() {
@@ -608,6 +731,11 @@ impl Worker {
             log::info!(target: "dictation", "{}", metrics.line());
             self.snap.dictation = DictationPhase::Idle;
             self.publish();
+            return;
+        }
+
+        if target == Target::Agent {
+            self.send_to_agent(text, released, metrics);
             return;
         }
 
@@ -636,6 +764,65 @@ impl Worker {
             (_, Err(e)) => Some(format!("could not save the dictation: {e}")),
             _ => None,
         };
+        self.publish();
+    }
+
+    /// Hand a finished agent dictation to the agent thread (which types it
+    /// and logs its line), save it, and show the agent working.
+    fn send_to_agent(&mut self, text: String, released: Instant, metrics: Metrics) {
+        let now = Instant::now();
+        let config = &self.config.agent;
+        let idle = agent::idle_expired(self.last_agent_request, now, config.clear_after_idle_mins);
+        let messages = agent::messages(&text, &config.clear_phrases, idle);
+        // `/clear` alone fires no hook, so nothing would end the ramp.
+        let working = messages.last().is_some_and(|m| m != agent::CLEAR);
+        if working {
+            self.last_agent_request = Some(now);
+        }
+        self.agent.send(Job::Deliver {
+            setup: self.agent_setup(),
+            messages,
+            released,
+            metrics: Box::new(metrics),
+        });
+
+        let entry = DictationEntry {
+            at: Local::now().naive_local(),
+            app: AGENT_APP.to_string(),
+            project: None,
+            text,
+        };
+        let saved = self.store.append_dictation(&entry);
+        self.snap.dictation = DictationPhase::Idle;
+        if working {
+            // A lone `/clear` leaves the ramp as it was: it does not end a
+            // turn under way, and its own Stop never comes.
+            self.snap.agent_working = Some(now);
+        }
+        self.snap.dictations_this_run += 1;
+        self.snap.revision += 1;
+        self.snap.last_error = saved
+            .err()
+            .map(|e| format!("could not save the dictation: {e}"));
+        self.publish();
+    }
+
+    /// What the agent's hooks report (`squawk agent <event>`).
+    fn on_agent_event(&mut self, event: AgentEvent) {
+        let now = Instant::now();
+        log::info!(target: "agent", "{}", event.as_str());
+        match event {
+            AgentEvent::Start => {
+                self.snap.agent_working = Some(now);
+                self.last_agent_request = Some(now);
+            }
+            AgentEvent::Stop => self.snap.agent_working = None,
+            AgentEvent::Question => {
+                self.snap.agent_working = None;
+                self.agent.send(Job::Show(self.agent_setup()));
+            }
+            AgentEvent::Show => self.agent.send(Job::Show(self.agent_setup())),
+        }
         self.publish();
     }
 
@@ -847,7 +1034,15 @@ impl Worker {
         }
         let prompt_changed = self.sync_prompt();
         let next_changed = self.sync_next_meeting();
-        if prompt_changed || next_changed {
+        let agent_done = self
+            .snap
+            .agent_working
+            .is_some_and(|since| now.saturating_duration_since(since) >= AGENT_TIMEOUT);
+        if agent_done {
+            log::info!(target: "agent", "no stop after {} min; idle again", AGENT_TIMEOUT.as_secs() / 60);
+            self.snap.agent_working = None;
+        }
+        if prompt_changed || next_changed || agent_done {
             self.publish();
         }
     }
@@ -945,6 +1140,10 @@ impl Worker {
                 self.reload();
                 Response::Ok
             }
+            Request::Agent { event } => {
+                self.on_agent_event(event);
+                Response::Ok
+            }
         };
         let _ = reply.send(response);
     }
@@ -977,6 +1176,7 @@ impl Worker {
         self.engine
             .update_config(EngineConfig::from_config(&self.paths, &config));
         self.hotkeys.set_timings(Timings::from(&config.hotkey));
+        self.hotkeys.set_agent_enabled(config.agent.enabled);
         self.notetaker.set_settings(Settings::from(&config.meeting));
         self.snap.meeting_config = config.meeting.clone();
         self.snap.cleanup_model = config.dictation.cleanup_model;
@@ -1087,6 +1287,9 @@ fn agent_name(agent: context::Agent) -> &'static str {
     }
 }
 
+/// The app name an agent dictation is saved and logged under.
+pub const AGENT_APP: &str = "agent";
+
 /// The title of a meeting nobody named.
 pub const DEFAULT_TITLE: &str = "Meeting";
 
@@ -1174,11 +1377,15 @@ pub struct Metrics {
     pub project: Option<String>,
     /// "claude"/"codex" in Claude Code mode.
     pub context: Option<&'static str>,
+    /// Pasted, or typed into the agent's session.
+    pub target: Target,
 }
 
 impl Metrics {
     /// `audio=20.4s segments=5 tail_ms=182 ... app=Ghostty project=squawk
-    /// context=claude`. Lengths and timings only, never text.
+    /// context=claude target=paste`. Lengths and timings only, never text.
+    /// For the agent, `paste_ms` is the time typing into tmux took and
+    /// `release_to_paste_ms` runs to the last Enter.
     pub fn line(&self) -> String {
         let mut line = format!(
             "audio={:.1}s segments={} tail_ms={} pipeline_ms={} cleanup={} cleanup_ms={} paste_ms={} release_to_paste_ms={} chars={} app={}",
@@ -1197,6 +1404,7 @@ impl Metrics {
             line.push_str(&format!(" project={}", log_value(project)));
         }
         line.push_str(&format!(" context={}", self.context.unwrap_or("none")));
+        line.push_str(&format!(" target={}", self.target.as_str()));
         line
     }
 }
@@ -1268,11 +1476,38 @@ pub(crate) mod tests {
             app: "Ghostty".into(),
             project: Some("squawk".into()),
             context: Some("claude"),
+            target: Target::Paste,
         };
         assert_eq!(
             m.line(),
             "audio=20.4s segments=5 tail_ms=182 pipeline_ms=3 cleanup=s1 cleanup_ms=140 \
-             paste_ms=12 release_to_paste_ms=197 chars=312 app=Ghostty project=squawk context=claude"
+             paste_ms=12 release_to_paste_ms=197 chars=312 app=Ghostty project=squawk context=claude \
+             target=paste"
+        );
+    }
+
+    #[test]
+    fn the_agent_log_line_says_so() {
+        let m = Metrics {
+            audio_secs: 2.0,
+            segments: 1,
+            tail_ms: 60,
+            pipeline_ms: 0,
+            cleanup: "s1".into(),
+            cleanup_ms: 120,
+            paste_ms: 18,
+            release_to_paste_ms: 230,
+            chars: 24,
+            app: AGENT_APP.into(),
+            project: None,
+            context: Some("claude"),
+            target: Target::Agent,
+        };
+        assert!(
+            m.line()
+                .ends_with("chars=24 app=agent context=claude target=agent"),
+            "{}",
+            m.line()
         );
     }
 
@@ -1291,9 +1526,11 @@ pub(crate) mod tests {
             app: "Google Chrome".into(),
             project: None,
             context: None,
+            target: Target::Paste,
         };
         assert!(
-            m.line().ends_with("app=\"Google Chrome\" context=none"),
+            m.line()
+                .ends_with("app=\"Google Chrome\" context=none target=paste"),
             "{}",
             m.line()
         );

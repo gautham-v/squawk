@@ -6,7 +6,8 @@
 //! At rest the bars are a still waveform, 6/10/14/10/6 pt tall. While
 //! recording they follow the mic level; after a recording they ease back to
 //! rest; during a meeting they pulse slowly; when squawk needs attention the
-//! resting shape is drawn faint. The maths is here and pure ([`Animator`]),
+//! resting shape is drawn faint; while the agent works they ease into a
+//! falling ramp and hold it, still. The maths is here and pure ([`Animator`]),
 //! so it is tested without AppKit; `status_item.rs` owns the timer.
 
 use block2::RcBlock;
@@ -21,6 +22,8 @@ use crate::status_item::MenuBarState;
 
 /// Resting bar heights in points, left to right.
 pub const IDLE_BARS: [f64; 5] = [6.0, 10.0, 14.0, 10.0, 6.0];
+/// While the agent works: a falling ramp, centre-aligned like the rest.
+pub const AGENT_BARS: [f64; 5] = [15.0, 12.0, 9.0, 6.0, 3.0];
 pub const BAR_WIDTH: f64 = 2.0;
 pub const BAR_GAP: f64 = 1.5;
 /// The glyph's width: five bars and four gaps. The image is always this
@@ -48,7 +51,8 @@ pub const FULL_SCALE_RMS: f64 = 0.12;
 /// room), so room tone does not twitch them.
 pub const NOISE_FLOOR_RMS: f64 = 0.003;
 
-/// After a recording, the bars ease back to rest over this long.
+/// After a recording, the bars ease back to rest over this long; the same
+/// ease takes them into and out of the agent's ramp.
 pub const SETTLE_SECS: f64 = 0.25;
 /// Meeting pulse: resting heights × (BASE + SWING·sin(2πt / PERIOD)).
 pub const PULSE_PERIOD_SECS: f64 = 5.0;
@@ -94,7 +98,7 @@ pub enum Motion {
     Still,
     /// Following the mic.
     Live,
-    /// Easing back to rest after a recording.
+    /// Easing to a resting shape: idle's after a recording, or the agent's.
     Settle,
     /// The slow meeting pulse.
     Pulse,
@@ -209,12 +213,35 @@ pub fn ease_out_cubic(k: f64) -> f64 {
 
 /// `elapsed` seconds into the settle from `from` back to the resting shape.
 pub fn settle_heights(from: [f64; 5], elapsed: f64) -> [f64; 5] {
+    morph_heights(from, IDLE_BARS, elapsed)
+}
+
+/// `elapsed` seconds into the ease from `from` to `to`.
+pub fn morph_heights(from: [f64; 5], to: [f64; 5], elapsed: f64) -> [f64; 5] {
     let k = ease_out_cubic(elapsed / SETTLE_SECS);
     let mut heights = [0.0; 5];
     for i in 0..5 {
-        heights[i] = from[i] + (IDLE_BARS[i] - from[i]) * k;
+        heights[i] = from[i] + (to[i] - from[i]) * k;
     }
     heights
+}
+
+/// The still shape a state settles into, for the states that settle:
+/// the agent's ramp while it works, the resting waveform otherwise.
+pub fn rest_heights(state: &MenuBarState) -> [f64; 5] {
+    match state {
+        MenuBarState::AgentWorking => AGENT_BARS,
+        _ => IDLE_BARS,
+    }
+}
+
+/// States whose glyph comes to rest in a still shape (and so are eased
+/// into rather than cut to).
+fn settles(state: &MenuBarState) -> bool {
+    matches!(
+        state,
+        MenuBarState::Idle | MenuBarState::Transcribing | MenuBarState::AgentWorking
+    )
 }
 
 /// The meeting pulse, `t` seconds in.
@@ -239,6 +266,10 @@ pub fn still_glyph(state: &MenuBarState) -> Glyph {
             heights: snap(IDLE_BARS.map(|h| h * PULSE_BASE)),
             alpha: 1.0,
         },
+        MenuBarState::AgentWorking => Glyph {
+            heights: AGENT_BARS,
+            alpha: 1.0,
+        },
     }
 }
 
@@ -254,8 +285,9 @@ pub struct Animator {
     last_t: f64,
     /// When the current state was entered (the pulse's zero).
     since: f64,
-    /// A settle in progress: when it started and the heights it left from.
-    settle: Option<(f64, [f64; 5])>,
+    /// A settle in progress: when it started, the heights it left from and
+    /// the shape it is heading for.
+    settle: Option<(f64, [f64; 5], [f64; 5])>,
 }
 
 impl Animator {
@@ -278,17 +310,23 @@ impl Animator {
         &self.state
     }
 
-    /// Enter `state` at `now`. Leaving a recording for transcribing or idle
-    /// starts the settle from the bars as last drawn; a settle already under
-    /// way carries on into idle, since it ends on the resting shape anyway.
+    /// Enter `state` at `now`. Entering a state that rests in a still shape
+    /// (idle, transcribing, the agent working) eases there from the bars as
+    /// last drawn; a settle already heading for that shape carries on (idle
+    /// arriving mid-settle after a recording does not restart it).
     pub fn set_state(&mut self, state: MenuBarState, now: f64, reduce_motion: bool) {
         if state == self.state && reduce_motion == self.reduce_motion {
             return;
         }
-        let rests = matches!(state, MenuBarState::Idle | MenuBarState::Transcribing);
-        if self.state == MenuBarState::Recording && rests && !reduce_motion {
-            self.settle = Some((now, self.last.heights));
-        } else if !rests || reduce_motion {
+        if settles(&state) && !reduce_motion {
+            let to = rest_heights(&state);
+            let heading_there = matches!(self.settle, Some((_, _, t)) if t == to);
+            if self.last.heights == to {
+                self.settle = None;
+            } else if !heading_there {
+                self.settle = Some((now, self.last.heights, to));
+            }
+        } else {
             self.settle = None;
         }
         if state == MenuBarState::Recording && self.state != MenuBarState::Recording {
@@ -310,10 +348,12 @@ impl Animator {
         match self.state {
             MenuBarState::Recording => Motion::Live,
             MenuBarState::Meeting => Motion::Pulse,
-            MenuBarState::Idle | MenuBarState::Transcribing => match self.settle {
-                Some((start, _)) if now - start < SETTLE_SECS => Motion::Settle,
-                _ => Motion::Still,
-            },
+            MenuBarState::Idle | MenuBarState::Transcribing | MenuBarState::AgentWorking => {
+                match self.settle {
+                    Some((start, _, _)) if now - start < SETTLE_SECS => Motion::Settle,
+                    _ => Motion::Still,
+                }
+            }
             MenuBarState::NeedsAttention => Motion::Still,
         }
     }
@@ -333,9 +373,9 @@ impl Animator {
                 }
             }
             Motion::Settle => {
-                let (start, from) = self.settle.expect("settling");
+                let (start, from, to) = self.settle.expect("settling");
                 Glyph {
-                    heights: settle_heights(from, now - start),
+                    heights: morph_heights(from, to, now - start),
                     alpha: 1.0,
                 }
             }
@@ -589,6 +629,54 @@ mod tests {
     }
 
     #[test]
+    fn the_agent_morphs_to_its_ramp_holds_it_still_and_morphs_back() {
+        assert_eq!(rest_heights(&MenuBarState::AgentWorking), AGENT_BARS);
+        assert_eq!(rest_heights(&MenuBarState::Idle), IDLE_BARS);
+        assert_eq!(snap(AGENT_BARS), AGENT_BARS);
+        // The ramp is centred like the resting bars.
+        for (_, y, _, h) in bar_rects(AGENT_BARS, 0.0) {
+            assert_eq!(y + h / 2.0, CANVAS_HEIGHT / 2.0);
+        }
+
+        let mut a = Animator::new(MenuBarState::Idle, 0.0, false);
+        a.set_state(MenuBarState::AgentWorking, 1.0, false);
+        assert_eq!(a.motion(1.0), Motion::Settle);
+        assert_eq!(a.frame(1.0, 0.0).heights, IDLE_BARS);
+        let mid = a.frame(1.0 + SETTLE_SECS / 2.0, 0.0);
+        assert!(mid.heights != IDLE_BARS && mid.heights != AGENT_BARS);
+        assert_eq!(
+            morph_heights(IDLE_BARS, AGENT_BARS, SETTLE_SECS / 2.0)[0],
+            6.0 + 9.0 * 0.875
+        );
+        // Then still: no timer while the agent works.
+        assert_eq!(a.motion(1.0 + SETTLE_SECS), Motion::Still);
+        let held = a.frame(1.0 + SETTLE_SECS, 0.0);
+        assert_eq!(held.heights, AGENT_BARS);
+        assert_eq!(a.frame(60.0, 0.0), held);
+
+        // A dictation over the top, then back to the ramp, eased from
+        // wherever the settle had got to.
+        a.set_state(MenuBarState::Recording, 61.0, false);
+        let mut t = 61.0;
+        for _ in 0..6 {
+            t += 1.0 / 24.0;
+            a.frame(t, 0.1);
+        }
+        a.set_state(MenuBarState::Transcribing, t, false);
+        a.frame(t + 0.1, 0.0);
+        a.set_state(MenuBarState::AgentWorking, t + 0.1, false);
+        assert_eq!(a.motion(t + 0.1), Motion::Settle);
+        assert_eq!(a.frame(t + 0.1 + SETTLE_SECS, 0.0).heights, AGENT_BARS);
+
+        // Done: back to the resting waveform.
+        let t = t + 5.0;
+        a.set_state(MenuBarState::Idle, t, false);
+        assert_eq!(a.motion(t), Motion::Settle);
+        assert_eq!(a.frame(t + SETTLE_SECS, 0.0), Glyph::IDLE);
+        assert_eq!(a.motion(t + SETTLE_SECS), Motion::Still);
+    }
+
+    #[test]
     fn reduced_motion_draws_a_still_glyph_per_state() {
         for state in [
             MenuBarState::Idle,
@@ -596,6 +684,7 @@ mod tests {
             MenuBarState::Recording,
             MenuBarState::Transcribing,
             MenuBarState::Meeting,
+            MenuBarState::AgentWorking,
         ] {
             let mut a = Animator::new(state.clone(), 0.0, true);
             assert_eq!(a.motion(0.0), Motion::Still, "{state:?}");

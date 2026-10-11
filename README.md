@@ -72,6 +72,9 @@ record one. Calendar access is asked for while the meeting heads-up is on (it is
 | ctrl+cmd+V | paste the last dictation again |
 | ctrl+cmd+C | copy the last dictation |
 | ⌥M | start or stop a meeting |
+| tap fn three times | hands-free dictation to the [agent](#agent); press fn once more to send |
+| hold ⌥ + fn, talk, release | send it to the [agent](#agent) instead of pasting (double-tap works too) |
+| tap ⌥ + fn | show the agent's terminal window, or hide it if it is in front |
 
 The menu bar item is just the five bars, in the menu bar's own colour. While it listens they move
 with your voice, when you let go they settle back, during a meeting they pulse slowly, and they
@@ -136,6 +139,50 @@ Try it offline against any repo: `squawk transcribe clip.m4a --raw --cwd ~/code/
 Turn it off by setting `claude_code_mode = false` under `[dictation]` in
 `~/.config/squawk/config.toml`.
 
+## Agent
+
+Tap fn three times (or hold ⌥ with fn) and the dictation goes to a Claude Code session that keeps
+running in a tmux session, wherever you are. The triple tap is hands-free: talk, then press fn once
+more to send. The third tap has to come as quickly as a double tap's second; later, it is the
+ordinary stop and paste. Nothing is pasted, the clipboard is not touched, and the app you are in
+keeps focus. Squawk types the text into the session (`tmux send-keys -l`) and presses return.
+"Open my notes from Tuesday", "what's on my calendar", "find the PR about the resampler".
+
+- If the session is not running, squawk starts it in `~/agent`, runs `claude` in it, and opens it in
+  the terminal: a new tab in Ghostty's front window (a new window if none is open), a new
+  window in Terminal or iTerm2. The first request waits for Claude Code to boot. If Claude Code has
+  exited and the session sits at a shell prompt, squawk runs `claude` again first rather than
+  typing the request into the shell.
+- Say "new conversation" (or "clear conversation") on its own to send `/clear`. After an hour
+  with no request (counted from the last one squawk saw since it started), the next one starts
+  with `/clear` as well.
+- While the agent works, the menu bar's bars lean into a falling ramp and hold still; they settle
+  back when it finishes.
+- Claude Code mode applies, as if you were dictating into the agent's terminal: file names in
+  `~/agent` become `@mentions`.
+- Agent dictations are saved like any other, under the app name `agent`.
+
+`make agent-init` sets up `~/agent`: a `CLAUDE.md` that tells Claude how requests arrive and what
+to do with them, and `.claude/settings.json` with the hooks that keep the menu bar in step
+(`squawk agent start` when a request lands, `stop` when it is done, `question` when it needs you,
+which brings its window forward). It never overwrites a file that is there. Claude Code ignores
+`bypassPermissions` in a project's settings now; to skip its permission prompts in the agent, set
+`command = "claude --permission-mode bypassPermissions"`.
+
+```toml
+[agent]
+enabled = true
+tmux_session = "agent"      # the tmux session the text is typed into
+dir = "~/agent"             # where squawk starts the session
+command = "claude"
+terminal = "Ghostty"        # or "Terminal", "iTerm2"
+clear_phrases = ["new conversation", "clear conversation"]
+clear_after_idle_mins = 60  # 0: never
+```
+
+Needs tmux (`brew install tmux`). `squawk agent send "what time is it in Tokyo"` delivers text the
+same way, for trying it without the hotkey.
+
 ## Files
 
 Plain files, so you (and Claude) can read them directly.
@@ -165,6 +212,8 @@ squawk dict add <phrase>     # "Kubernetes" or "cloud code -> Claude Code"
 squawk dict list
 squawk model download        # Parakeet, and S1-mini while cleanup_model is on
 squawk transcribe <audio file> [--raw] [--cwd DIR]   # --raw also shows S1-mini's answer
+squawk agent send <text>     # type it into the agent's tmux session and press return
+squawk agent start|stop|question|show   # for the agent's hooks; always exits 0
 ```
 
 `status`, `reload` and `meet start/stop` talk to the running app; everything else reads the files
@@ -276,6 +325,7 @@ make run        # build Squawk.app and launch it
 make test       # cargo test --workspace
 make check      # fmt + clippy
 make preview    # the popover with fixture data (MODE=recording|meeting|settings|panels|…)
+make agent-init # scaffold the agent's directory (~/agent, or [agent] dir)
 cargo run -p squawk-app --example menu_bar_preview   # every menu bar state at once
 cargo run -p squawk-app --example menu_bar_preview -- --png DIR   # frames as PNGs, light and dark
 cargo run -p squawk-app --example mic_probe          # which processes use the mic, as call detection sees them

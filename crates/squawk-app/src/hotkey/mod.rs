@@ -58,6 +58,10 @@ impl SharedMachine {
         self.lock().set_timings(timings);
     }
 
+    pub fn set_agent_enabled(&self, enabled: bool) {
+        self.lock().set_agent_enabled(enabled);
+    }
+
     /// The controller ended a dictation itself (max length, an engine error):
     /// put the machine back to idle silently.
     pub fn force_idle(&self) {
@@ -263,6 +267,11 @@ fn log_gesture(state: &TapState, raw: &RawEvent, outcome: &Outcome, now: Instant
     if outcome.actions.contains(&Action::EnterHandsFree) {
         log::info!(
             "hands-free: second fn press {} ms after release",
+            gap.unwrap_or(0)
+        );
+    } else if outcome.actions.contains(&Action::RetargetAgent) {
+        log::info!(
+            "agent: third fn press {} ms after release",
             gap.unwrap_or(0)
         );
     } else if fn_edge {

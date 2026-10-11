@@ -124,7 +124,7 @@ pub fn drive(machine: &mut Machine, event: RawEvent, now: Instant) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use squawk_core::hotkey::{Action, CancelReason, State, Timings};
+    use squawk_core::hotkey::{Action, CancelReason, State, Target, Timings};
     use std::time::Duration;
 
     const FN_BIT: u64 = flag::FUNCTION;
@@ -134,6 +134,13 @@ mod tests {
     const LETTER_A: u16 = 0;
     const LEFT_SHIFT: u16 = 56;
     const LEFT_CMD: u16 = 55;
+    const LEFT_OPTION: u16 = 58;
+    const START: Action = Action::StartRecording {
+        target: Target::Paste,
+    };
+    const START_AGENT: Action = Action::StartRecording {
+        target: Target::Agent,
+    };
     /// The non-coalesced "device independent" bit macOS sets on every
     /// flagsChanged; present so the tests see the flags the tap really sees.
     const NON_COALESCED: u64 = 0x100;
@@ -182,7 +189,7 @@ mod tests {
     #[test]
     fn globe_key_down_between_taps_keeps_the_double_tap() {
         let mut r = Replay::new();
-        assert_eq!(r.acts(0, fn_down()), [Action::StartRecording]);
+        assert_eq!(r.acts(0, fn_down()), [START]);
         assert!(r.acts(5, key(keycode::GLOBE)).is_empty());
         assert!(r.acts(90, fn_up()).is_empty());
         assert!(r.acts(200, key(keycode::GLOBE)).is_empty());
@@ -247,7 +254,7 @@ mod tests {
     #[test]
     fn hold_is_push_to_talk() {
         let mut r = Replay::new();
-        assert_eq!(r.acts(0, fn_down()), [Action::StartRecording]);
+        assert_eq!(r.acts(0, fn_down()), [START]);
         assert!(r.acts(900, fn_up()).contains(&Action::StopAndPaste));
         assert_eq!(r.m.state(), State::Idle);
     }
@@ -394,8 +401,71 @@ mod tests {
         // The fn-up that arrives after re-enabling is harmless...
         assert!(r.acts(900, fn_up()).is_empty());
         // ...and the next hold works normally.
-        assert_eq!(r.acts(2_000, fn_down()), [Action::StartRecording]);
+        assert_eq!(r.acts(2_000, fn_down()), [START]);
         assert_eq!(r.acts(2_800, fn_up()), [Action::StopAndPaste]);
+    }
+
+    /// ⌥ down, fn held, fn up, ⌥ up: the flags exactly as the tap sees them.
+    #[test]
+    fn option_fn_hold_records_for_the_agent() {
+        let mut r = Replay::new();
+        let opt = flag::OPTION | NON_COALESCED;
+        assert!(r
+            .acts(0, RawEvent::flags_changed(LEFT_OPTION, opt))
+            .is_empty());
+        assert_eq!(
+            r.acts(80, RawEvent::flags_changed(keycode::FN, FN_BIT | opt)),
+            [START_AGENT]
+        );
+        assert!(r
+            .acts(1_400, RawEvent::flags_changed(keycode::FN, opt))
+            .contains(&Action::StopAndPaste));
+        assert!(r
+            .acts(1_450, RawEvent::flags_changed(LEFT_OPTION, NON_COALESCED))
+            .is_empty());
+        assert_eq!(r.m.state(), State::Idle);
+        // Plain fn is unchanged afterwards.
+        assert_eq!(r.acts(3_000, fn_down()), [START]);
+        assert_eq!(r.acts(3_900, fn_up()), [Action::StopAndPaste]);
+    }
+
+    #[test]
+    fn option_fn_tap_toggles_the_agent_window() {
+        let mut r = Replay::new();
+        let opt = flag::OPTION | NON_COALESCED;
+        r.acts(0, RawEvent::flags_changed(LEFT_OPTION, opt));
+        assert_eq!(
+            r.acts(50, RawEvent::flags_changed(keycode::FN, FN_BIT | opt)),
+            [START_AGENT]
+        );
+        assert!(r
+            .acts(140, RawEvent::flags_changed(keycode::FN, opt))
+            .is_empty());
+        // Letting go of ⌥ inside the window is not "another key".
+        assert!(r
+            .acts(200, RawEvent::flags_changed(LEFT_OPTION, NON_COALESCED))
+            .is_empty());
+        assert_eq!(
+            r.tick(140 + 400),
+            [Action::Cancel(CancelReason::Tap), Action::ToggleAgentWindow]
+        );
+        assert_eq!(r.m.state(), State::Idle);
+    }
+
+    #[test]
+    fn triple_tap_sends_the_dictation_to_the_agent() {
+        let mut r = Replay::new();
+        assert_eq!(r.acts(0, fn_down()), [START]);
+        r.acts(80, fn_up());
+        assert_eq!(r.acts(200, fn_down()), [Action::EnterHandsFree]);
+        r.acts(260, fn_up());
+        assert_eq!(r.acts(380, fn_down()), [Action::RetargetAgent]);
+        assert!(r.acts(450, fn_up()).is_empty());
+        assert_eq!(r.m.state(), State::HandsFree);
+        assert_eq!(r.m.target(), Target::Agent);
+        assert!(r.tick(2_000).is_empty());
+        assert!(r.acts(20_000, fn_down()).is_empty());
+        assert_eq!(r.acts(20_100, fn_up()), [Action::StopAndPaste]);
     }
 
     #[test]

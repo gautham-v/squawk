@@ -258,6 +258,7 @@ fn main() {
 
         let engine = Engine::new(EngineConfig::from_config(&paths, &config));
         let machine = SharedMachine::new(Timings::from(&config.hotkey));
+        machine.set_agent_enabled(config.agent.enabled);
         let initial = Snapshot::initial(paths.clone(), engine.model_status(), config_note.clone());
 
         let (snap_tx, mut snaps) = futures::channel::mpsc::unbounded::<Snapshot>();

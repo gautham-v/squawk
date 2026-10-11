@@ -7,10 +7,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use squawk_core::agent::{self, Setup, System};
 use squawk_core::cleanup::CleanupOptions;
 use squawk_core::config::CLEANUP_MODEL_URL;
 use squawk_core::context::{Agent, Context, RepoVocab, Session};
-use squawk_core::ipc::{self, Request, Response};
+use squawk_core::ipc::{self, AgentEvent, Request, Response};
 use squawk_core::normalize::Normalizer;
 use squawk_core::{dictionary, pipeline, Config, Dictionary, ModelStatus, Paths, Store};
 use squawk_engine::{model, normalizer, Engine, EngineConfig};
@@ -197,6 +198,46 @@ pub fn reload(env: &Env) -> anyhow::Result<()> {
         Response::Ok => emit("Reloaded config.toml\n"),
         r => Err(unexpected(r)),
     }
+}
+
+/// How long a hook waits on the app before giving up (quietly).
+const AGENT_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Tell the app what the agent is doing. Run by the agent session's hooks,
+/// so it never fails and never prints: no app, a slow app or an error all
+/// end in exit 0.
+pub fn agent_event(env: &Env, event: AgentEvent) -> anyhow::Result<()> {
+    if env.paths.socket.exists() {
+        let _ = ipc::send(
+            &env.paths.socket,
+            &Request::Agent { event },
+            AGENT_EVENT_TIMEOUT,
+        );
+    }
+    Ok(())
+}
+
+/// Type `text` into the agent's tmux session and press Enter, the way an
+/// ⌥+fn dictation is delivered (a clear phrase sends `/clear`). Not saved to
+/// the day file; the idle `/clear` is the app's alone.
+pub fn agent_send(env: &Env, text: &str) -> anyhow::Result<()> {
+    env.warn_config();
+    let config = &env.config.agent;
+    let messages = agent::messages(text, &config.clear_phrases, false);
+    if messages.is_empty() {
+        return Err(exit(1, "Nothing to send."));
+    }
+    let setup = Setup::new(config, &env.paths.home);
+    let delivered = agent::deliver(&mut System, &setup, &messages).map_err(|e| exit(1, e))?;
+    let launched = if delivered.launched {
+        " (launched it first)"
+    } else {
+        ""
+    };
+    emit(&format!(
+        "Sent to tmux session {}{launched}.\n",
+        setup.session
+    ))
 }
 
 pub fn dict_add(env: &Env, phrase: &str) -> anyhow::Result<()> {
@@ -486,6 +527,48 @@ mod tests {
         let server = fake_app(&env, 1, |_| Response::Ok);
         reload(&env).unwrap();
         assert_eq!(server.join().unwrap(), [Request::Reload]);
+    }
+
+    #[test]
+    fn agent_events_reach_the_app() {
+        let (_d, env) = env();
+        let server = fake_app(&env, 2, |_| Response::Ok);
+        agent_event(&env, AgentEvent::Start).unwrap();
+        agent_event(&env, AgentEvent::Stop).unwrap();
+        assert_eq!(
+            server.join().unwrap(),
+            [
+                Request::Agent {
+                    event: AgentEvent::Start
+                },
+                Request::Agent {
+                    event: AgentEvent::Stop
+                }
+            ]
+        );
+    }
+
+    /// Hooks must never fail Claude: no app, or an app that answers with
+    /// an error, is still success.
+    #[test]
+    fn agent_events_succeed_without_the_app() {
+        let (_d, env) = env();
+        assert!(agent_event(&env, AgentEvent::Question).is_ok());
+        let server = fake_app(&env, 1, |_| Response::Error {
+            message: "no".into(),
+        });
+        assert!(agent_event(&env, AgentEvent::Show).is_ok());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn agent_send_with_nothing_to_send_is_exit_1() {
+        let (_d, env) = env();
+        let exit = agent_send(&env, "  ")
+            .unwrap_err()
+            .downcast::<Exit>()
+            .unwrap();
+        assert_eq!((exit.code, exit.message.as_str()), (1, "Nothing to send."));
     }
 
     #[test]

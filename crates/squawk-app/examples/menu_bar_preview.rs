@@ -8,9 +8,10 @@
 //!
 //! Without `--png`, puts one status item per state in the real menu bar for
 //! `seconds` (default 8): idle, needs attention, recording (fed by a
-//! synthetic voice), a loop of recording → transcribing → idle, and a
-//! meeting. `--only idle|attention|recording|transcribing|meeting` shows just
-//! that one, for measuring its CPU cost.
+//! synthetic voice), a loop of recording → transcribing → idle, a
+//! meeting, and a loop of idle → agent working → idle. `--only
+//! idle|attention|recording|transcribing|meeting|agent` shows just that one,
+//! for measuring its CPU cost.
 //!
 //! With `panel`, one idle item instead, with the notetaker's call prompt
 //! hanging under it the way the app shows it (a non-activating pop-up that
@@ -143,6 +144,27 @@ fn main() {
                 for (state, ms) in [
                     (MenuBarState::Recording, 1600),
                     (MenuBarState::Transcribing, 250),
+                    (MenuBarState::Idle, 1200),
+                ] {
+                    let Some(item) = looped.upgrade() else {
+                        return;
+                    };
+                    item.set_state(mtm, state);
+                    drop(item);
+                    cx.background_executor()
+                        .timer(Duration::from_millis(ms))
+                        .await;
+                }
+            })
+            .detach();
+        }
+        if wanted("agent") {
+            let item = Rc::new(StatusItem::new(mtm, MenuBarState::Idle, || 0.0).0);
+            let looped = Rc::downgrade(&item);
+            items.push(item);
+            cx.spawn(async move |cx| loop {
+                for (state, ms) in [
+                    (MenuBarState::AgentWorking, 2000),
                     (MenuBarState::Idle, 1200),
                 ] {
                     let Some(item) = looped.upgrade() else {
@@ -307,12 +329,19 @@ fn frames() -> Vec<(&'static str, Vec<Glyph>)> {
     let meeting: Vec<Glyph> = (0..10)
         .map(|k| meeting_anim.frame(k as f64 * PULSE_PERIOD_SECS / 10.0, 0.0))
         .collect();
+    // The agent: the ease into its ramp at 30 fps, then held.
+    let mut agent_anim = Animator::new(MenuBarState::Idle, 0.0, false);
+    agent_anim.set_state(MenuBarState::AgentWorking, 0.0, false);
+    let agent: Vec<Glyph> = (0..=8)
+        .map(|k| agent_anim.frame(k as f64 / 30.0, 0.0))
+        .collect();
     let reduced: Vec<Glyph> = [
         MenuBarState::Idle,
         MenuBarState::NeedsAttention,
         MenuBarState::Recording,
         MenuBarState::Transcribing,
         MenuBarState::Meeting,
+        MenuBarState::AgentWorking,
     ]
     .iter()
     .map(still_glyph)
@@ -326,6 +355,7 @@ fn frames() -> Vec<(&'static str, Vec<Glyph>)> {
         ("recording", recording),
         ("settle", settle),
         ("meeting", meeting),
+        ("agent", agent),
         ("reduced-motion", reduced),
     ]
 }

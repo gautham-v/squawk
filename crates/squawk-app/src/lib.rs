@@ -11,7 +11,11 @@
 //!   fn-down to paste (front app, Claude Code context, pasteboard and the
 //!   synthetic cmd+V included); everything slow happens here, never on main.
 //! - **ipc**: accept loop on the socket; forwards requests to the controller.
+//! - **agent**: types ⌥+fn dictations into the agent's tmux session, one at
+//!   a time (a launch waits for Claude Code to boot), and shows or hides its
+//!   terminal window.
 
+pub mod agent;
 pub mod calendar;
 pub mod controller;
 pub mod frontmost;

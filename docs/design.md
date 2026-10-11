@@ -18,11 +18,12 @@ code is right and this file is stale.
 
 ```
 Cargo.toml                 workspace; shared deps in [workspace.dependencies]
-crates/squawk-core         lib   config, config_edit, paths, store, dictionary, cleanup, normalize, pipeline, hotkey, ipc, status, text, context/, notetaker/
+crates/squawk-core         lib   agent, config, config_edit, paths, store, dictionary, cleanup, normalize, pipeline, hotkey, ipc, status, text, context/, notetaker/
 crates/squawk-engine       lib   audio, segmenter, model, recognizer, normalizer, dictation, meeting, system_audio
 crates/squawk-app          lib+bin "squawk-app", bundled as Squawk.app (LSUIElement)
 crates/squawk-cli          bin "squawk"
 scripts/bundle.sh          builds Squawk.app
+scripts/agent-init.sh      scaffolds the agent's directory (make agent-init)
 vendor/transcribe-rs       transcribe-rs 0.3.11 with one decoding fix; not a workspace member ([patch.crates-io])
 ```
 
@@ -160,6 +161,13 @@ defaults plus a human note (`Config::load -> (Config, Option<String>)`) that the
 | `[model] dir` | `parakeet-tdt-0.6b-v3-int8` | directory under models/ |
 | `[model] url` | `https://blob.handy.computer/parakeet-v3-int8.tar.gz` | where to download it |
 | `[model] threads` | `0` | ORT intra-op threads, 0 = ORT decides |
+| `[agent] enabled` | `true` | ⌥+fn dictates to the agent; off, ⌥+fn does nothing |
+| `[agent] tmux_session` | `"agent"` | the tmux session text is typed into (empty = default; `:` and `.`, which tmux reads as separators in a target, become `_`) |
+| `[agent] dir` | `"~/agent"` | where squawk starts the session (`~` expands) |
+| `[agent] command` | `"claude"` | typed into the session's shell when squawk starts it |
+| `[agent] terminal` | `"Ghostty"` | app whose window shows the session (`Terminal`, `iTerm2`, …) |
+| `[agent] clear_phrases` | `["new conversation", "clear conversation"]` | said alone (case and end punctuation ignored): send `/clear` |
+| `[agent] clear_after_idle_mins` | `60` | `/clear` before a request after this long without one; 0 = never |
 
 ### Log
 
@@ -168,8 +176,12 @@ that writes `<RFC3339> <LEVEL> <target>: <message>`). Per dictation, exactly one
 app's controller:
 
 ```
-2026-09-29T14:03:12-07:00 INFO dictation: audio=20.4s segments=5 tail_ms=182 pipeline_ms=3 cleanup=s1 cleanup_ms=140 paste_ms=12 release_to_paste_ms=337 chars=312 app=Ghostty project=squawk context=claude
+2026-09-29T14:03:12-07:00 INFO dictation: audio=20.4s segments=5 tail_ms=182 pipeline_ms=3 cleanup=s1 cleanup_ms=140 paste_ms=12 release_to_paste_ms=337 chars=312 app=Ghostty project=squawk context=claude target=paste
 ```
+
+`target` is `paste` or `agent`; an agent dictation's line is written by the agent thread once the
+last Enter is typed (or the delivery failed) (`app=agent`, `paste_ms` = the tmux calls, `release_to_paste_ms` to the last
+Enter, a launch's boot wait included).
 
 `cleanup` is `s1` (S1-mini's text was used), `rules` (off, or not downloaded/loaded yet) or
 `fallback:<why>` (`timeout`, `input_too_long`, `error`, `too_long`, `emptied`); `cleanup_ms` is
@@ -182,7 +194,7 @@ optimise. **Never log dictated text** (privacy); lengths only.
 
 ## squawk-core
 
-`pub mod`: `cleanup`, `config`, `config_edit`, `context`, `dictionary`, `error`, `hotkey`,
+`pub mod`: `agent`, `cleanup`, `config`, `config_edit`, `context`, `dictionary`, `error`, `hotkey`,
 `ipc`, `normalize`, `notetaker`, `paths`, `pipeline`, `status`, `store`, `text`. Re-exports: `Config`, `Dictionary`, `Error`, `Result`,
 `Paths`, `AppState`, `ModelStatus`, `Store`, `VERSION`.
 
@@ -235,6 +247,22 @@ optimise. **Never log dictated text** (privacy); lengths only.
   key is added to its table (created if needed). A file that does not parse is left alone.
 - `hotkey` — the state machine, below.
 - `ipc` — the protocol, below.
+- `agent` — the ⌥+fn agent (a Claude Code session in tmux): `messages(text, clear_phrases,
+  idle_expired)` (`/clear` alone for a clear phrase, `/clear` first after an idle, line breaks
+  to spaces), `idle_expired`, `is_clear_phrase`, `find_tmux` (`PATH`, then Homebrew's and the
+  usual places: the app's launchd `PATH` has none), `Setup` (the resolved `[agent]` config: every
+  tmux and terminal command line as a `Cmd`), and the sequences `deliver` / `show` /
+  `ensure_session` / `wait_for_boot` run through a `Shell` (`System` spawns; tests record).
+  Targets are exact (`-t =<session>` for the session, `-t =<session>:` for its pane), so a session
+  named `agent-old` never stands in for a missing `agent`. Delivery is `send-keys -t =<session>: -l
+  -- <text>` then `send-keys -t =<session>: Enter`, per message, 300 ms apart. A session whose pane
+  is back at its shell (the command exited) gets the command typed again and the boot wait first,
+  so the text never runs as a shell line. A missing session is started with `new-session -d -s
+  <session> -c <dir>`,
+  the command is typed into its login shell (which has the user's `PATH`), a terminal window is
+  opened on it (Ghostty: a new tab in the front window via its AppleScript dictionary, else a new window; Alacritty/kitty/WezTerm with `open -na … --args`; Terminal and iTerm2 via
+  `osascript`), and the first text waits until the pane runs something other than a shell, plus
+  2 s.
 - `notetaker` — the meeting helpers, below.
 
 ### squawk-core::notetaker
@@ -352,40 +380,53 @@ Behaviour:
 ### Hotkey state machine (`squawk_core::hotkey`)
 
 Pure; inputs carry an `Instant`. Constants: `DEFAULT_TAP_MAX_MS = 300`, `DEFAULT_DOUBLE_TAP_MS =
-350` (both configurable). Keycodes: fn 63, esc 53, C 8, V 9, M 46. Flag bits: shift 0x20000,
+400` (both configurable). Keycodes: fn 63, esc 53, C 8, V 9, M 46. Flag bits: shift 0x20000,
 control 0x40000, option 0x80000, command 0x100000, fn 0x800000.
 
 Inputs: `FnDown{mods}` / `FnUp` (flagsChanged, keycode 63), `ModsChanged{mods}` (other
 flagsChanged), `KeyDown{keycode, mods, repeat}`, `Tick` (timer at `deadline()`).
-Outputs: `Outcome{actions: Vec<Action>, swallow: bool}` with `Action::{StartRecording,
-EnterHandsFree, StopAndPaste, Cancel(Tap|FnAsModifier|Escape|Reset), PasteLast, CopyLast,
-ToggleMeeting}`.
+Outputs: `Outcome{actions: Vec<Action>, swallow: bool}` with `Action::{StartRecording{target},
+EnterHandsFree, RetargetAgent, StopAndPaste, Cancel(Tap|FnAsModifier|Escape|Reset), PasteLast, CopyLast,
+ToggleMeeting, ToggleAgentWindow}`. `Target::{Paste, Agent}` is fixed at the first fn press: no
+other modifier → `Paste`, ⌥ alone → `Agent` (the agent gesture), anything else → not a dictation.
+For an `Agent` dictation ⌥ is part of the gesture, so wherever the table says "mods" it means
+mods other than ⌥ (letting go of ⌥, or pressing the second tap or the stop with or without it,
+changes nothing); a modifier never changes the target mid-recording. The one thing that does is
+a triple tap: a plain (`Paste`) double tap, agent on, opens a third-tap window of `double_tap`
+from the second release (`third_tap_until`, kept on the machine so the state stays `HandsFree`).
+A plain fn press inside it emits `RetargetAgent` and sets the target to `Agent`; the window
+closes by the clock (a `Tick`, or the next input at/after it), silently. An `Agent` double tap or
+the agent off opens no window, so the third tap is the ordinary stop.
 
 | state | input | → state | actions | swallow |
 |---|---|---|---|---|
-| Idle | FnDown, no mods | Pressed | StartRecording | |
-| Idle | FnDown with mods | Idle | – | |
+| Idle | FnDown, no mods / ⌥ alone (agent on) | Pressed | StartRecording{Paste / Agent} | |
+| Idle | FnDown with other mods | Idle | – | |
 | Idle | ctrl+cmd+V / ctrl+cmd+C / opt+M (exact mods) | Idle | PasteLast / CopyLast / ToggleMeeting (repeat: none) | yes |
 | Pressed | FnUp, held < tap_max | TapReleased | – | |
 | Pressed | FnUp, held ≥ tap_max | Idle | StopAndPaste | |
 | Pressed | esc | Idle | Cancel(Escape) | yes |
 | Pressed | any other KeyDown, or ModsChanged with mods | Idle | Cancel(FnAsModifier) | |
-| TapReleased | (any input at/after up + double_tap) | Idle first | Cancel(Tap), then the input is handled from Idle | |
+| TapReleased | (any input at/after up + double_tap) | Idle first | Cancel(Tap) (+ ToggleAgentWindow for an `Agent` tap), then the input is handled from Idle | |
 | TapReleased | FnDown, no mods, inside window | SecondPress | EnterHandsFree | |
 | TapReleased | esc | Idle | Cancel(Escape) | yes |
-| TapReleased | other KeyDown / FnDown with mods | Idle | Cancel(Tap) | |
-| SecondPress | FnUp | HandsFree | – | |
+| TapReleased | other KeyDown / FnDown with mods | Idle | Cancel(Tap); a FnDown that is itself a start (⌥ alone after a `Paste` tap, agent on) → Pressed, + StartRecording{Agent} | |
+| SecondPress | FnUp | HandsFree (+ third-tap window until up + double_tap, if `Paste` and agent on) | – | |
 | SecondPress | esc | Idle | Cancel(Escape) | yes |
 | SecondPress | other KeyDown / ModsChanged with mods | Idle | Cancel(FnAsModifier) | |
+| HandsFree | FnDown, no mods, third-tap window open | HandsFreeThirdPress | RetargetAgent | |
 | HandsFree | FnDown, no mods | HandsFreeFnDown | – | |
 | HandsFree | esc | Idle | Cancel(Escape) | yes |
 | HandsFree | anything else (typing is allowed) | HandsFree | – | |
 | HandsFreeFnDown | FnUp | Idle | StopAndPaste | |
 | HandsFreeFnDown | other KeyDown / ModsChanged with mods (fn as modifier) | HandsFree | – | |
 | HandsFreeFnDown | esc | Idle | Cancel(Escape) | yes |
+| HandsFreeThirdPress | FnUp, other KeyDown, ModsChanged with mods | HandsFree (target `Agent`) | – | |
+| HandsFreeThirdPress | esc | Idle | Cancel(Escape) | yes |
 
 Recording starts on the first fn down (no speech lost to the gesture decision); a discarded tap
-throws that audio away. `deadline()` is `up_at + double_tap` in TapReleased, else `None`.
+throws that audio away. `deadline()` is `up_at + double_tap` in TapReleased, the third-tap window's end in HandsFree
+while it is open, else `None`.
 `reset()` → Idle, returning `Cancel(Reset)` if a recording was running (call after the tap was
 disabled by the system). `force_idle()` → Idle silently (the controller ended the dictation itself,
 e.g. `max_secs`). flagsChanged events are never swallowed. Arrow/F-key keyDowns carry the fn bit
@@ -408,6 +449,7 @@ Requests (`{"cmd": ...}`):
 | `{"cmd":"meet_start","title":"Standup"}` (title optional) | `{"type":"meeting_started", ...MeetingInfo}` or `error` ("a meeting is already recording") |
 | `{"cmd":"meet_stop"}` | after the final write: `{"type":"meeting_stopped","title":..,"path":..,"length_secs":..}` or `error` ("no meeting is recording") |
 | `{"cmd":"reload"}` | `{"type":"ok"}` after re-reading config.toml |
+| `{"cmd":"agent","event":"start"}` (`start`, `stop`, `question`, `show`) | `{"type":"ok"}`; see "Agent (agent.rs)" |
 | anything unparseable | `{"type":"error","message":"bad request: ..."}` |
 
 `StatusInfo { version, state: AppState, model: ModelStatus, permissions: Permissions, meeting:
@@ -669,6 +711,10 @@ One thread; owns `Engine`, the live `DictationSession`, the live `MeetingHandle`
   `Option<Context>`. If the mic permission is undetermined, request it (first dictation).
   Publish `Recording{since, hands_free: false}`.
 - `Hotkey(EnterHandsFree)`: publish `Recording{hands_free: true}`.
+- `Hotkey(RetargetAgent)` (agent on, live dictation bound for `Paste`): the live dictation's
+  target becomes `Agent`, its front app is dropped, its context is the agent's
+  (`agent_context`), and the clipboard prepare is discarded. The session keeps recording; the
+  menu bar does not tell agent dictations apart, so nothing is published.
 - `Hotkey(StopAndPaste)` (or `EngineEvent::DictationTooLong`): publish `Transcribing`;
   `session.finish()`; `pipeline::finish_with(text, engine.normalizer(), dict_cache.get(),
   ctx.as_ref(), &CleanupOptions{ remove_fillers: config.dictation.remove_fillers, fix_doubles:
@@ -711,6 +757,27 @@ One thread; owns `Engine`, the live `DictationSession`, the live `MeetingHandle`
   Screen & System Audio Recording without prompting, for the ready line.
   `Snapshot` carries `meeting_config`, `prompt`, `calendar_access` and `next_meeting`.
 
+### Agent (agent.rs)
+
+⌥+fn and triple-tap dictations (`Target::Agent`) run the normal pipeline, with Claude Code mode's context built
+from `[agent] dir` as the cwd (no front-app detection, no clipboard prepare), then go to the
+`squawk-agent` thread as `Job::Deliver` (one job at a time, in order: a launch waits seconds),
+which calls `squawk_core::agent::deliver` and writes the log line. The controller saves the day
+file entry (app `agent`, no project) and sets `snapshot.agent_working` at hand-off (a lone
+`/clear`, which fires no hook, leaves it as it was). `AgentEvent`s over IPC: `Start` sets it (and counts as a
+request for the idle `/clear`), `Stop` clears it, `Question` clears it and shows the window,
+`Show` shows it; `tick` clears it after `AGENT_TIMEOUT` (10 min). `ToggleAgentWindow` →
+`Job::Toggle`: if the front app is `[agent] terminal` and a client is attached to the session,
+`NSRunningApplication.hide`; else `agent::show` (launch, or `open -a <terminal>`, or a new window
+attached when none is). A failed job comes back as `Command::AgentFailed` (shown as the last
+error; a failed delivery also clears `agent_working`, a failed show does not). With `[agent]
+enabled = false` the machine (`set_agent_enabled`, at launch and on reload) treats ⌥+fn as fn
+used as a modifier, as before the agent existed. The session's directory is scaffolded by `scripts/agent-init.sh`: `CLAUDE.md` and
+`.claude/settings.json` (`defaultMode: bypassPermissions`, which only older Claude Code honours
+from a project; hooks `UserPromptSubmit` → `squawk agent start`, `Stop` → `stop`, `Notification`
+(permission prompts and the like, not `idle_prompt`) and `PreToolUse` on `AskUserQuestion` →
+`question`).
+
 ### Paste (paste.rs)
 
 Main thread. Save all pasteboard items (every type as `NSData`), `clearContents` +
@@ -722,7 +789,7 @@ newline, ever (squawk never submits). `copy` just sets the string.
 
 ### Menu bar (status_item.rs, menu_bar_icon.rs)
 
-`MenuBarState` (`from_snapshot` precedence: recording > transcribing > meeting >
+`MenuBarState` (`from_snapshot` precedence: recording > transcribing > meeting > agent working >
 needs-attention > idle):
 
 The item is only the glyph: five vertical rounded bars, 2 pt wide, 1.5 pt gaps, centred in a
@@ -736,12 +803,15 @@ colour; the image never changes size, so the item never changes width.
 | `Recording` (push-to-talk and hands-free alike) | bars follow the mic, 3–16 pt | 24 fps |
 | `Transcribing` | from the last live heights back to rest over 250 ms (cubic ease-out), then still | 30 fps, then none |
 | `Meeting` | resting heights × (0.78 + 0.1·sin(2πt / 5 s)) | 8 fps |
+| `AgentWorking` | eases (250 ms, cubic ease-out) from the bars as drawn to a falling ramp, 15/12/9/6/3 pt, then still; eases back to rest when it ends | 30 fps, then none |
 
 Live bars: `DictationSession`'s capture callback stores each block's RMS in the engine's shared
 `InputLevel` atomic; each frame reads it, gates it (−50 dBFS → 0, −18 dBFS → 1), smooths it (40 ms
 attack, 150 ms release), takes the square root so quiet speech still moves the bars, and scales
 per bar by 0.62/0.86/1/0.86/0.62 with a small per-bar jitter. Heights snap to 0.5 pt so an
-unchanged frame is not redrawn. A settle already under way carries on into `Idle`.
+unchanged frame is not redrawn. Entering a state that rests in a still shape (`Idle`,
+`Transcribing`, `AgentWorking`) eases there from the bars as last drawn; a settle already heading
+for that shape carries on (one under way after a recording carries on into `Idle`).
 
 The timer is a main-run-loop `NSTimer` (common modes, 10% tolerance) that exists only while the
 state moves and is invalidated as soon as it stops. With `accessibilityDisplayShouldReduceMotion`
@@ -906,6 +976,8 @@ errors: message to stderr, exit 1. Never print ANSI colours when stdout is not a
 | `squawk dict list` | one entry per line as written in the file |
 | `squawk model download` | progress on stderr, one updating line `Downloading 42%  201/478 MB`; then `Model ready: <dir>`; already installed → `Model already installed: <dir>`. Then the same for S1-mini while `cleanup_model` is on (`S1-mini by Superwhisper ready: <file>`) |
 | `squawk transcribe <file> [--raw] [--cwd DIR]` | loads the model (`load_model_blocking`), `audio::load_file`, `engine.transcribe`, `pipeline::finish_with` (S1-mini when on and downloaded, via `load_cleanup_model_blocking`) with the dictionary (and, with `--cwd`, a `Context` built from `Session{cwd, agent: Claude, pid: 0, tty: None}` + `RepoVocab::build`). Prints the cleaned text. `--raw` also prints `raw:`, `s1:` (S1-mini's answer, when it gave one), `clean:`, and `audio 12.3s · model load 1.4s · transcribe 410ms · cleanup s1 140ms`. Model missing → "Run `squawk model download` first.", exit 1 |
+| `squawk agent start\|stop\|question\|show` | sends `Agent{event}` with a 2 s timeout; prints nothing and exits 0 whatever happens (the agent's hooks run it) |
+| `squawk agent send <text…>` | `agent::deliver` as the app would (clear phrase → `/clear`; no idle `/clear`, not saved): `Sent to tmux session agent.` (`(launched it first)`); empty → "Nothing to send.", exit 1; a tmux failure → its message, exit 1 |
 
 Clipboard: `pbcopy`. Editor: `$VISUAL`, else `$EDITOR`, else `open`.
 

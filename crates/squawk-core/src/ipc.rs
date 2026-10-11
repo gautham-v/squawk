@@ -41,6 +41,35 @@ pub enum Request {
     MeetStop,
     /// Re-read config.toml. Answered with `Ok`.
     Reload,
+    /// News from the agent's Claude Code session (its hooks run `squawk
+    /// agent <event>`). Answered with `Ok`.
+    Agent { event: AgentEvent },
+}
+
+/// What the agent's session reports, through its hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEvent {
+    /// A prompt was submitted (`UserPromptSubmit`): the agent is working.
+    Start,
+    /// The agent finished its turn (`Stop`).
+    Stop,
+    /// The agent is waiting on the user (`Notification`): show its window.
+    Question,
+    /// Show the agent's window (the agent answered a question).
+    Show,
+}
+
+impl AgentEvent {
+    /// As the CLI spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentEvent::Start => "start",
+            AgentEvent::Stop => "stop",
+            AgentEvent::Question => "question",
+            AgentEvent::Show => "show",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -185,6 +214,18 @@ mod tests {
             ),
             (Request::MeetStop, r#"{"cmd":"meet_stop"}"#),
             (Request::Reload, r#"{"cmd":"reload"}"#),
+            (
+                Request::Agent {
+                    event: AgentEvent::Stop,
+                },
+                r#"{"cmd":"agent","event":"stop"}"#,
+            ),
+            (
+                Request::Agent {
+                    event: AgentEvent::Question,
+                },
+                r#"{"cmd":"agent","event":"question"}"#,
+            ),
         ];
         for (req, json) in cases {
             assert_eq!(serde_json::to_string(&req).unwrap(), json);
